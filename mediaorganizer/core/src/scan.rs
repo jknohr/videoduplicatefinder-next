@@ -556,6 +556,17 @@ impl<D: Database> ScanEngine<D> {
             for j in (i + 1)..candidates.len() {
                 let b = &candidates[j];
 
+                // Temporal avg hash pre-filter: if both files have hashes and
+                // Hamming distance is > 25 bits (out of 64), skip expensive I-frame scan.
+                if settings.temporal_avg_hash {
+                    if let (Some(ha), Some(hb)) = (a.temporal_avg_hash(), b.temporal_avg_hash()) {
+                        let distance = (ha ^ hb).count_ones();
+                        if distance > 25 {
+                            continue;
+                        }
+                    }
+                }
+
                 let a_hashes = a.iframe_hashes();
                 let b_hashes = b.iframe_hashes();
                 let (shorter, longer, short_rec, long_rec) =
@@ -641,10 +652,8 @@ impl<D: Database> ScanEngine<D> {
             .into_iter()
             .filter(|f| !f.is_image())
             .filter_map(|f| {
-                // Check for stored sig path in external_ids, then fall back to extraction.
-                let sig = f.external_ids
-                    .as_ref()
-                    .and_then(|e| e.mpeg7_sig_path.clone())
+                // Check for stored sig path in fingerprints, then fall back to extraction.
+                let sig = f.mpeg7_sig_path()
                     .map(std::path::PathBuf::from)
                     .filter(|p| p.exists() && p.metadata().map(|m| m.len() > 0).unwrap_or(false))
                     .or_else(|| {
@@ -1011,17 +1020,62 @@ fn hash_one_file(path: &Utf8Path, settings: &Settings) -> VdfResult<FileRecord> 
     let duration = info.duration_secs;
     record.set_media_info(info);
 
+    // Scene-aware skip: detect intro end via FFmpeg scdet filter,
+    // then offset effective_skip_start by the first detected scene change.
+    let effective_start = if settings.scene_aware_skip {
+        let scenes = ffmpeg::get_scene_change_timestamps(
+            path,
+            settings.scene_detection_threshold,
+            settings.scene_skip_count + 4, // fetch a few extra; we take only Nth
+        );
+        // Take the Nth scene cut (skip_count = how many intros to skip)
+        let offset = scenes
+            .get(settings.scene_skip_count.saturating_sub(1))
+            .copied()
+            .unwrap_or(0.0);
+        // Use the larger of computed scene offset and the normal skip
+        offset.max(settings.effective_skip_start(duration))
+    } else {
+        settings.effective_skip_start(duration)
+    };
+
     // Standard pHash samples using the configured thumbnail count
     let timestamps = settings.sample_timestamps(duration, settings.thumbnail_count);
     let frames = ffmpeg::extract_gray_frames(
         path,
         &timestamps,
-        settings.effective_skip_start(duration),
+        effective_start,
         settings.effective_skip_end(duration),
     )?;
     let phash_map: std::collections::HashMap<u64, u64> =
         frames.into_iter().map(|(ts, gray)| (ts, compute_phash(&gray))).collect();
     record.set_phash_from_map(&phash_map);
+
+    // Temporal average hash (fast pre-filter for I-frame timeline comparison)
+    if settings.temporal_avg_hash {
+        match ffmpeg::extract_temporal_average_hash(
+            path,
+            settings.temporal_avg_start_secs,
+            settings.temporal_avg_window_secs,
+            duration,
+        ) {
+            Some(gray) => {
+                let hash = crate::phash::compute_phash(&gray);
+                record.set_temporal_avg_hash(hash);
+            }
+            None => warn!("temporal avg hash returned nothing for {path}"),
+        }
+    }
+
+    // MPEG-7 signature extraction
+    if settings.mpeg7_signature {
+        if let Some(ffmpeg_path) = ffmpeg::which_ffmpeg() {
+            let sig_path = mpeg7::extract_signature(path.as_std_path(), &ffmpeg_path, false);
+            if let Some(sig) = sig_path {
+                record.set_mpeg7_sig_path(sig.to_string_lossy().into_owned());
+            }
+        }
+    }
 
     // I-frame timeline fingerprint
     if settings.iframe_fingerprint {

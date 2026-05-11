@@ -667,6 +667,30 @@ impl FileRecord {
             .chromaprint = Some(chroma);
     }
 
+    pub fn set_temporal_avg_hash(&mut self, hash: u64) {
+        let fp = self.fingerprints.get_or_insert_with(Fingerprints::default);
+        let now = unix_now();
+        fp.temporal_avg = Some(TemporalAvgFingerprint {
+            computed_at: Some(now),
+            hash: Some(hash as i64),
+            window_start_secs: None,
+            window_end_secs: None,
+            mean_brightness: None,
+        });
+    }
+
+    pub fn set_mpeg7_sig_path(&mut self, path: String) {
+        let fp = self.fingerprints.get_or_insert_with(Fingerprints::default);
+        let mpeg7 = fp.mpeg7.get_or_insert_with(Mpeg7Fingerprint::default);
+        mpeg7.sig_path = Some(path);
+    }
+
+    pub fn mpeg7_sig_path(&self) -> Option<&str> {
+        self.fingerprints.as_ref()
+            .and_then(|fp| fp.mpeg7.as_ref())
+            .and_then(|m| m.sig_path.as_deref())
+    }
+
     // ── Convenience accessors ────────────────────────────────────────────────
 
     pub fn duration_secs(&self) -> f64 {
@@ -1132,7 +1156,28 @@ DEFINE FIELD IF NOT EXISTS label          ON trim_edit TYPE option<string>;
 
 -- ── meta  (version singleton) ─────────────────────────────────────────────────
 DEFINE TABLE IF NOT EXISTS meta SCHEMALESS;
+DEFINE FIELD IF NOT EXISTS version ON meta TYPE int;
 ";
+
+/// Incremental migration SQL for each schema version.
+/// Index = target version - 1.  migrations[0] upgrades v0 → v1, etc.
+///
+/// Rules:
+/// - Only use `DEFINE … IF NOT EXISTS`, `ALTER … IF EXISTS`, `UPSERT`, or `DELETE`.
+/// - Never DROP TABLE or DROP FIELD — SurrealDB kv-rocksdb may lose data.
+/// - After adding a migration, bump DB_SCHEMA_VERSION by one.
+const MIGRATIONS: &[&str] = &[
+    // v0 → v1: initial schema (handled by SCHEMA_DDL DEFINE IF NOT EXISTS)
+    "",
+    // v1 → v2: add scene_change_timestamps and mpeg7_signature_path to file table;
+    //          add temporal_avg_hash field; add flipped evidence field on duplicate_of
+    "
+    DEFINE FIELD IF NOT EXISTS scene_change_timestamps ON file TYPE option<array<float>>;
+    DEFINE FIELD IF NOT EXISTS mpeg7_signature_path    ON file TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS temporal_avg_hash       ON file TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS is_flipped              ON duplicate_of TYPE bool DEFAULT false;
+    ",
+];
 
 // ═════════════════════════════════════════════════════════════════════════════
 // SURREAL DATABASE IMPL
@@ -1155,10 +1200,31 @@ impl SurrealDatabase {
             .block_on(async move {
                 let db: Surreal<Db> = Surreal::new::<RocksDb>(db_path).await?;
                 db.use_ns(NS).use_db(DB_NAME).await?;
+                // Apply full schema DDL (all DEFINE … IF NOT EXISTS — idempotent)
                 db.query(SCHEMA_DDL).await?;
-                db.upsert::<Option<serde_json::Value>>(("meta", "version"))
-                    .content(serde_json::json!({ "version": DB_SCHEMA_VERSION }))
-                    .await?;
+                // Read stored schema version
+                let stored: Option<serde_json::Value> = db
+                    .select(("meta", "version"))
+                    .await
+                    .unwrap_or(None);
+                let stored_ver: u32 = stored
+                    .as_ref()
+                    .and_then(|v| v.get("version"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .unwrap_or(0);
+                // Run incremental migrations
+                for target_ver in (stored_ver + 1)..=DB_SCHEMA_VERSION {
+                    let idx = (target_ver - 1) as usize;
+                    if let Some(sql) = MIGRATIONS.get(idx) {
+                        if !sql.trim().is_empty() {
+                            db.query(*sql).await?;
+                        }
+                    }
+                    db.upsert::<Option<serde_json::Value>>(("meta", "version"))
+                        .content(serde_json::json!({ "version": target_ver }))
+                        .await?;
+                }
                 Ok::<Surreal<Db>, surrealdb::Error>(db)
             })
             .map_err(|e: surrealdb::Error| VdfError::Database(e.to_string()))?;

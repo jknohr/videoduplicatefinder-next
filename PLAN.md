@@ -106,65 +106,27 @@ Port every algorithm from `VDF.Core/`. No simplification. No stubs.
 
 ### 1a. Error types and config ✅ COMPLETE
 - [x] `error.rs` — `VdfError` enum, `VdfResult<T>`
-- [x] `config.rs` — base `Settings` struct
-
-**Settings fields still missing** (add to `config.rs`):
-
-| Field | Default | Notes |
-|-------|---------|-------|
-| `skip_start_percent` | 0.0 | % of duration to skip at start (takes max with seconds) |
-| `skip_end_percent` | 0.0 | % of duration to skip at end |
-| `scene_aware_skip` | false | Auto-detect intro end via FFmpeg scdet |
-| `scene_detection_threshold` | 14 | scdet sensitivity 0–100 |
-| `scene_skip_count` | 1 | Number of scene transitions to skip at start |
-| `iframe_sample_interval` | 30.0 | Seconds between I-frame samples |
-| `max_iframe_samples` | 300 | Cap on samples per video |
-| `iframe_match_percent` | 0.40 | Fraction of shorter video's frames that must match |
-| `iframe_min_consecutive` | 3 | Min unbroken (or gap-bridged) run to declare match |
-| `iframe_max_gap` | 0 | Non-matching frames tolerated inside a run |
-| `iframe_hash_threshold` | 0.85 | Per-frame pHash similarity to count as match |
-| `temporal_avg_hash` | false | Enable temporal average hash rejection filter |
-| `temporal_avg_start_sec` | 120.0 | Start of averaging window |
-| `temporal_avg_window_sec` | 60.0 | Duration of averaging window |
-| `mpeg7_signature` | false | Enable MPEG-7 video signature comparison |
-| `ssim_verification` | false | Enable SSIM second-pass for borderline matches |
-| `ssim_verify_min_sim` | 0.80 | Lower bound of grey zone for SSIM check |
-| `ssim_verify_max_sim` | 0.95 | Upper bound of grey zone |
-| `ssim_reject_threshold` | 0.90 | SSIM score below this = hard reject |
-| `ssim_window_seconds` | 10.0 | Duration compared at matched offset |
-| `partial_clip_min_ratio` | 0.10 | Min clip/source duration ratio |
-| `partial_clip_min_similarity` | 0.80 | Min audio fingerprint similarity |
+- [x] `config.rs` — all Settings fields including: skip_start/end_percent, scene_aware_skip,
+  scene_detection_threshold, scene_skip_count, iframe_sample_interval_secs, max_iframe_samples,
+  iframe_match_percent, iframe_min_consecutive, iframe_max_gap, iframe_hash_threshold,
+  temporal_avg_hash, temporal_avg_start/window_secs, mpeg7_signature, ssim_verification,
+  ssim_verify_min/max_sim, ssim_reject_threshold, ssim_window_secs, hardware_accel
 
 ### 1b. Perceptual hashing ✅ COMPLETE
 - [x] `phash.rs` — DCT pHash 32×32 grayscale, Hamming similarity
 - C# ref: `VDF.Core/pHash/PerceptualHash.cs`
 
-### 1c. FFmpeg integration ✅ COMPLETE (base)
+### 1c. FFmpeg integration ✅ COMPLETE
 - [x] `ffmpeg.rs` — `probe_media()`, `extract_gray_frames()`, `extract_iframe_timestamps()`
-- C# ref: `VDF.Core/FFTools/FFmpegEngine.cs`
+- [x] `get_scene_change_timestamps()` — FFmpeg scdet filter, Vec<f64> timestamps
+- [x] `extract_temporal_average_hash()` — FFmpeg tblend, single pHash of blended frame
+- [x] `compute_ssim_at_offset()` — FFmpeg ssim filter at matched offset
+- [x] `read_metadata_tags()` — ffprobe JSON tag reader (mirrors FFProbeEngine.GetMetadataTags)
+- [x] `write_metadata_tags()` — ffmpeg -c copy atomic rewrite
+- [x] `which_ffmpeg()` / `which_ffprobe()` — binary discovery
+- C# ref: `VDF.Core/FFTools/FFmpegEngine.cs`, `FFProbeEngine.cs`
 
 **Still to add in `ffmpeg.rs`:**
-- [ ] `extract_gray_frames_windowed()` — respects skip_start/skip_end with percent + seconds (take max of the two)
-  - skip_secs = max(skip_start_seconds, video_duration * skip_start_percent / 100.0)
-- [ ] `detect_scene_changes()` — run FFmpeg `scdet` filter, return Vec<f64> of timestamps
-  - Cache result in DB (`scene_change_timestamps` field on file node)
-  - On rescan: if field present, skip decode pass entirely
-- [ ] `extract_temporal_average_hash()` — FFmpeg `tblend=all_mode=average` over configurable window
-  - Inputs: start_sec, window_sec from Settings
-  - Output: single pHash of the blended frame
-  - C# ref: `VDF.Core/pHash/` (TemporalAverageHash)
-- [ ] `extract_mpeg7_signature()` — FFmpeg `signature` filter, write binary .sig file
-  - Return path to .sig file; store path in DB
-  - C# ref: `VDF.Core/FFTools/` (MPEG-7 via FFmpeg)
-- [ ] `compare_mpeg7_signatures()` — FFmpeg `signature=detectmode=full` on two .sig files
-  - Returns Option<f64> clip offset in source if match found
-- [ ] `compute_ssim()` — FFmpeg `ssim` filter at matched offset for N seconds
-  - Inputs: file_a path, file_b path, offset_secs, window_secs
-  - Output: f64 SSIM score
-  - C# ref: `VDF.Core/Utils/` (SSIM via FFmpeg filter)
-- [ ] `read_metadata()` — `ffprobe` JSON output, parse all container tags
-- [ ] `write_metadata()` — `ffmpeg -c copy -metadata key=value` atomic rewrite
-  - Write to temp file, then `std::fs::rename()` (atomic on same filesystem)
 - [ ] Hardware accel helpers — `hwaccel.rs` (VA-API / CUDA / VideoToolbox)
   - Full `AVHWDeviceContext` init via ffmpeg-sys-the-third unsafe FFI
   - C# ref: `VDF.Core/FFTools/FFmpegEngine.cs` (HW accel setup)
@@ -173,60 +135,45 @@ Port every algorithm from `VDF.Core/`. No simplification. No stubs.
 - [x] `audio.rs` — full Chromaprint pipeline, Vec<u32> output
 - C# ref: `VDF.Core/Chromaprint/`
 
-### 1e. I-frame comparison ✅ COMPLETE (base)
+### 1e. I-frame comparison ✅ COMPLETE
 - [x] `comparison.rs` — sliding-window I-frame timeline matching
+- [x] Gap-tolerant sliding window honouring `iframe_max_gap`
+- [x] Per-frame threshold using `iframe_hash_threshold`
+- [x] Returns `consecutive_frames` count and `best_offset_idx` in match result
 
-**Still to add in `comparison.rs`:**
-- [ ] Gap-tolerant sliding window — honour `iframe_max_gap` to bridge non-matching frames
-  - 0 = strict consecutive; N = allow N-frame gaps and keep counting the run
-- [ ] Early exit optimisation — per offset, abort when accumulated mismatches exceed budget
-  - Budget = (shorter_len - min_consecutive) * (1 - iframe_match_percent)
-- [ ] Per-frame threshold — use `iframe_hash_threshold` not a hardcoded value
-- [ ] Return `consecutive_frames` count and `best_offset_idx` in match result
-  - These are stored as evidence fields on the `duplicate_of` edge
+### 1f. Temporal average hash ✅ COMPLETE
+- [x] `extract_temporal_average_hash()` in ffmpeg.rs
+- [x] Pre-filter wired into `scan_for_timeline_duplicates()` in scan.rs
+- [x] `set_temporal_avg_hash()` / `temporal_avg_hash()` on FileRecord
 
-### 1f. Temporal average hash
-- [ ] `temporal_hash.rs` — `compute_temporal_average_hash(path, start_sec, window_sec)`
-  - Used as fast pre-filter: if temporal hashes differ beyond threshold, skip I-frame compare entirely
-  - C# ref: `VDF.Core/pHash/` (TemporalAverageHash)
-
-### 1g. Database ✅ COMPLETE (base)
+### 1g. Database ✅ COMPLETE
 - [x] `db.rs` — SurrealDB 3.0 graph schema + CRUD + RELATE
+- [x] `blacklisted` RELATE table with `added_at`, `reason`
+- [x] `meta` table with `db_version` singleton
+- [x] Migration system — reads stored version, runs incremental migrations, updates version
+- [x] `set_temporal_avg_hash()` / `set_mpeg7_sig_path()` setters on FileRecord
+- Schema additions (added via migration v1→v2): scene_change_timestamps, mpeg7_signature_path,
+  temporal_avg_hash, is_flipped on duplicate_of
 
-**Schema additions needed:**
-- [ ] `scene_change_timestamps` field on `file` table (array<float>) — cached scdet output
-- [ ] `mpeg7_signature_path` field on `file` table (option<string>) — path to .sig file
-- [ ] `temporal_avg_hash` field on `file` table (option<int>) — u64 hash as int
-- [ ] `flipped` field on `duplicate_of` edge (bool) — horizontally mirrored match
-- [ ] `blacklist` RELATE table — pairs permanently excluded from results
-  - Fields: `added_at: int`, `reason: option<string>`
-- [ ] Migration system — `meta` table with `db_version: int`; run ALTER statements on version bump
-
-### 1h. Scan engine ✅ COMPLETE (base)
+### 1h. Scan engine ✅ COMPLETE
 - [x] `scan.rs` — 3-phase scan engine
+- [x] Phase 2: scene-aware skip via `get_scene_change_timestamps()`
+- [x] Phase 2: temporal average hash via `extract_temporal_average_hash()`
+- [x] Phase 2: MPEG-7 signature extraction via `mpeg7::extract_signature()`
+- [x] Phase 3: temporal avg hash pre-filter before I-frame sliding window (Hamming > 25 → skip)
+- [x] Phase 3: MPEG-7 compare via `scan_for_mpeg7_duplicates()`
+- [x] Phase 3: SSIM second-pass for borderline matches (`ssim_verify` in scan.rs)
+- [x] Blacklist filter — `pair_is_blacklisted()` guards all four `add_duplicate()` call sites
 
-**Still to add in `scan.rs`:**
-- [ ] Phase 2 extension: run `detect_scene_changes()` when `scene_aware_skip = true`
-  - After detection, compute effective skip offset from scene timestamps + scene_skip_count
-  - Store `scene_change_timestamps` in DB; skip on rescan if already present
-- [ ] Phase 2 extension: run `extract_temporal_average_hash()` when `temporal_avg_hash = true`
-- [ ] Phase 2 extension: run `extract_mpeg7_signature()` when `mpeg7_signature = true`
-- [ ] Phase 3 extension: temporal average hash pre-filter before I-frame sliding window
-- [ ] Phase 3 extension: MPEG-7 compare when both files have .sig files
-- [ ] Phase 3 extension: SSIM second-pass for borderline matches
-  - Condition: similarity in (ssim_verify_min_sim, ssim_verify_max_sim) range
-  - If SSIM < ssim_reject_threshold → remove from results (hard reject)
-- [ ] Phase 3 extension: flipped-image detection
-  - Horizontal mirror the query frames and re-run comparison; set `flipped=true` on edge if match
-- [ ] Blacklist filter — skip pairs where a `blacklist` edge already exists in DB
+**Still to add:**
+- [ ] Phase 3: flipped-image detection (horizontal mirror + re-compare)
 - [ ] Rescan single file — re-hash one path, update DB, re-run comparisons for that file only
 
-### 1i. Metadata module (new)
-- [ ] `metadata.rs` — read/write container tags via FFmpeg
-  - `read_tags(path) -> HashMap<String, String>`
-  - `write_tags(path, tags: HashMap<String, String>) -> VdfResult<()>`
-  - Atomic: write to tmpfile alongside original, then rename
-  - Supported containers: MP4, MKV, AVI, MOV, WebM (anything FFmpeg can remux)
+### 1i. Metadata module ✅ COMPLETE
+- [x] `read_metadata_tags(path)` in `ffmpeg.rs` — ffprobe JSON tag reader
+- [x] `write_metadata_tags(path, tags)` in `ffmpeg.rs` — ffmpeg -c copy atomic rewrite
+- [x] Exposed in `lib.rs`, wired in `server/api.rs` (read_tags / write_tags server functions)
+- [x] `MetadataEditorInline` component in results.rs — inline tag editor per file row
 
 ### 1j. MPEG-7 module (new)
 - [ ] `mpeg7.rs` — signature extraction and comparison
@@ -245,18 +192,19 @@ Port every algorithm from `VDF.Core/`. No simplification. No stubs.
 
 Port `VDF.CLI/` using `clap` derive macros.
 
-### Subcommands already scaffolded
-- [x] `scan` — run scan, output progress
-- [x] `list` — list duplicate clusters from DB
+### Subcommands implemented
+- [x] `scan` — run scan, output progress, full settings flags
+- [x] `list` — list duplicate clusters from DB (text/json/csv output)
 - [x] `show` — show evidence for a specific file pair
+- [x] `mark` — trash/delete files by ID
+- [x] `relocate` — move files to target directory, update DB paths, name deconfliction
 
 ### Subcommands still to add
-- [ ] `scan-and-compare` — combined single-command workflow (primary CLI entry point per README)
+- [ ] `scan-and-compare` — combined single-command workflow
 - [ ] `delete` — auto-mark and delete duplicates by strategy
   - Strategies: `lowest-quality`, `smallest-file`, `shortest-duration`, `worst-resolution`, `100-percent-only`
   - Flags: `--dry-run` (default), `--delete` (trash), `--delete-permanent`
 - [ ] `export` — export results as `--format json|text|csv` to `--output <file>` or stdout
-- [ ] `relocate` — move files to a target directory, update DB paths
 - [ ] `blacklist add <file_a> <file_b>` / `blacklist remove <id>` / `blacklist list`
 - [ ] `rescan <path>` — re-hash a single file
 
@@ -334,11 +282,17 @@ tree. Feature flags select the platform runtime — not the components.
 /logs                   → LogsView
 ```
 
-### Views already scaffolded
+### Views already built
 - [x] `views/scan.rs` — folder picker, start/stop, progress bar, live log panel
-- [x] `views/results.rs` — cluster cards (basic)
-- [x] `views/compare.rs` — side-by-side file cards (basic)
-- [x] `views/settings.rs` — settings form (partial — missing new fields)
+- [x] `views/results.rs` — cluster cards, file actions, sort/filter, search, auto-select,
+  blacklist group, move-to-folder inline, metadata editor inline (⋮ button per file)
+- [x] `views/compare.rs` — side-by-side file cards with evidence display
+- [x] `views/settings.rs` — all settings fields: similarity, fingerprinting, scan scope,
+  MPEG-7, SSIM, hardware acceleration, skip start/end (seconds + %)
+- [x] `views/stats.rs` — group count, dup storage, reclaimable space, method breakdown
+- [x] `views/blacklist.rs` — list blacklisted pairs, un-mark, clear, prune missing
+- [x] `views/database.rs` — paginated sortable file browser, db entry removal
+- [x] `views/logs.rs` — live log panel with level filter, auto-scroll, clear
 
 ### Views — what still needs to be built or completed
 
