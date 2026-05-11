@@ -67,15 +67,35 @@ services:
     volumes:
       # ── Media directories ─────────────────────────────────────────────────────
       # Mount your video folders here.  Use :rw for write access (needed if VDF
-      # will delete or move files), :ro for read-only scanning.
+      # will rename, move, or delete files), :ro for read-only scanning.
       # Paths with spaces or special characters must be quoted.
       #
-      # Examples:
-      #   - /mnt/nas/movies:/mnt/nas/movies:ro
-      #   - "/path/with spaces:/media/movies:rw,Z"
+      # ── SELinux / Fedora / RHEL / CentOS note ────────────────────────────────
+      # On systems running SELinux (Fedora, RHEL, CentOS, Rocky Linux, etc.)
+      # you MUST append the :Z label to every bind-mount volume.
+      # Without :Z, SELinux denies all container reads — even :rw has no effect.
+      #   :Z  — relabels the directory for this container only (private)
+      #   :z  — relabels the directory as shared (for multiple containers)
+      # Ubuntu / Debian / Arch: :Z is allowed but not required; safe to include.
       #
-      # Your current paths:
+      # ── Folder permissions ────────────────────────────────────────────────────
+      # The container process runs as root (uid 0).  Your host folders must allow
+      # root (or the mapped uid) to read and — if you enable delete/move — write.
+      # Quick fix if VDF reports permission errors:
+      #   chmod -R a+rX /path/to/your/videos        # everyone can read/enter
+      #   chmod -R g+rwX /path/to/your/videos       # group can read and write
+      #   chown -R $USER:video /path/to/your/videos # optional: group = video
+      # For :rw mounts (delete / move enabled) the container also needs write
+      # permission.  For :ro (scan-only) read + execute on directories is enough.
+      #
+      # Examples:
+      #   - /mnt/nas/movies:/mnt/nas/movies:ro          # Debian / Ubuntu
+      #   - /mnt/nas/movies:/mnt/nas/movies:ro,Z        # Fedora / RHEL
+      #   - "/path/with spaces:/media/movies:rw,Z"      # Fedora + special chars
+      #
+      # Your current paths (Fedora-style with :Z):
       - /home/subtomic/Videos/xxxcompressed:/xxxcompressed:rw,Z
+      - /home/subtomic/Videos/xxx:/xxx:rw,Z
       - "/home/subtomic/Videos/\U0001F61C:/\U0001F61C:rw,Z"
       - "/home/subtomic/Videos/\U0001F600:/\U0001F600:rw,Z"
 
