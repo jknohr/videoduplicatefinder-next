@@ -311,6 +311,7 @@ impl<D: Database> ScanEngine<D> {
                          sim: f32,
                          method: MatchMethod,
                          offset: Option<f64>,
+                         is_flipped: bool,
                          all_recs: &[FileRecord],
                          pairs_lock: &Arc<Mutex<Vec<DuplicatePair>>>,
                          p2g: &Arc<Mutex<HashMap<String, u64>>>,
@@ -383,6 +384,7 @@ impl<D: Database> ScanEngine<D> {
 
             let mut new_pair = DuplicatePair::new(rec_a.id.clone(), rec_b.id.clone(), sim, method);
             new_pair.clip_offset_secs = offset;
+            new_pair.is_flipped = is_flipped;
             pairs_lock.lock().unwrap().push(new_pair);
         };
 
@@ -1027,6 +1029,7 @@ fn hash_one_file(path: &Utf8Path, settings: &Settings) -> VdfResult<FileRecord> 
             path,
             settings.scene_detection_threshold,
             settings.scene_skip_count + 4, // fetch a few extra; we take only Nth
+            settings.hardware_accel,
         );
         // Take the Nth scene cut (skip_count = how many intros to skip)
         let offset = scenes
@@ -1046,10 +1049,25 @@ fn hash_one_file(path: &Utf8Path, settings: &Settings) -> VdfResult<FileRecord> 
         &timestamps,
         effective_start,
         settings.effective_skip_end(duration),
+        settings.hardware_accel,
     )?;
-    let phash_map: std::collections::HashMap<u64, u64> =
-        frames.into_iter().map(|(ts, gray)| (ts, compute_phash(&gray))).collect();
-    record.set_phash_from_map(&phash_map);
+
+    // Build phash map; also compute flipped hashes when enabled
+    let mut phash_map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut flipped_map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for (ts, gray) in &frames {
+        phash_map.insert(*ts, compute_phash(gray));
+        if settings.compare_horizontally_flipped {
+            let flipped = ffmpeg::flip_gray_horizontal(gray);
+            flipped_map.insert(*ts, compute_phash(&flipped));
+        }
+    }
+
+    if settings.compare_horizontally_flipped {
+        record.set_phash_from_map_with_flipped(&phash_map, Some(&flipped_map));
+    } else {
+        record.set_phash_from_map(&phash_map);
+    }
 
     // Temporal average hash (fast pre-filter for I-frame timeline comparison)
     if settings.temporal_avg_hash {
@@ -1058,6 +1076,7 @@ fn hash_one_file(path: &Utf8Path, settings: &Settings) -> VdfResult<FileRecord> 
             settings.temporal_avg_start_secs,
             settings.temporal_avg_window_secs,
             duration,
+            settings.hardware_accel,
         ) {
             Some(gray) => {
                 let hash = crate::phash::compute_phash(&gray);
@@ -1091,6 +1110,7 @@ fn hash_one_file(path: &Utf8Path, settings: &Settings) -> VdfResult<FileRecord> 
             &ts_list,
             settings.effective_skip_start(duration),
             settings.effective_skip_end(duration),
+            settings.hardware_accel,
         )?;
         let iframe_hashes: Vec<u64> = gray_frames.values().map(|g| compute_phash(g)).collect();
         record.set_iframe_fingerprint(ts_list, iframe_hashes);
@@ -1265,7 +1285,7 @@ fn ssim_verify(a: &FileRecord, b: &FileRecord, sim: f32, settings: &Settings) ->
     let offset_b = dur_b * 0.5;
 
     let ssim = crate::ffmpeg::compute_ssim_at_offset(
-        &a.path, offset_a, &b.path, offset_b, settings.ssim_window_secs,
+        &a.path, offset_a, &b.path, offset_b, settings.ssim_window_secs, settings.hardware_accel,
     );
 
     if ssim >= 0.0 && ssim < settings.ssim_reject_threshold {
@@ -1276,6 +1296,20 @@ fn ssim_verify(a: &FileRecord, b: &FileRecord, sim: f32, settings: &Settings) ->
         return false;
     }
     true
+}
+
+/// Compute average Hamming similarity between two sets of pHashes.
+///
+/// Used for flipped comparison where `a_hashes` are pre-flipped.
+fn phash_hamming_multi_similarity(a_hashes: &[u64], b_hashes: &[u64]) -> f32 {
+    if a_hashes.is_empty() || b_hashes.is_empty() {
+        return 0.0;
+    }
+    let total: f32 = a_hashes.iter()
+        .zip(b_hashes.iter())
+        .map(|(&ha, &hb)| phash_similarity(ha, hb))
+        .sum();
+    total / a_hashes.len().min(b_hashes.len()) as f32
 }
 
 /// Compute similarity between the first pHashes of two records (for DuplicatePair.similarity).
@@ -1303,11 +1337,12 @@ fn duration_filter_passes(a: &FileRecord, b: &FileRecord, settings: &Settings) -
 // ---------------------------------------------------------------------------
 
 type MergeFn<'a> = dyn Fn(
-        &FileRecord,
-        &FileRecord,
-        f32,
+        &FileRecord,   // a
+        &FileRecord,   // b
+        f32,           // similarity
         MatchMethod,
-        Option<f64>,
+        Option<f64>,   // clip_offset_secs
+        bool,          // is_flipped
         &[FileRecord],
         &Arc<Mutex<Vec<DuplicatePair>>>,
         &Arc<Mutex<HashMap<String, u64>>>,
@@ -1331,16 +1366,10 @@ fn compare_images(
 ) {
     for i in 0..images.len().saturating_sub(1) {
         let a = &images[i];
-        // Pre-compute flipped hash for image a if enabled
-        let flipped_a: Option<u64> = if settings.compare_horizontally_flipped {
-            a.first_phash().map(|h| {
-                // For images: flip the raw 32×32 gray and recompute (we don't have raw bytes here,
-                // so we use a placeholder — proper flip needs the gray bytes stored in DB)
-                // TODO: store raw gray bytes in FileRecord for flip support
-                h // placeholder: same hash (no flip effect without raw bytes)
-            })
+        let a_flipped = if settings.compare_horizontally_flipped {
+            a.flipped_phash_hashes()
         } else {
-            None
+            vec![]
         };
 
         for j in (i + 1)..images.len() {
@@ -1356,11 +1385,22 @@ fn compare_images(
             }
 
             let is_dup = phash_check_duplicate(a, b, settings);
-            let _ = flipped_a; // flip not yet implemented without raw gray bytes
             if is_dup {
                 let sim = phash_first_similarity(a, b);
                 if ssim_verify(a, b, sim, settings) {
-                    merge(a, b, sim, MatchMethod::FrameSimilarity, None, images, pairs, p2g, greps, gid, settings);
+                    merge(a, b, sim, MatchMethod::FrameSimilarity, None, false, images, pairs, p2g, greps, gid, settings);
+                }
+                continue;
+            }
+
+            // Check horizontally flipped match (a's flipped hashes vs b's normal hashes)
+            if settings.compare_horizontally_flipped && !a_flipped.is_empty() {
+                let b_hashes = b.phash_hashes();
+                if !b_hashes.is_empty() {
+                    let flip_sim = phash_hamming_multi_similarity(&a_flipped, &b_hashes);
+                    if flip_sim >= settings.min_similarity {
+                        merge(a, b, flip_sim, MatchMethod::FrameSimilarity, None, true, images, pairs, p2g, greps, gid, settings);
+                    }
                 }
             }
         }
@@ -1382,6 +1422,12 @@ fn compare_videos_linear(
 ) {
     for i in 0..videos.len().saturating_sub(1) {
         let a = &videos[i];
+        let a_flipped = if settings.compare_horizontally_flipped {
+            a.flipped_phash_hashes()
+        } else {
+            vec![]
+        };
+
         for j in (i + 1)..videos.len() {
             let b = &videos[j];
 
@@ -1401,7 +1447,21 @@ fn compare_videos_linear(
             if is_dup {
                 let sim = phash_first_similarity(a, b);
                 if ssim_verify(a, b, sim, settings) {
-                    merge(a, b, sim, MatchMethod::FrameSimilarity, None, videos, pairs, p2g, greps, gid, settings);
+                    merge(a, b, sim, MatchMethod::FrameSimilarity, None, false, videos, pairs, p2g, greps, gid, settings);
+                }
+                continue;
+            }
+
+            // Check horizontally flipped match
+            if settings.compare_horizontally_flipped && !a_flipped.is_empty() {
+                let b_hashes = b.phash_hashes();
+                if !b_hashes.is_empty() {
+                    let flip_sim = phash_hamming_multi_similarity(&a_flipped, &b_hashes);
+                    if flip_sim >= settings.min_similarity {
+                        if ssim_verify(a, b, flip_sim, settings) {
+                            merge(a, b, flip_sim, MatchMethod::FrameSimilarity, None, true, videos, pairs, p2g, greps, gid, settings);
+                        }
+                    }
                 }
             }
         }
@@ -1466,7 +1526,7 @@ fn compare_videos_bucketed(
                     if is_dup {
                         let sim = phash_first_similarity(a, b);
                         if ssim_verify(a, b, sim, settings) {
-                            merge(a, b, sim, MatchMethod::FrameSimilarity, None, videos, pairs, p2g, greps, gid, settings);
+                            merge(a, b, sim, MatchMethod::FrameSimilarity, None, false, videos, pairs, p2g, greps, gid, settings);
                         }
                     }
                 }

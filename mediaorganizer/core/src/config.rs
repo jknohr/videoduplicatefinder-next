@@ -115,15 +115,25 @@ pub struct Settings {
     pub hardware_accel: HardwareAccel,
 }
 
+/// Hardware acceleration mode for FFmpeg video decode.
+///
+/// Faithful port of `FFHardwareAccelerationMode` from C#.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum HardwareAccel {
     #[default]
     None,
+    Auto,
+    Vdpau,
+    Dxva2,
     Vaapi,
+    Qsv,
     Cuda,
     VideoToolbox,
     D3d11va,
+    Drm,
+    MediaCodec,
+    Vulkan,
 }
 
 impl Default for Settings {

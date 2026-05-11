@@ -3,6 +3,7 @@
 //! All FFmpeg operations are synchronous (blocking). Call via
 //! `tokio::task::spawn_blocking` from async contexts.
 
+use crate::config::HardwareAccel;
 use crate::error::{VdfError, VdfResult};
 use camino::Utf8Path;
 use fast_image_resize::images::Image;
@@ -21,6 +22,50 @@ const GRAY_SIZE: usize = 32 * 32;
 
 /// Decoded 32×32 grayscale frame.
 pub type GrayFrame = Box<[u8; GRAY_SIZE]>;
+
+// ─── Hardware acceleration ────────────────────────────────────────────────────
+
+/// Map a `HardwareAccel` variant to the corresponding `AVHWDeviceType`.
+///
+/// Faithful port of `FfmpegEngine.GetConfiguredHardwareDeviceType()` from C#.
+fn hw_device_type(accel: HardwareAccel) -> ffmpeg_sys_the_third::AVHWDeviceType {
+    use ffmpeg_sys_the_third::AVHWDeviceType::*;
+    match accel {
+        HardwareAccel::None => AV_HWDEVICE_TYPE_NONE,
+        // "auto" in the process-spawn path is handled by passing the string "auto"
+        // to -hwaccel; for the native path we fall back to no hw acceleration since
+        // av_hwdevice_ctx_create does not support an "auto" device type.
+        HardwareAccel::Auto => AV_HWDEVICE_TYPE_NONE,
+        HardwareAccel::Vdpau => AV_HWDEVICE_TYPE_VDPAU,
+        HardwareAccel::Dxva2 => AV_HWDEVICE_TYPE_DXVA2,
+        HardwareAccel::Vaapi => AV_HWDEVICE_TYPE_VAAPI,
+        HardwareAccel::Qsv => AV_HWDEVICE_TYPE_QSV,
+        HardwareAccel::Cuda => AV_HWDEVICE_TYPE_CUDA,
+        HardwareAccel::VideoToolbox => AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+        HardwareAccel::D3d11va => AV_HWDEVICE_TYPE_D3D11VA,
+        HardwareAccel::Drm => AV_HWDEVICE_TYPE_DRM,
+        HardwareAccel::MediaCodec => AV_HWDEVICE_TYPE_MEDIACODEC,
+        HardwareAccel::Vulkan => AV_HWDEVICE_TYPE_VULKAN,
+    }
+}
+
+/// The string that FFmpeg's `-hwaccel` flag accepts for this mode.
+fn hw_accel_flag_str(accel: HardwareAccel) -> Option<&'static str> {
+    match accel {
+        HardwareAccel::None => None,
+        HardwareAccel::Auto => Some("auto"),
+        HardwareAccel::Vdpau => Some("vdpau"),
+        HardwareAccel::Dxva2 => Some("dxva2"),
+        HardwareAccel::Vaapi => Some("vaapi"),
+        HardwareAccel::Qsv => Some("qsv"),
+        HardwareAccel::Cuda => Some("cuda"),
+        HardwareAccel::VideoToolbox => Some("videotoolbox"),
+        HardwareAccel::D3d11va => Some("d3d11va"),
+        HardwareAccel::Drm => Some("drm"),
+        HardwareAccel::MediaCodec => Some("mediacodec"),
+        HardwareAccel::Vulkan => Some("vulkan"),
+    }
+}
 
 /// Media info extracted from a file.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -139,6 +184,7 @@ pub fn extract_gray_frames(
     timestamps: &[f64],
     skip_start_secs: f64,
     skip_end_secs: f64,
+    hw_accel: HardwareAccel,
 ) -> VdfResult<BTreeMap<u64, GrayFrame>> {
     if timestamps.is_empty() {
         return Ok(BTreeMap::new());
@@ -167,6 +213,33 @@ pub fn extract_gray_frames(
         let tb = stream.time_base();
         (dec, tb)
     };
+
+    // Attach hardware device context when hw_accel is configured.
+    // Mirrors VideoStreamDecoder constructor passing AVHWDeviceType in C#.
+    let hw_type = hw_device_type(hw_accel);
+    if hw_type != ffmpeg_sys_the_third::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE {
+        unsafe {
+            let mut hw_ctx: *mut ffmpeg_sys_the_third::AVBufferRef = std::ptr::null_mut();
+            let ret = ffmpeg_sys_the_third::av_hwdevice_ctx_create(
+                &mut hw_ctx,
+                hw_type,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            );
+            if ret >= 0 {
+                (*decoder.as_mut_ptr()).hw_device_ctx =
+                    ffmpeg_sys_the_third::av_buffer_ref(hw_ctx);
+                // Release the create-ref; the codec context holds its own ref now.
+                ffmpeg_sys_the_third::av_buffer_unref(&mut hw_ctx);
+            } else {
+                warn!(
+                    "hw_device_ctx_create failed for {:?} (code {}), falling back to software decode",
+                    hw_accel, ret
+                );
+            }
+        }
+    }
 
     let ctx_dur = ictx.duration();
     let av_tb = ffmpeg_the_third::ffi::AV_TIME_BASE as f64;
@@ -428,11 +501,24 @@ fn decode_frame_at(
             match decoder.receive_frame(&mut frame) {
                 Ok(()) => {
                     found = true;
-                    let pts = frame.pts().unwrap_or(0);
+                    // Download hw frame to system memory if needed before we
+                    // inspect PTS (the pts field is accessible on both hw and sw frames).
+                    let sw_frame = match ensure_sw_frame(std::mem::replace(
+                        &mut frame,
+                        VideoFrame::empty(),
+                    )) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            warn!("hw frame download failed: {e}");
+                            break;
+                        }
+                    };
+                    let pts = sw_frame.pts().unwrap_or(0);
                     if pts >= target_pts.saturating_sub(2) {
-                        best_frame = frame;
+                        best_frame = sw_frame;
                         break 'outer;
                     }
+                    // Keep searching; restore empty frame for next receive_frame call.
                 }
                 Err(ffmpeg_the_third::Error::Other { errno: e })
                     if e == ffmpeg_the_third::ffi::AVERROR(libc::EAGAIN) =>
@@ -449,6 +535,44 @@ fn decode_frame_at(
     }
 
     Ok(best_frame)
+}
+
+/// Download a hardware-decoded frame to system memory, if needed.
+///
+/// When hw acceleration is active, decoded frames reside in GPU memory with a
+/// pixel format such as `AV_PIX_FMT_CUDA` or `AV_PIX_FMT_VAAPI`. libswscale
+/// cannot process these directly; `av_hwframe_transfer_data` copies to a CPU
+/// frame using the surface's software pixel format (e.g. NV12, P010LE).
+///
+/// If the frame is already a software frame, returns it as-is.
+pub fn ensure_sw_frame(frame: VideoFrame) -> VdfResult<VideoFrame> {
+    // AVHWFramesContext is set on frames that live in GPU memory.
+    let is_hw = unsafe { !(*frame.as_ptr()).hw_frames_ctx.is_null() };
+    if !is_hw {
+        return Ok(frame);
+    }
+
+    let mut sw = VideoFrame::empty();
+    let ret = unsafe {
+        ffmpeg_sys_the_third::av_hwframe_transfer_data(
+            sw.as_mut_ptr(),
+            frame.as_ptr(),
+            0,
+        )
+    };
+    if ret < 0 {
+        return Err(VdfError::FfmpegGeneral {
+            code: ret,
+            msg: format!("av_hwframe_transfer_data failed (code {})", ret),
+        });
+    }
+    // Copy presentation metadata that av_hwframe_transfer_data does not copy.
+    unsafe {
+        (*sw.as_mut_ptr()).pts = (*frame.as_ptr()).pts;
+        (*sw.as_mut_ptr()).pkt_dts = (*frame.as_ptr()).pkt_dts;
+        (*sw.as_mut_ptr()).best_effort_timestamp = (*frame.as_ptr()).best_effort_timestamp;
+    }
+    Ok(sw)
 }
 
 /// Convert a decoded VideoFrame to a 32×32 grayscale image.
@@ -533,6 +657,7 @@ pub fn extract_temporal_average_hash(
     start_secs: f64,
     window_secs: f64,
     duration_secs: f64,
+    hw_accel: HardwareAccel,
 ) -> Option<Box<[u8; GRAY_SIZE]>> {
     const N: usize = 32;
 
@@ -546,11 +671,16 @@ pub fn extract_temporal_average_hash(
 
     let ffmpeg = which_ffmpeg()?;
 
+    let hw_flag = hw_accel_flag_str(hw_accel)
+        .map(|s| format!("-hwaccel {s} "))
+        .unwrap_or_default();
+
     let args = format!(
         "-hide_banner -loglevel quiet -nostdin \
-         -ss {start:.6} -t {win:.6} -i \"{path}\" \
+         {hw_flag}-ss {start:.6} -t {win:.6} -i \"{path}\" \
          -vf \"tblend=all_mode=average,framestep=32767,scale={N}:{N}:flags=bicubic,format=gray\" \
          -frames:v 1 -f rawvideo pipe:1",
+        hw_flag = hw_flag,
         start = start_secs,
         win = actual_window,
         path = video_path,
@@ -587,8 +717,13 @@ pub fn extract_thumbnail_jpeg(
     video_path: &Utf8Path,
     position_secs: f64,
     max_width: u32,
+    hw_accel: HardwareAccel,
 ) -> Option<Vec<u8>> {
     let ffmpeg = which_ffmpeg()?;
+
+    let hw_flag = hw_accel_flag_str(hw_accel)
+        .map(|s| format!("-hwaccel {s} "))
+        .unwrap_or_default();
 
     let scale_filter = if max_width > 0 {
         format!("-vf \"scale={}:-1:flags=bicubic\" ", max_width)
@@ -598,8 +733,9 @@ pub fn extract_thumbnail_jpeg(
 
     let args = format!(
         "-hide_banner -loglevel quiet -nostdin \
-         -ss {pos:.6} -i \"{path}\" \
+         {hw_flag}-ss {pos:.6} -i \"{path}\" \
          {scale}-frames:v 1 -f image2pipe -vcodec mjpeg -q:v 2 pipe:1",
+        hw_flag = hw_flag,
         pos = position_secs,
         path = video_path,
         scale = scale_filter,
@@ -631,17 +767,23 @@ pub fn compute_ssim_at_offset(
     path_b: &Utf8Path,
     offset_b: f64,
     window_secs: f64,
+    hw_accel: HardwareAccel,
 ) -> f32 {
     let ffmpeg = match which_ffmpeg() {
         Some(f) => f,
         None => return -1.0,
     };
 
+    let hw_flag = hw_accel_flag_str(hw_accel)
+        .map(|s| format!("-hwaccel {s} "))
+        .unwrap_or_default();
+
     let args = format!(
         "-hide_banner -loglevel info -nostdin \
-         -ss {oa:.3} -t {ws:.3} -i \"{pa}\" \
-         -ss {ob:.3} -t {ws:.3} -i \"{pb}\" \
+         {hw_flag}-ss {oa:.3} -t {ws:.3} -i \"{pa}\" \
+         {hw_flag}-ss {ob:.3} -t {ws:.3} -i \"{pb}\" \
          -lavfi \"[0][1]ssim=stats_file=-\" -f null -",
+        hw_flag = hw_flag,
         oa = offset_a,
         ob = offset_b,
         ws = window_secs,
@@ -686,16 +828,22 @@ pub fn get_scene_change_timestamps(
     video_path: &Utf8Path,
     threshold: f32,
     max_count: usize,
+    hw_accel: HardwareAccel,
 ) -> Vec<f64> {
     let ffmpeg = match which_ffmpeg() {
         Some(f) => f,
         None => return vec![],
     };
 
+    let hw_flag = hw_accel_flag_str(hw_accel)
+        .map(|s| format!("-hwaccel {s} "))
+        .unwrap_or_default();
+
     let args = format!(
-        "-hide_banner -loglevel info -nostdin -i \"{path}\" \
+        "-hide_banner -loglevel info -nostdin {hw_flag}-i \"{path}\" \
          -vf \"select='gt(scene,{thresh:.2})',showinfo\" \
          -vsync vfr -frames:v {max} -f null -",
+        hw_flag = hw_flag,
         path = video_path,
         thresh = threshold,
         max = max_count,
