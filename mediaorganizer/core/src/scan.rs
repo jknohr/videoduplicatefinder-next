@@ -13,7 +13,10 @@ use crate::{
     db::{Database, DuplicatePair, FileRecord, MatchMethod},
     error::VdfResult,
     ffmpeg,
+    hardlink,
+    mpeg7,
     phash::{compute_phash, is_duplicate as phash_is_duplicate, similarity as phash_similarity},
+    ranker,
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use ignore::WalkBuilder;
@@ -76,7 +79,7 @@ impl<D: Database> ScanEngine<D> {
         }
     }
 
-    /// Full scan: discover → hash → compare (three phases).
+    /// Full scan: discover → hash → compare (four phases) → highlight best matches.
     pub fn run(&mut self) -> VdfResult<()> {
         let paths = self.discover_files();
         info!("discovered {} files", paths.len());
@@ -92,6 +95,13 @@ impl<D: Database> ScanEngine<D> {
         if self.settings.iframe_fingerprint {
             self.scan_for_timeline_duplicates()?;
         }
+
+        if self.settings.mpeg7_signature {
+            self.scan_for_mpeg7_duplicates()?;
+        }
+
+        info!("Highlighting best matches per duplicate group");
+        self.highlight_best_matches()?;
 
         let dupes = self.db.all_duplicates()?.len();
         self.db.flush()?;
@@ -554,6 +564,175 @@ impl<D: Database> ScanEngine<D> {
         }
         Ok(())
     }
+
+    // ------------------------------------------------------------------
+    // Phase 3d: MPEG-7 signature comparison
+    // ------------------------------------------------------------------
+
+    fn scan_for_mpeg7_duplicates(&mut self) -> VdfResult<()> {
+        let ffmpeg_path = match which_ffmpeg() {
+            Some(p) => p,
+            None => {
+                warn!("ffmpeg not found in PATH — skipping MPEG-7 phase");
+                return Ok(());
+            }
+        };
+
+        let all = self.db.all_files()?;
+        // Only files that already have an mpeg7_sig_path stored, or that we can
+        // extract a signature for right now.
+        let candidates: Vec<(FileRecord, std::path::PathBuf)> = all
+            .into_iter()
+            .filter(|f| !f.is_image())
+            .filter_map(|f| {
+                // Check for stored sig path in external_ids, then fall back to extraction.
+                let sig = f.external_ids
+                    .as_ref()
+                    .and_then(|e| e.mpeg7_sig_path.clone())
+                    .map(std::path::PathBuf::from)
+                    .filter(|p| p.exists() && p.metadata().map(|m| m.len() > 0).unwrap_or(false))
+                    .or_else(|| {
+                        mpeg7::extract_signature(f.path.as_std_path(), &ffmpeg_path, false)
+                    })?;
+                Some((f, sig))
+            })
+            .collect();
+
+        if candidates.len() < 2 {
+            return Ok(());
+        }
+
+        info!("MPEG-7 signature scan: {} videos with signatures", candidates.len());
+
+        let mut new_pairs = Vec::new();
+
+        for i in 0..candidates.len().saturating_sub(1) {
+            let (a, sig_a) = &candidates[i];
+            let dur_a = a.duration_secs();
+
+            for j in (i + 1)..candidates.len() {
+                let (b, sig_b) = &candidates[j];
+
+                // Hard-link exclusion
+                if self.settings.exclude_hard_links
+                    && hardlink::are_same_file(a.path.as_std_path(), b.path.as_std_path())
+                {
+                    continue;
+                }
+
+                // Duration pre-filter (avoid O(n²) FFmpeg comparisons)
+                let dur_b = b.duration_secs();
+                if dur_a > 0.0 && dur_b > 0.0 {
+                    let shorter = dur_a.min(dur_b);
+                    let longer = dur_a.max(dur_b);
+                    let tol = self.settings.percent_duration_difference / 100.0;
+                    if tol > 0.0 && (longer - shorter) / longer > tol * 2.0 {
+                        continue;
+                    }
+                }
+
+                let result = mpeg7::compare_signatures(sig_a, sig_b, &ffmpeg_path, false);
+                if !result.is_match {
+                    continue;
+                }
+
+                info!(
+                    "[MPEG-7] {} ↔ {}: offset={:.1}s",
+                    a.path.file_name().unwrap_or("?"),
+                    b.path.file_name().unwrap_or("?"),
+                    result.offset_secs,
+                );
+
+                let (long_rec, short_rec) = if dur_a >= dur_b { (a, b) } else { (b, a) };
+                let mut pair = DuplicatePair::new(
+                    long_rec.id.clone(),
+                    short_rec.id.clone(),
+                    1.0, // MPEG-7 match is binary — confidence is always 1.0
+                    MatchMethod::Mpeg7Signature,
+                );
+                pair.clip_offset_secs = Some(result.offset_secs);
+                new_pairs.push(pair);
+            }
+        }
+
+        for pair in new_pairs {
+            self.emit(ScanProgress::DuplicateFound {
+                file_a: pair.file_a.clone(),
+                file_b: pair.file_b.clone(),
+                similarity: pair.similarity,
+            });
+            self.db.add_duplicate(pair)?;
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 4: highlight best matches per group
+    // ------------------------------------------------------------------
+
+    /// For each duplicate cluster, compute quality flags and store them back
+    /// to the DB via upsert_file.  Mirrors C# ScanEngine.HighlightBestMatches().
+    fn highlight_best_matches(&mut self) -> VdfResult<()> {
+        let all_files = self.db.all_files()?;
+        let all_pairs = self.db.all_duplicates()?;
+
+        // Build path → FileRecord map for fast lookup.
+        let file_map: HashMap<String, FileRecord> =
+            all_files.into_iter().map(|f| (f.id.clone(), f)).collect();
+
+        // Union-Find to group files by cluster.
+        let mut parent: HashMap<String, String> = HashMap::new();
+        for id in file_map.keys() {
+            parent.insert(id.clone(), id.clone());
+        }
+        let find = |parent: &mut HashMap<String, String>, mut x: String| -> String {
+            while parent.get(&x).map(|p| p != &x).unwrap_or(false) {
+                let p = parent[&x].clone();
+                let gp = parent.get(&p).cloned().unwrap_or(p.clone());
+                parent.insert(x.clone(), gp.clone());
+                x = gp;
+            }
+            x
+        };
+
+        for pair in &all_pairs {
+            let ra = find(&mut parent, pair.file_a.clone());
+            let rb = find(&mut parent, pair.file_b.clone());
+            if ra != rb {
+                parent.insert(rb, ra);
+            }
+        }
+
+        // Collect clusters: root → [file_ids].
+        let mut clusters: HashMap<String, Vec<String>> = HashMap::new();
+        for id in file_map.keys() {
+            let root = find(&mut parent, id.clone());
+            clusters.entry(root).or_default().push(id.clone());
+        }
+
+        let _criteria = ranker::default_criteria();
+
+        for (_root, member_ids) in &clusters {
+            if member_ids.len() < 2 {
+                continue; // no quality annotation needed for singletons
+            }
+            let members: Vec<FileRecord> = member_ids
+                .iter()
+                .filter_map(|id| file_map.get(id).cloned())
+                .collect();
+
+            let flags_vec = ranker::compute_best_flags(&members);
+
+            for (record, flags) in members.iter().zip(flags_vec.iter()) {
+                // Persist flags to analysis sub-document via DB upsert.
+                let mut updated = record.clone();
+                let analysis = updated.analysis.get_or_insert_with(Default::default);
+                analysis.best_flags = Some(flags.clone());
+                self.db.upsert_file(updated)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +748,14 @@ fn hash_one_file(path: &Utf8Path, settings: &Settings) -> VdfResult<FileRecord> 
     if is_image {
         // Load image, resize to 32×32, extract grayscale bytes
         if let Ok(gray) = load_image_as_gray32(path) {
+            // TooDark check: mirrors GrayBytesUtils.VerifyGrayScaleValues.
+            // 80% or more pixels < 0x20 → mark as too dark, skip hashing.
+            if is_too_dark(&gray) {
+                warn!("image too dark, skipping pHash: {path}");
+                let analysis = record.analysis.get_or_insert_with(Default::default);
+                analysis.is_too_dark = true;
+                return Ok(record);
+            }
             let h = compute_phash(&gray);
             let mut map = std::collections::HashMap::new();
             map.insert(0u64, h);
@@ -638,6 +825,23 @@ fn hash_one_file(path: &Utf8Path, settings: &Settings) -> VdfResult<FileRecord> 
     Ok(record)
 }
 
+// ---------------------------------------------------------------------------
+// FFmpeg binary discovery
+// ---------------------------------------------------------------------------
+
+/// Find the `ffmpeg` binary on PATH. Returns None if not found.
+fn which_ffmpeg() -> Option<std::path::PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .flat_map(|dir| {
+            let mut candidates = vec![dir.join("ffmpeg")];
+            if cfg!(windows) {
+                candidates.push(dir.join("ffmpeg.exe"));
+            }
+            candidates
+        })
+        .find(|p| p.is_file())
+}
+
 /// Load any image file as a 32×32 grayscale array using the `image` crate.
 fn load_image_as_gray32(path: &Utf8Path) -> VdfResult<Box<[u8; 1024]>> {
     use fast_image_resize::images::Image;
@@ -680,6 +884,25 @@ pub fn is_silent_fingerprint(fp: &[u32]) -> bool {
         return false;
     }
     fp.iter().all(|&b| b == 0)
+}
+
+// ---------------------------------------------------------------------------
+// TooDark detection (port of GrayBytesUtils.VerifyGrayScaleValues)
+// ---------------------------------------------------------------------------
+
+/// Pixel brightness threshold below which a pixel is considered "dark".
+/// Matches C# `BlackPixelLimit = 0x20`.
+const BLACK_PIXEL_LIMIT: u8 = 0x20;
+
+/// Percentage of dark pixels that classifies a frame as "too dark" (image rejected).
+/// Matches C# `darkPercent = 80` default.
+const TOO_DARK_PERCENT: f64 = 80.0;
+
+/// Returns `true` when 80% or more of the 32×32 grayscale pixels are below 0x20.
+/// Mirrors `GrayBytesUtils.VerifyGrayScaleValues` (returns false when too dark).
+pub fn is_too_dark(gray: &[u8; 1024]) -> bool {
+    let dark_pixels = gray.iter().filter(|&&b| b <= BLACK_PIXEL_LIMIT).count();
+    100.0 / gray.len() as f64 * dark_pixels as f64 >= TOO_DARK_PERCENT
 }
 
 // ---------------------------------------------------------------------------
@@ -806,6 +1029,11 @@ fn compare_images(
         for j in (i + 1)..images.len() {
             let b = &images[j];
 
+            if settings.exclude_hard_links
+                && hardlink::are_same_file(a.path.as_std_path(), b.path.as_std_path())
+            {
+                continue;
+            }
             if !folder_filter_passes(a, b, settings) {
                 continue;
             }
@@ -838,6 +1066,11 @@ fn compare_videos_linear(
         for j in (i + 1)..videos.len() {
             let b = &videos[j];
 
+            if settings.exclude_hard_links
+                && hardlink::are_same_file(a.path.as_std_path(), b.path.as_std_path())
+            {
+                continue;
+            }
             if !duration_filter_passes(a, b, settings) {
                 continue;
             }
@@ -896,6 +1129,11 @@ fn compare_videos_bucketed(
                     }
                     let b = &videos[j_pos];
 
+                    if settings.exclude_hard_links
+                        && hardlink::are_same_file(a.path.as_std_path(), b.path.as_std_path())
+                    {
+                        continue;
+                    }
                     if !duration_filter_passes(a, b, settings) {
                         continue;
                     }

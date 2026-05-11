@@ -448,6 +448,8 @@ pub struct Analysis {
     pub has_decode_errors: bool,
     pub is_intro_dominated: bool,
     pub is_unreliable_fingerprint: bool,
+    // Per-group quality ranking flags (set by ranker::compute_best_flags after scan)
+    pub best_flags: Option<crate::ranker::BestFlags>,
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -502,6 +504,8 @@ pub struct ExternalIds {
     pub musicbrainz_release_id: Option<String>,
     pub acoustid: Option<String>,
     pub isrc: Option<String>,
+    /// Path to cached MPEG-7 binary signature file on disk.
+    pub mpeg7_sig_path: Option<String>,
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -751,6 +755,48 @@ impl FileRecord {
             .and_then(|fp| fp.temporal_avg.as_ref())
             .and_then(|t| t.hash)
             .map(|h| h as u64)
+    }
+
+    // ── Quality-ranking accessors (used by ranker.rs) ────────────────────────
+
+    /// Frame rate of the primary video stream (fps).
+    pub fn frame_rate(&self) -> Option<f32> {
+        self.video_streams.first().and_then(|v| v.fps)
+    }
+
+    /// Bit-rate of the primary video stream in kbps.
+    pub fn video_bitrate_kbps(&self) -> Option<i64> {
+        self.video_streams.first().and_then(|v| v.bitrate_kbps)
+    }
+
+    /// Sample rate of the primary audio stream in Hz.
+    pub fn audio_sample_rate(&self) -> Option<u32> {
+        self.audio_streams.first().and_then(|a| a.sample_rate_hz)
+    }
+
+    /// Bit-rate of the primary audio stream in kbps.
+    pub fn audio_bitrate_kbps(&self) -> Option<i64> {
+        self.audio_streams.first().and_then(|a| a.bitrate_kbps)
+    }
+
+    /// Numeric rank for the HDR format of the primary video stream.
+    ///
+    /// Higher = better.  Mirrors the ordering used in VDF.Core
+    /// (DolbyVision > HDR10+ > HDR10 > HLG > SDR).
+    pub fn hdr_format_rank(&self) -> u8 {
+        let hdr = self.video_streams.first().and_then(|v| v.hdr_format.as_deref());
+        match hdr {
+            Some(f) if f.contains("Dolby Vision") => 4,
+            Some(f) if f.contains("HDR10+")       => 3,
+            Some(f) if f.contains("HDR10")         => 2,
+            Some(f) if f.contains("HLG")           => 1,
+            _                                       => 0,
+        }
+    }
+
+    /// Overall (container-level) bit-rate in kbps.
+    pub fn overall_bitrate_kbps(&self) -> Option<i64> {
+        self.container.as_ref().and_then(|c| c.overall_bitrate_kbps)
     }
 }
 
