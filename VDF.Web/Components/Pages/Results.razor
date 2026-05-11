@@ -114,6 +114,12 @@ else {
                 <span class="similarity-badge @SimilarityClass(maxSimilarity)">
                     @maxSimilarity.ToString("F1")% similar
                 </span>
+                @* Detection method badges *@
+                <div class="det-badges">
+                    @foreach (var b in GetGroupDetectionBadges(sortedItems)) {
+                        <span class="det-badge det-@b.css" title="@b.tooltip">@b.label</span>
+                    }
+                </div>
                 <div class="group-actions">
                     <select class="group-sort" title="Sort cards"
                             @onchange="e => SetGroupSort(groupId, e.Value?.ToString())">
@@ -254,10 +260,46 @@ else {
                                         <span class="badge-best">Best quality</span>
                                     }
                                     @if (item.Flags.HasFlag(VDF.Core.DuplicateFlags.PartialClip)) {
-                                        <span class="badge-partial-clip">partial clip @item.PartialClipOffsetDisplay</span>
+                                        <span class="badge-partial-clip">partial clip</span>
+                                    }
+                                    @if (item.Flags.HasFlag(VDF.Core.DuplicateFlags.TimelineMatch)) {
+                                        <span class="badge-timeline">timeline match</span>
+                                    }
+                                    @if (item.Flags.HasFlag(VDF.Core.DuplicateFlags.Mpeg7Match)) {
+                                        <span class="badge-mpeg7">MPEG-7</span>
                                     }
                                 </div>
                             </div>
+
+                            @* Timeline strip — shows matching regions relative to full duration *@
+                            @{
+                                var tsegs = GetTimelineSegments(item, sortedItems);
+                                double tdur = item.Duration.TotalSeconds;
+                            }
+                            @if (tdur > 0) {
+                                <div class="card-timeline" @onclick:stopPropagation>
+                                    <div class="tl-track">
+                                        @foreach (var seg in tsegs) {
+                                            <div class="tl-seg @seg.Css"
+                                                 style="left:@seg.StartPct%;width:@seg.WidthPct%"
+                                                 title="@seg.Tooltip"></div>
+                                        }
+                                    </div>
+                                    <div class="tl-labels">
+                                        <span>0:00</span>
+                                        @if (item.Flags.HasFlag(VDF.Core.DuplicateFlags.PartialClip) && item.PartialClipOffset > TimeSpan.Zero) {
+                                            <span class="tl-offset-label" style="left:@(Math.Min(99, item.PartialClipOffset.TotalSeconds / tdur * 100).ToString("F0", System.Globalization.CultureInfo.InvariantCulture))%">
+                                                &#x25BC;@item.PartialClipOffset.ToString(@"h\:mm\:ss")
+                                            </span>
+                                        }
+                                        <span>@item.Duration.ToString(@"h\:mm\:ss")</span>
+                                    </div>
+                                    @* Compact match explanation under the strip *@
+                                    <div class="tl-why">
+                                        @GetMatchExplanation(item, sortedItems)
+                                    </div>
+                                </div>
+                            }
                         </div>
                     }
 
@@ -963,4 +1005,109 @@ else {
 
     public void Dispose() =>
         Scan.StateChanged -= OnStateChanged;
+
+    // ── Timeline & detection helpers ──────────────────────────────────────
+
+    record TimelineSegment(double StartPct, double WidthPct, string Css, string Tooltip);
+
+    /// <summary>
+    /// Returns colored timeline segments for a card's strip.
+    /// Source videos show where each clip appears in them.
+    /// Clip videos show their whole bar as matched content.
+    /// Standard-match videos show evenly-spaced sample markers.
+    /// </summary>
+    static List<TimelineSegment> GetTimelineSegments(DuplicateItem item, List<DuplicateItem> group) {
+        var segs = new List<TimelineSegment>();
+        double dur = item.Duration.TotalSeconds;
+        if (dur <= 0) return segs;
+
+        if (item.Flags.HasFlag(VDF.Core.DuplicateFlags.PartialClip)) {
+            // This IS the clip — the whole video is the duplicate content.
+            // Show it as fully matched, with the offset anchor label handled in the strip markup.
+            segs.Add(new TimelineSegment(0, 100, "tl-clip", "Entire clip matched"));
+        }
+        else {
+            // This is a source video. Find every clip in the group and draw where it appears.
+            var clips = group
+                .Where(i => i.Flags.HasFlag(VDF.Core.DuplicateFlags.PartialClip) &&
+                            i.PartialClipOffset >= TimeSpan.Zero)
+                .ToList();
+
+            foreach (var clip in clips) {
+                double startSec = clip.PartialClipOffset.TotalSeconds;
+                double endSec   = startSec + clip.Duration.TotalSeconds;
+                double startPct = Math.Max(0, startSec / dur * 100);
+                double widthPct = Math.Min(100 - startPct, (endSec - startSec) / dur * 100);
+                if (widthPct < 0.5) widthPct = 0.5; // always visible
+                string tip = $"{System.IO.Path.GetFileName(clip.Path)}: {clip.PartialClipOffset:h\\:mm\\:ss}–{TimeSpan.FromSeconds(endSec):h\\:mm\\:ss}";
+                segs.Add(new TimelineSegment(startPct, widthPct, "tl-source", tip));
+            }
+
+            // If no partial-clip members but a pure similarity group, show sample-frame markers
+            if (clips.Count == 0 && group.All(i => i.Flags == VDF.Core.DuplicateFlags.None || i.Flags == VDF.Core.DuplicateFlags.Flipped)) {
+                // Evenly distribute sample-position dots (4 reference points)
+                for (int n = 1; n <= 4; n++) {
+                    double pct = n * 100.0 / 5;
+                    segs.Add(new TimelineSegment(pct - 0.5, 1, "tl-sample", $"Sample at {TimeSpan.FromSeconds(dur * n / 5):h\\:mm\\:ss}"));
+                }
+            }
+        }
+        return segs;
+    }
+
+    record DetectionBadge(string label, string css, string tooltip);
+
+    /// <summary>Returns detection method badges for the group header.</summary>
+    static List<DetectionBadge> GetGroupDetectionBadges(List<DuplicateItem> group) {
+        var badges = new List<DetectionBadge>();
+
+        bool hasTimeline = group.Any(i => i.Flags.HasFlag(VDF.Core.DuplicateFlags.TimelineMatch));
+        bool hasMpeg7    = group.Any(i => i.Flags.HasFlag(VDF.Core.DuplicateFlags.Mpeg7Match));
+        bool hasAudio    = group.Any(i =>
+            i.Flags.HasFlag(VDF.Core.DuplicateFlags.PartialClip) &&
+            !i.Flags.HasFlag(VDF.Core.DuplicateFlags.TimelineMatch));
+        bool hasPartial  = group.Any(i => i.Flags.HasFlag(VDF.Core.DuplicateFlags.PartialClip));
+        bool onlyFrames  = group.All(i =>
+            i.Flags == VDF.Core.DuplicateFlags.None ||
+            i.Flags == VDF.Core.DuplicateFlags.Flipped);
+
+        if (hasTimeline) badges.Add(new("I-frame timeline", "timeline",
+            "Matched by comparing I-frame perceptual hashes across the full video duration via sliding-window alignment."));
+        if (hasMpeg7)    badges.Add(new("MPEG-7", "mpeg7",
+            "Matched by FFmpeg MPEG-7 Video Signature — a temporal histogram fingerprint resilient to re-encoding and resolution changes."));
+        if (hasAudio)    badges.Add(new("Audio FP", "audio",
+            "Clip detected by audio fingerprint (Chromaprint) sliding-window match."));
+        if (hasPartial)  badges.Add(new("Partial clip", "partial",
+            "One or more files are clips — sub-segments found inside a longer source video."));
+        if (onlyFrames)  badges.Add(new("Frame similarity", "frames",
+            "Matched by comparing sampled frames from a fixed position in each video."));
+        if (group.Any(i => i.Flags.HasFlag(VDF.Core.DuplicateFlags.Flipped)))
+            badges.Add(new("Flipped", "flipped", "Horizontally mirrored copy detected."));
+
+        return badges;
+    }
+
+    /// <summary>One-line human explanation of why this specific card was grouped.</summary>
+    static string GetMatchExplanation(DuplicateItem item, List<DuplicateItem> group) {
+        double dur = item.Duration.TotalSeconds;
+
+        if (item.Flags.HasFlag(VDF.Core.DuplicateFlags.PartialClip) && item.PartialClipOffset >= TimeSpan.Zero) {
+            var method = item.Flags.HasFlag(VDF.Core.DuplicateFlags.TimelineMatch) ? "I-frame timeline"
+                       : item.Flags.HasFlag(VDF.Core.DuplicateFlags.Mpeg7Match)    ? "MPEG-7"
+                       : "Audio fingerprint";
+            return $"{method} · clip found at {item.PartialClipOffset:h\\:mm\\:ss} in source · {item.Similarity:P0} match";
+        }
+
+        // This is the source. How many clips point to it?
+        int clipCount = group.Count(i => i.Flags.HasFlag(VDF.Core.DuplicateFlags.PartialClip));
+        if (clipCount > 0) {
+            double totalCoverage = group
+                .Where(i => i.Flags.HasFlag(VDF.Core.DuplicateFlags.PartialClip) && dur > 0)
+                .Sum(i => i.Duration.TotalSeconds) / dur * 100;
+            return $"Source video · {clipCount} clip(s) mapped to it · {totalCoverage:F0}% of duration covered";
+        }
+
+        // Standard frame-similarity match
+        return $"Frame similarity · {item.Similarity:P0} match";
+    }
 }
