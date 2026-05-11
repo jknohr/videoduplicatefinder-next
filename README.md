@@ -1,4 +1,4 @@
-# Video Duplicate Finder
+# Media Organizer
 
 Video Duplicate Finder is a cross-platform tool that finds duplicate and near-duplicate video (and image) files on disk based on visual similarity. Unlike basic duplicate finders, it handles files that differ in resolution, frame rate, watermark, bitrate, encoding, and even videos that are **partial clips** of a longer original — including when the same scene has been re-edited.
 
