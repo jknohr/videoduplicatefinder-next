@@ -1245,3 +1245,20 @@ input.input-invalid:focus { box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.2); }
 .rename-input { padding: .4rem .6rem; border: 1px solid var(--border, #ccc); border-radius: 4px; font-size: .9rem; width: 100%; box-sizing: border-box; }
 .rename-actions { display: flex; gap: .5rem; justify-content: flex-end; }
 
+/* ── Metadata editor modal (B4b) ──────────────────────────────────────── */
+.meta-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 910; display: flex; align-items: center; justify-content: center; }
+.meta-box { background: var(--surface, #fff); border-radius: 8px; width: min(560px, 96vw); max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(0,0,0,.35); overflow: hidden; }
+.meta-header { display: flex; align-items: center; gap: .5rem; padding: 1rem 1.25rem .75rem; border-bottom: 1px solid var(--border, #e0e0e0); }
+.meta-header h3 { margin: 0; font-size: 1rem; flex-shrink: 0; }
+.meta-filename { flex: 1; font-size: .75rem; color: var(--text-muted, #999); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.meta-close { background: none; border: none; font-size: 1.1rem; cursor: pointer; padding: 0 .25rem; flex-shrink: 0; }
+.meta-loading { padding: 2rem; text-align: center; color: var(--text-muted, #999); }
+.meta-fields { padding: .75rem 1.25rem; overflow-y: auto; display: flex; flex-direction: column; gap: .5rem; }
+.meta-field { display: flex; align-items: center; gap: .75rem; }
+.meta-field-label { width: 140px; flex-shrink: 0; font-size: .82rem; color: var(--text-muted, #888); text-align: right; }
+.meta-field-input { flex: 1; padding: .3rem .5rem; border: 1px solid var(--border, #ccc); border-radius: 4px; font-size: .87rem; }
+.meta-error { margin: .5rem 1.25rem; padding: .5rem .75rem; background: rgba(220,50,50,.1); border: 1px solid rgba(220,50,50,.3); border-radius: 4px; font-size: .82rem; color: #c0392b; }
+.meta-footer { padding: .75rem 1.25rem; border-top: 1px solid var(--border, #e0e0e0); display: flex; flex-direction: column; gap: .5rem; }
+.meta-hint { font-size: .75rem; color: var(--text-muted, #999); }
+.meta-actions { display: flex; gap: .5rem; justify-content: flex-end; }
+

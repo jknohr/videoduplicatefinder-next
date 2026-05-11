@@ -209,6 +209,40 @@ app.MapGet("/video", (HttpContext ctx, string path, ScanService scan) => {
 	return Results.File(resolved, mime, enableRangeProcessing: true);
 });
 
+// GET /file/metadata — reads embedded tags from a video file
+record MetadataWriteRequest(string Path, Dictionary<string, string> Tags);
+
+app.MapGet("/file/metadata", async (HttpContext ctx, string path, ScanService scan) => {
+	if (string.IsNullOrEmpty(path)) return Results.BadRequest();
+	string resolved = System.IO.Path.GetFullPath(path);
+	bool allowed = scan.Settings.IncludeList.Any(dir =>
+		resolved.StartsWith(System.IO.Path.GetFullPath(dir), StringComparison.OrdinalIgnoreCase));
+	if (!allowed) return Results.Forbid();
+	if (!File.Exists(resolved)) return Results.NotFound();
+	var tags = VDF.Core.FFTools.FFProbeEngine.GetMetadataTags(resolved);
+	return Results.Ok(tags);
+});
+
+// POST /file/metadata — writes embedded tags to a video file
+app.MapPost("/file/metadata", async (HttpContext ctx, ScanService scan) => {
+	MetadataWriteRequest? req;
+	try {
+		req = await ctx.Request.ReadFromJsonAsync<MetadataWriteRequest>();
+	}
+	catch {
+		return Results.BadRequest();
+	}
+	if (req == null || string.IsNullOrEmpty(req.Path)) return Results.BadRequest();
+	string resolved = System.IO.Path.GetFullPath(req.Path);
+	bool allowed = scan.Settings.IncludeList.Any(dir =>
+		resolved.StartsWith(System.IO.Path.GetFullPath(dir), StringComparison.OrdinalIgnoreCase));
+	if (!allowed) return Results.Forbid();
+	if (!File.Exists(resolved)) return Results.NotFound();
+	var (success, error) = VDF.Core.FFTools.FfmpegEngine.WriteMetadataTags(resolved, req.Tags ?? new(), false);
+	if (success) return Results.Ok(new { success = true });
+	return Results.Problem(error ?? "Unknown error writing metadata.");
+});
+
 app.MapRazorComponents<VDF.Web.Components.App>()
 	.AddInteractiveServerRenderMode();
 

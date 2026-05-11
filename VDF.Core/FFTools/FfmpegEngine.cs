@@ -745,6 +745,65 @@ namespace VDF.Core.FFTools {
 		}
 	}
 
+	// ── Metadata tag writing ──────────────────────────────────────────────────
+	internal static partial class FfmpegEngine {
+		public static (bool success, string? error) WriteMetadataTags(
+			string path, Dictionary<string, string> tags, bool extendedLogging) {
+			if (string.IsNullOrEmpty(FFmpegPath))
+				return (false, "FFmpeg path is not configured.");
+			if (!File.Exists(path))
+				return (false, $"File not found: {path}");
+
+			string ext = Path.GetExtension(path);
+			string tempPath = path + ".vdf_meta_tmp" + ext;
+
+			var psi = new ProcessStartInfo {
+				FileName = FFmpegPath,
+				CreateNoWindow = true,
+				RedirectStandardOutput = false,
+				RedirectStandardError = true,
+				WindowStyle = ProcessWindowStyle.Hidden,
+				WorkingDirectory = Path.GetDirectoryName(FFmpegPath)!
+			};
+			psi.ArgumentList.Add("-hide_banner");
+			psi.ArgumentList.Add("-loglevel"); psi.ArgumentList.Add("quiet");
+			psi.ArgumentList.Add("-y");
+			psi.ArgumentList.Add("-i"); psi.ArgumentList.Add(FFToolsUtils.LongPathFix(path));
+			psi.ArgumentList.Add("-c"); psi.ArgumentList.Add("copy");
+			psi.ArgumentList.Add("-map_metadata"); psi.ArgumentList.Add("0");
+			foreach (var kvp in tags) {
+				psi.ArgumentList.Add("-metadata");
+				psi.ArgumentList.Add($"{kvp.Key}={kvp.Value}");
+			}
+			psi.ArgumentList.Add(FFToolsUtils.LongPathFix(tempPath));
+
+			string stderrOutput = string.Empty;
+			try {
+				using var process = new Process { StartInfo = psi };
+				process.Start();
+				stderrOutput = process.StandardError.ReadToEnd();
+				bool exited = process.WaitForExit(60_000);
+				if (!exited) {
+					try { process.Kill(); } catch { }
+					if (File.Exists(tempPath)) File.Delete(tempPath);
+					return (false, "FFmpeg timed out.");
+				}
+				if (process.ExitCode != 0) {
+					if (File.Exists(tempPath)) File.Delete(tempPath);
+					return (false, string.IsNullOrWhiteSpace(stderrOutput)
+						? $"FFmpeg exited with code {process.ExitCode}."
+						: stderrOutput.Trim());
+				}
+				File.Move(tempPath, path, overwrite: true);
+				return (true, null);
+			}
+			catch (Exception ex) {
+				try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+				return (false, ex.Message);
+			}
+		}
+	}
+
 	// ── SSIM second-pass verification ─────────────────────────────────────────
 	internal static partial class FfmpegEngine {
 		/// <summary>
