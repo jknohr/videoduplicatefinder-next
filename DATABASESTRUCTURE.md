@@ -63,13 +63,14 @@ graph TD
             mp4_udta["📦 mp4_udta{}\niTunes atoms"]
         end
 
-        subgraph fingerprints_layer["🔍 Fingerprints Layer"]
-            phash["pHash vectors + timestamps"]
-            iframe_fp["I-frame hashes + timestamps"]
-            audio_fp["Chromaprint Vec<u32>"]
-            temporal_avg["temporal avg hash (u64)"]
-            mpeg7["MPEG-7 .sig path"]
-            scene_data["scene change timestamps\neffective skip offset"]
+        subgraph fingerprints_layer["🔍 Fingerprints Layer  (one sub-schema per analysis phase)"]
+            fp_phash["fingerprints.phash{}\nsampling_window · samples[]\nper-frame: timestamp · hash · brightness\nskipped_dark · settings_used"]
+            fp_iframe["fingerprints.iframe{}\nall_keyframe_timestamps[]\nkeyframe_density_per_min\nsamples[] · settings_used"]
+            fp_scene["fingerprints.scene{}\nevents[]: timestamp · score · is_significant\neffective_skip_start_secs · settings_used"]
+            fp_temporal["fingerprints.temporal_avg{}\nhash · window · settings_used"]
+            fp_mpeg7["fingerprints.mpeg7{}\nsig_path · windows_analyzed\nduration_covered · computed_at"]
+            fp_chromaprint["fingerprints.chromaprint{}\nstream_index · duration_analyzed\nfingerprint[] · silence_ratio\nsettings_used"]
+            fp_validity["fingerprints.all_phases_complete\nfingerprints.settings_hash"]
         end
 
         subgraph geo_layer["🌍 Geo Layer"]
@@ -773,48 +774,240 @@ DEFINE FIELD IF NOT EXISTS vorbis_comment.extra              ON file TYPE option
 
 #### Sub-schema: `fingerprints`
 
-All computed fingerprints and detection artifacts. Completely separate from metadata.
+One sub-schema per analysis phase. Each phase is fully self-describing: it stores the
+settings it was computed with, when it ran, what quality it produced, and the actual data.
+
+This design means:
+- Any phase can be independently invalidated and recomputed without touching the others
+- Every comparison result is reproducible — you know exactly which settings produced which hashes
+- Quality gates use real per-frame data, not file-level flags
 
 ```surql
-DEFINE FIELD IF NOT EXISTS fingerprints                           ON file TYPE option<object>;
+DEFINE FIELD IF NOT EXISTS fingerprints ON file TYPE option<object>;
 
--- pHash (frame-level visual fingerprint)
-DEFINE FIELD IF NOT EXISTS fingerprints.phash_vector             ON file TYPE array<int>;
-    -- array<u64 as int>; one per sample frame; MTREE HAMMING indexed
-DEFINE FIELD IF NOT EXISTS fingerprints.phash_timestamps         ON file TYPE array<float>;
-    -- parallel: seconds from start at which each pHash was sampled
-
--- I-frame timeline fingerprint
-DEFINE FIELD IF NOT EXISTS fingerprints.iframe_phashes           ON file TYPE array<int>;
-DEFINE FIELD IF NOT EXISTS fingerprints.iframe_timestamps        ON file TYPE array<float>;
-DEFINE FIELD IF NOT EXISTS fingerprints.iframe_sample_interval   ON file TYPE option<float>;
-    -- interval used when these hashes were computed (for invalidation)
-
--- Audio fingerprint (Chromaprint pipeline → Vec<u32>)
-DEFINE FIELD IF NOT EXISTS fingerprints.audio_fp                 ON file TYPE array<int>;
-    -- one u32 per second of audio; null = not computed; empty = no audio
-
--- Temporal average hash (single blended frame hash)
-DEFINE FIELD IF NOT EXISTS fingerprints.temporal_avg_hash        ON file TYPE option<int>;
-DEFINE FIELD IF NOT EXISTS fingerprints.temporal_avg_start_secs  ON file TYPE option<float>;
-DEFINE FIELD IF NOT EXISTS fingerprints.temporal_avg_window_secs ON file TYPE option<float>;
-
--- MPEG-7 video signature
-DEFINE FIELD IF NOT EXISTS fingerprints.mpeg7_sig_path           ON file TYPE option<string>;
-    -- path to .sig file on disk; null = not yet computed
-
--- Scene detection
-DEFINE FIELD IF NOT EXISTS fingerprints.scene_change_timestamps  ON file TYPE array<float>;
-DEFINE FIELD IF NOT EXISTS fingerprints.scene_detection_threshold ON file TYPE option<float>;
-    -- threshold used; stored for invalidation (rerun if threshold changes)
-DEFINE FIELD IF NOT EXISTS fingerprints.effective_skip_start_secs ON file TYPE option<float>;
-    -- computed from scene timestamps + settings.scene_skip_count
-
--- Computed at scan time; used to detect when fingerprints need recomputation
-DEFINE FIELD IF NOT EXISTS fingerprints.computed_at              ON file TYPE option<datetime>;
+-- ── Phase validity (top-level) ────────────────────────────────────────────────
 DEFINE FIELD IF NOT EXISTS fingerprints.settings_hash            ON file TYPE option<string>;
-    -- SHA-256 of the Settings fields that affect fingerprint computation;
-    -- if settings change, this mismatches and fingerprints are recomputed
+    -- SHA-256 of the full Settings struct that affects ALL phases.
+    -- If this mismatches current settings, the whole fingerprints object is stale.
+DEFINE FIELD IF NOT EXISTS fingerprints.all_phases_complete      ON file TYPE bool DEFAULT false;
+    -- true only when every enabled phase has run successfully
+```
+
+---
+
+##### `fingerprints.phash` — Visual perceptual hash (standard pHash, Phase 1)
+
+Samples N frames across the effective duration window (after skip adjustment), computes
+a 64-bit DCT pHash for each. The sampling window itself is stored so comparisons can be
+replayed exactly.
+
+```surql
+DEFINE FIELD IF NOT EXISTS fingerprints.phash                           ON file TYPE option<object>;
+
+-- Provenance
+DEFINE FIELD IF NOT EXISTS fingerprints.phash.computed_at               ON file TYPE option<datetime>;
+DEFINE FIELD IF NOT EXISTS fingerprints.phash.settings_used             ON file TYPE option<object>;
+    -- { thumbnail_count, skip_start_secs, skip_start_pct, skip_end_secs, skip_end_pct,
+    --   max_sampling_duration_secs, ignore_black_pixels, ignore_white_pixels }
+
+-- Effective sampling window (AFTER skip adjustment — not the raw settings values)
+-- This is what was actually used for this file given its duration.
+DEFINE FIELD IF NOT EXISTS fingerprints.phash.window_start_secs         ON file TYPE option<float>;
+DEFINE FIELD IF NOT EXISTS fingerprints.phash.window_end_secs           ON file TYPE option<float>;
+DEFINE FIELD IF NOT EXISTS fingerprints.phash.window_duration_secs      ON file TYPE option<float>;
+
+-- Per-sample data — array of objects, one per sampled frame
+-- Each: { ts: float, hash: int, brightness: float, skipped: bool, skip_reason: string? }
+--   ts            seconds from file start at which the frame was decoded
+--   hash          64-bit pHash stored as int (SurrealDB int is i64; store as two u32s if needed)
+--   brightness    mean pixel value 0.0-1.0 of the 32×32 grayscale frame
+--   skipped       true if frame was not used in comparison (too dark / too bright / decode error)
+--   skip_reason   "too_dark" | "too_bright" | "decode_error" | null
+DEFINE FIELD IF NOT EXISTS fingerprints.phash.samples                   ON file TYPE array<object>;
+DEFINE FIELD IF NOT EXISTS fingerprints.phash.samples[*].ts             ON file TYPE float;
+DEFINE FIELD IF NOT EXISTS fingerprints.phash.samples[*].hash           ON file TYPE int;
+DEFINE FIELD IF NOT EXISTS fingerprints.phash.samples[*].brightness     ON file TYPE float;
+DEFINE FIELD IF NOT EXISTS fingerprints.phash.samples[*].skipped        ON file TYPE bool;
+DEFINE FIELD IF NOT EXISTS fingerprints.phash.samples[*].skip_reason    ON file TYPE option<string>;
+
+-- Derived convenience fields (computed from samples[]; stored for index/query speed)
+DEFINE FIELD IF NOT EXISTS fingerprints.phash.sample_count              ON file TYPE int DEFAULT 0;
+DEFINE FIELD IF NOT EXISTS fingerprints.phash.usable_sample_count       ON file TYPE int DEFAULT 0;
+    -- samples where skipped = false
+DEFINE FIELD IF NOT EXISTS fingerprints.phash.mean_brightness           ON file TYPE option<float>;
+DEFINE FIELD IF NOT EXISTS fingerprints.phash.dark_frame_ratio          ON file TYPE option<float>;
+    -- fraction of samples that were too dark; high ratio = hard to fingerprint
+
+-- Flat hash vector extracted from samples (for MTREE vector index)
+-- Equal to [s.hash FOR s IN samples WHERE NOT s.skipped]
+DEFINE FIELD IF NOT EXISTS fingerprints.phash.hash_vector               ON file TYPE array<int>;
+```
+
+---
+
+##### `fingerprints.iframe` — I-frame timeline fingerprint (Phase 2)
+
+Scans the container packet stream (no decoding) to locate ALL keyframe PTS timestamps,
+then samples N evenly-spaced positions. Stores both the full keyframe list (for density
+analysis) and the sampled subset with hashes.
+
+```surql
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe                          ON file TYPE option<object>;
+
+-- Provenance
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.computed_at              ON file TYPE option<datetime>;
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.settings_used            ON file TYPE option<object>;
+    -- { sample_interval_secs, max_samples }
+
+-- ALL keyframe timestamps found in the packet stream (before sampling)
+-- Stored as a flat array<float>; used for encode-quality analysis.
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.all_keyframe_timestamps  ON file TYPE array<float>;
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.total_keyframes          ON file TYPE int DEFAULT 0;
+
+-- Encode-quality metrics derived from the full keyframe list
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.keyframe_density_per_min ON file TYPE option<float>;
+    -- total_keyframes / (duration_secs / 60)
+    -- Low = very long GOPs (efficient but less seekable); high = many keyframes (bloated or screencap)
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.avg_gop_secs             ON file TYPE option<float>;
+    -- average distance between keyframes in seconds
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.min_gop_secs             ON file TYPE option<float>;
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.max_gop_secs             ON file TYPE option<float>;
+
+-- Sampled subset — evenly-spaced positions chosen from the full keyframe list
+-- Each: { ts: float, hash: int }
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples                  ON file TYPE array<object>;
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples[*].ts            ON file TYPE float;
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples[*].hash          ON file TYPE int;
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.sample_count             ON file TYPE int DEFAULT 0;
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.sample_interval_secs     ON file TYPE option<float>;
+    -- actual interval used (may differ from settings if max_samples was hit)
+```
+
+---
+
+##### `fingerprints.scene` — Scene-change detection (Phase 4)
+
+Runs FFmpeg `scdet` filter to find visual transition timestamps. Each event carries a
+score so we know whether it was a hard cut or a gradual fade. The effective skip offset
+is computed from the event list and stored here — it is a derived value, not a setting.
+
+```surql
+DEFINE FIELD IF NOT EXISTS fingerprints.scene                           ON file TYPE option<object>;
+
+-- Provenance
+DEFINE FIELD IF NOT EXISTS fingerprints.scene.computed_at               ON file TYPE option<datetime>;
+DEFINE FIELD IF NOT EXISTS fingerprints.scene.settings_used             ON file TYPE option<object>;
+    -- { detection_threshold, skip_count }
+
+-- Scene change events — array of objects, one per detected transition
+-- Each: { ts: float, score: float, is_significant: bool }
+--   ts              seconds from file start
+--   score           scdet score 0.0-100.0; high = hard cut; low = gradual fade/dissolve
+--   is_significant  score >= detection_threshold
+DEFINE FIELD IF NOT EXISTS fingerprints.scene.events                    ON file TYPE array<object>;
+DEFINE FIELD IF NOT EXISTS fingerprints.scene.events[*].ts              ON file TYPE float;
+DEFINE FIELD IF NOT EXISTS fingerprints.scene.events[*].score           ON file TYPE float;
+DEFINE FIELD IF NOT EXISTS fingerprints.scene.events[*].is_significant  ON file TYPE bool;
+
+-- Derived
+DEFINE FIELD IF NOT EXISTS fingerprints.scene.event_count               ON file TYPE int DEFAULT 0;
+DEFINE FIELD IF NOT EXISTS fingerprints.scene.significant_event_count   ON file TYPE int DEFAULT 0;
+DEFINE FIELD IF NOT EXISTS fingerprints.scene.effective_skip_start_secs ON file TYPE option<float>;
+    -- timestamp of the Nth significant event (settings.scene_skip_count)
+    -- NULL = no significant events found → skip = 0
+DEFINE FIELD IF NOT EXISTS fingerprints.scene.intro_cut_score           ON file TYPE option<float>;
+    -- score of the transition at effective_skip_start_secs; high = very abrupt intro end
+```
+
+---
+
+##### `fingerprints.temporal_avg` — Temporal average hash (Phase 3)
+
+Collapses a configurable time window into a single blended frame hash. Used as a fast
+pre-filter: if two videos' temporal average hashes differ beyond threshold, skip the
+expensive I-frame sliding window entirely.
+
+```surql
+DEFINE FIELD IF NOT EXISTS fingerprints.temporal_avg                    ON file TYPE option<object>;
+
+-- Provenance
+DEFINE FIELD IF NOT EXISTS fingerprints.temporal_avg.computed_at        ON file TYPE option<datetime>;
+DEFINE FIELD IF NOT EXISTS fingerprints.temporal_avg.settings_used      ON file TYPE option<object>;
+    -- { start_secs, window_secs }
+
+-- The hash (single 64-bit value stored as int)
+DEFINE FIELD IF NOT EXISTS fingerprints.temporal_avg.hash               ON file TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS fingerprints.temporal_avg.window_start_secs  ON file TYPE option<float>;
+DEFINE FIELD IF NOT EXISTS fingerprints.temporal_avg.window_end_secs    ON file TYPE option<float>;
+DEFINE FIELD IF NOT EXISTS fingerprints.temporal_avg.mean_brightness    ON file TYPE option<float>;
+    -- mean pixel value of the blended frame; near 0 = black window = unreliable hash
+```
+
+---
+
+##### `fingerprints.mpeg7` — MPEG-7 video signature (Phase 5)
+
+ISO/IEC 15938 coarse signature extracted via FFmpeg `signature` filter. ~2.5 MB/hour.
+Resilient to resolution changes, bitrate compression, mild cropping.
+
+```surql
+DEFINE FIELD IF NOT EXISTS fingerprints.mpeg7                           ON file TYPE option<object>;
+
+-- Provenance
+DEFINE FIELD IF NOT EXISTS fingerprints.mpeg7.computed_at               ON file TYPE option<datetime>;
+
+-- Signature file
+DEFINE FIELD IF NOT EXISTS fingerprints.mpeg7.sig_path                  ON file TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS fingerprints.mpeg7.sig_size_bytes            ON file TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS fingerprints.mpeg7.sig_sha256                ON file TYPE option<string>;
+    -- hash of the .sig file itself; detects if file was corrupted or overwritten
+
+-- Coverage metadata (from FFmpeg output)
+DEFINE FIELD IF NOT EXISTS fingerprints.mpeg7.windows_analyzed          ON file TYPE option<int>;
+    -- number of 90-frame windows the signature covers
+DEFINE FIELD IF NOT EXISTS fingerprints.mpeg7.duration_covered_secs     ON file TYPE option<float>;
+    -- may be < container.duration_secs if FFmpeg stopped early
+DEFINE FIELD IF NOT EXISTS fingerprints.mpeg7.frames_processed          ON file TYPE option<int>;
+```
+
+---
+
+##### `fingerprints.chromaprint` — Audio fingerprint / partial clip detection (Phase 6)
+
+Chromaprint-style chroma extraction pipeline: FFmpeg decode → SWR resample 11025 Hz mono
+s16 → Hann-window FFT → 12 chroma bins → 5-tap FIR → L2 normalise → 32 pairwise comparisons
+→ majority-vote → Vec<u32> (one element per second of audio).
+
+```surql
+DEFINE FIELD IF NOT EXISTS fingerprints.chromaprint                     ON file TYPE option<object>;
+
+-- Provenance
+DEFINE FIELD IF NOT EXISTS fingerprints.chromaprint.computed_at         ON file TYPE option<datetime>;
+DEFINE FIELD IF NOT EXISTS fingerprints.chromaprint.settings_used       ON file TYPE option<object>;
+    -- { partial_clip_min_ratio, partial_clip_min_similarity }
+
+-- Which audio stream was used (index into audio_streams[])
+DEFINE FIELD IF NOT EXISTS fingerprints.chromaprint.audio_stream_index  ON file TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS fingerprints.chromaprint.input_sample_rate   ON file TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS fingerprints.chromaprint.input_channels      ON file TYPE option<int>;
+
+-- Duration and coverage
+DEFINE FIELD IF NOT EXISTS fingerprints.chromaprint.duration_analyzed_secs ON file TYPE option<float>;
+    -- seconds of audio actually processed (may be < container duration)
+DEFINE FIELD IF NOT EXISTS fingerprints.chromaprint.fingerprint_length  ON file TYPE option<int>;
+    -- should equal ceil(duration_analyzed_secs); stored for validation
+
+-- The fingerprint: one u32 per second of audio
+DEFINE FIELD IF NOT EXISTS fingerprints.chromaprint.fingerprint         ON file TYPE array<int>;
+
+-- Quality indicators
+DEFINE FIELD IF NOT EXISTS fingerprints.chromaprint.silence_ratio       ON file TYPE option<float>;
+    -- fraction of one-second windows that produced an all-zero fingerprint frame
+    -- high ratio = mostly silent audio = fingerprint is unreliable for matching
+DEFINE FIELD IF NOT EXISTS fingerprints.chromaprint.is_reliable         ON file TYPE bool DEFAULT true;
+    -- false if silence_ratio > 0.5 or duration_analyzed < 10s or decode errors occurred
+DEFINE FIELD IF NOT EXISTS fingerprints.chromaprint.error               ON file TYPE option<string>;
+    -- error message if extraction failed partway through
 ```
 
 ---
@@ -851,31 +1044,97 @@ DEFINE FIELD IF NOT EXISTS geo.track_end_time            ON file TYPE option<dat
 
 #### Sub-schema: `analysis`
 
-Results of automated quality and content analysis. Populated during or after scan.
+Quality and content analysis results. Organised into three layers:
+- **Aggregate metrics** — single numbers describing the whole file
+- **Segment lists** — time-stamped events with start/end (black segments, silence, clipping, decode errors)
+- **Pre-filter flags** — boolean gates derived from the above; used as fast skip conditions before expensive comparisons
 
 ```surql
-DEFINE FIELD IF NOT EXISTS analysis                              ON file TYPE option<object>;
+DEFINE FIELD IF NOT EXISTS analysis ON file TYPE option<object>;
 
--- Visual quality
-DEFINE FIELD IF NOT EXISTS analysis.black_pixel_ratio           ON file TYPE option<float>;  -- 0.0-1.0
-DEFINE FIELD IF NOT EXISTS analysis.white_pixel_ratio           ON file TYPE option<float>;
-DEFINE FIELD IF NOT EXISTS analysis.blur_score                  ON file TYPE option<float>;  -- Laplacian variance
-DEFINE FIELD IF NOT EXISTS analysis.scene_complexity            ON file TYPE option<float>;  -- DCT entropy-based
-DEFINE FIELD IF NOT EXISTS analysis.motion_score                ON file TYPE option<float>;  -- avg inter-frame diff
+-- ── Visual: aggregate ────────────────────────────────────────────────────────
+DEFINE FIELD IF NOT EXISTS analysis.mean_brightness             ON file TYPE option<float>;
+    -- mean pixel value across all pHash sample frames (0.0-1.0)
+DEFINE FIELD IF NOT EXISTS analysis.brightness_variance         ON file TYPE option<float>;
+    -- variance of per-frame brightness; high = lots of content diversity
+DEFINE FIELD IF NOT EXISTS analysis.dark_frame_ratio            ON file TYPE option<float>;
+    -- fraction of sample frames with mean brightness < 0.1 (nearly black)
+DEFINE FIELD IF NOT EXISTS analysis.blur_score                  ON file TYPE option<float>;
+    -- Laplacian variance of the sharpest sample frame; low = blurry/unfocused
+DEFINE FIELD IF NOT EXISTS analysis.scene_cut_rate              ON file TYPE option<float>;
+    -- significant scene changes per minute (from fingerprints.scene.events)
+    -- high = rapidly cut content; low = slow burns / single-shot
 
--- Audio quality
+-- ── Visual: segment lists ────────────────────────────────────────────────────
+-- Black segments: contiguous regions where decoded frames are nearly black.
+-- Common causes: bad rip, chapter separator, corrupted encode, pre-roll filler.
+-- Each: { start_secs: float, end_secs: float, duration_secs: float }
+DEFINE FIELD IF NOT EXISTS analysis.black_segments              ON file TYPE array<object>;
+DEFINE FIELD IF NOT EXISTS analysis.black_segments[*].start_secs ON file TYPE float;
+DEFINE FIELD IF NOT EXISTS analysis.black_segments[*].end_secs   ON file TYPE float;
+DEFINE FIELD IF NOT EXISTS analysis.black_segments[*].duration_secs ON file TYPE float;
+DEFINE FIELD IF NOT EXISTS analysis.total_black_secs            ON file TYPE option<float>;
+
+-- Decode error segments: regions where FFmpeg reported errors or produced corrupt frames.
+-- Each: { start_secs: float, error_type: string, error_count: int }
+DEFINE FIELD IF NOT EXISTS analysis.decode_errors               ON file TYPE array<object>;
+DEFINE FIELD IF NOT EXISTS analysis.decode_errors[*].start_secs  ON file TYPE float;
+DEFINE FIELD IF NOT EXISTS analysis.decode_errors[*].error_type  ON file TYPE string;
+    -- "corrupt_frame"|"missing_reference"|"pts_discontinuity"|"decode_failure"
+DEFINE FIELD IF NOT EXISTS analysis.decode_errors[*].error_count ON file TYPE int;
+DEFINE FIELD IF NOT EXISTS analysis.total_decode_errors         ON file TYPE int DEFAULT 0;
+
+-- ── Audio: aggregate ─────────────────────────────────────────────────────────
 DEFINE FIELD IF NOT EXISTS analysis.rms_db                      ON file TYPE option<float>;
+    -- RMS loudness in dBFS; -∞ = silence
 DEFINE FIELD IF NOT EXISTS analysis.peak_db                     ON file TYPE option<float>;
-DEFINE FIELD IF NOT EXISTS analysis.replaygain_lufs             ON file TYPE option<float>;  -- EBU R128 integrated
-DEFINE FIELD IF NOT EXISTS analysis.dynamic_range_db            ON file TYPE option<float>;  -- DR score
-DEFINE FIELD IF NOT EXISTS analysis.silence_ratio               ON file TYPE option<float>;  -- fraction of file that is silent
-DEFINE FIELD IF NOT EXISTS analysis.clipping_ratio              ON file TYPE option<float>;  -- fraction of samples above 0 dBFS
+    -- sample peak in dBFS
+DEFINE FIELD IF NOT EXISTS analysis.true_peak_dbfs              ON file TYPE option<float>;
+    -- inter-sample true peak (higher than sample peak due to reconstruction)
+DEFINE FIELD IF NOT EXISTS analysis.integrated_lufs             ON file TYPE option<float>;
+    -- EBU R128 integrated loudness; used for ReplayGain normalisation target
+DEFINE FIELD IF NOT EXISTS analysis.lufs_short_term_max         ON file TYPE option<float>;
+    -- maximum 3-second LUFS window; high spikes = ads, explosions, or level errors
+DEFINE FIELD IF NOT EXISTS analysis.dynamic_range_db            ON file TYPE option<float>;
+    -- DR standard score; < 8 = heavily compressed; > 14 = wide dynamic range
+DEFINE FIELD IF NOT EXISTS analysis.silence_ratio               ON file TYPE option<float>;
+    -- fraction of audio that is below silence threshold
+DEFINE FIELD IF NOT EXISTS analysis.clipping_ratio              ON file TYPE option<float>;
+    -- fraction of audio samples at or above 0 dBFS
 
--- Derived flags (computed from analysis values; used in comparison pre-filters)
+-- ── Audio: segment lists ──────────────────────────────────────────────────────
+-- Silence segments: contiguous regions below silence threshold.
+-- Each: { start_secs: float, end_secs: float, duration_secs: float }
+DEFINE FIELD IF NOT EXISTS analysis.silence_segments            ON file TYPE array<object>;
+DEFINE FIELD IF NOT EXISTS analysis.silence_segments[*].start_secs  ON file TYPE float;
+DEFINE FIELD IF NOT EXISTS analysis.silence_segments[*].end_secs    ON file TYPE float;
+DEFINE FIELD IF NOT EXISTS analysis.silence_segments[*].duration_secs ON file TYPE float;
+DEFINE FIELD IF NOT EXISTS analysis.total_silence_secs          ON file TYPE option<float>;
+
+-- Clipping events: regions where audio clips above 0 dBFS.
+-- Each: { start_secs: float, end_secs: float, peak_dbfs: float }
+DEFINE FIELD IF NOT EXISTS analysis.clipping_segments           ON file TYPE array<object>;
+DEFINE FIELD IF NOT EXISTS analysis.clipping_segments[*].start_secs  ON file TYPE float;
+DEFINE FIELD IF NOT EXISTS analysis.clipping_segments[*].end_secs    ON file TYPE float;
+DEFINE FIELD IF NOT EXISTS analysis.clipping_segments[*].peak_dbfs   ON file TYPE float;
+
+-- ── Pre-filter flags (derived; evaluated before expensive comparisons) ────────
+-- These are the fast-exit conditions checked in Phase 3 compare_all().
+-- Recomputed automatically when analysis data changes.
 DEFINE FIELD IF NOT EXISTS analysis.is_too_dark                 ON file TYPE bool DEFAULT false;
+    -- dark_frame_ratio > 0.8 AND mean_brightness < 0.05
 DEFINE FIELD IF NOT EXISTS analysis.is_silent                   ON file TYPE bool DEFAULT false;
+    -- silence_ratio > 0.95 OR rms_db < -60
 DEFINE FIELD IF NOT EXISTS analysis.is_clipping                 ON file TYPE bool DEFAULT false;
-DEFINE FIELD IF NOT EXISTS analysis.is_mostly_black             ON file TYPE bool DEFAULT false;
+    -- clipping_ratio > 0.001 (audible distortion)
+DEFINE FIELD IF NOT EXISTS analysis.has_decode_errors           ON file TYPE bool DEFAULT false;
+    -- total_decode_errors > 0
+DEFINE FIELD IF NOT EXISTS analysis.is_intro_dominated          ON file TYPE bool DEFAULT false;
+    -- fingerprints.scene.effective_skip_start_secs > container.duration_secs * 0.3
+    -- (intro is more than 30% of the video — sampling window is small)
+DEFINE FIELD IF NOT EXISTS analysis.is_unreliable_fingerprint   ON file TYPE bool DEFAULT false;
+    -- OR of: is_too_dark, is_silent (chromaprint), dark_frame_ratio > 0.5, decode_errors > 10
+    -- When true: comparison results for this file should be shown with a warning
 ```
 
 ---
@@ -955,8 +1214,22 @@ DEFINE INDEX IF NOT EXISTS file_tags_fts          ON file FIELDS tags
     SEARCH ANALYZER media_text BM25(1.2, 0.75);
 
 -- ── Vector: pHash nearest-neighbour (Hamming distance) ───────────────────────
-DEFINE INDEX IF NOT EXISTS file_phash_mtree       ON file FIELDS fingerprints.phash_vector
+-- Index the flat hash_vector derived from usable samples
+DEFINE INDEX IF NOT EXISTS file_phash_mtree       ON file FIELDS fingerprints.phash.hash_vector
     MTREE DIMENSION 64 DIST HAMMING;
+
+-- ── Analysis pre-filter flags (used in compare_all() fast-exit) ──────────────
+DEFINE INDEX IF NOT EXISTS file_too_dark          ON file FIELDS analysis.is_too_dark;
+DEFINE INDEX IF NOT EXISTS file_silent            ON file FIELDS analysis.is_silent;
+DEFINE INDEX IF NOT EXISTS file_unreliable        ON file FIELDS analysis.is_unreliable_fingerprint;
+DEFINE INDEX IF NOT EXISTS file_has_errors        ON file FIELDS analysis.has_decode_errors;
+
+-- ── Fingerprint completeness (rescan targeting) ───────────────────────────────
+DEFINE INDEX IF NOT EXISTS file_fp_complete       ON file FIELDS fingerprints.all_phases_complete;
+DEFINE INDEX IF NOT EXISTS file_fp_settings       ON file FIELDS fingerprints.settings_hash;
+
+-- ── I-frame density (encode quality queries) ─────────────────────────────────
+DEFINE INDEX IF NOT EXISTS file_kf_density        ON file FIELDS fingerprints.iframe.keyframe_density_per_min;
 
 -- ── Geospatial: GPS point clustering ─────────────────────────────────────────
 DEFINE INDEX IF NOT EXISTS file_geo_location      ON file FIELDS geo.location;
@@ -1029,33 +1302,101 @@ DEFINE FIELD IF NOT EXISTS quality_score     ON stem_of TYPE option<float>;
 ## SurrealDB Features in Use
 
 ```surql
--- Live query: real-time scan progress
+-- ── Live queries ─────────────────────────────────────────────────────────────
+
+-- Real-time scan progress
 LIVE SELECT status, files_hashed, files_discovered FROM scan_job WHERE status = "running";
 
--- Vector search: pHash nearest-neighbour
-SELECT path, vector::distance::hamming(fingerprints.phash_vector, $q) AS dist
-FROM file WHERE vector::distance::hamming(fingerprints.phash_vector, $q) < 10
+-- Live duplicate feed — new edges appear in UI as scan progresses
+LIVE SELECT in.path, out.path, similarity, method
+FROM duplicate_of WHERE discovered_in = $current_scan_id;
+
+-- ── Vector search ────────────────────────────────────────────────────────────
+
+-- pHash nearest-neighbour (uses flat hash_vector from usable samples only)
+SELECT path,
+       vector::distance::hamming(fingerprints.phash.hash_vector, $q) AS dist
+FROM file
+WHERE vector::distance::hamming(fingerprints.phash.hash_vector, $q) < 10
+  AND analysis.is_unreliable_fingerprint = false
 ORDER BY dist LIMIT 50;
 
--- Geo: images within 500m of a point
+-- ── Geospatial ───────────────────────────────────────────────────────────────
+
+-- Images within 500m of a GPS point
 SELECT path, geo.location FROM file
 WHERE media_type = "image" AND geo::distance(geo.location, $pt) < 500;
 
--- Geo: photos along a hiking track (intersects with GPS linestring)
+-- Photos along a GPS track (intersects bounding polygon)
 SELECT path, geo.location FROM file
 WHERE geo::intersects(geo.location, $route_polygon);
 
--- Full-text: search across name and all tags
+-- ── Full-text search ─────────────────────────────────────────────────────────
+
 SELECT path, search::score(1) AS score FROM file
 WHERE name @1@ $q OR tags @2@ $q ORDER BY score DESC LIMIT 20;
 
--- Event: auto-update scan_job counter when duplicate edge is created
+-- ── Analysis queries (enabled by the new per-phase schema) ───────────────────
+
+-- Files with stale fingerprints (settings changed since last compute)
+SELECT path, fingerprints.settings_hash FROM file
+WHERE fingerprints.settings_hash != $current_settings_hash
+  AND fingerprints.all_phases_complete = true;
+
+-- Files whose intro takes up more than 30% of their duration (hard to fingerprint)
+SELECT path, container.duration_secs,
+       fingerprints.scene.effective_skip_start_secs,
+       fingerprints.scene.effective_skip_start_secs / container.duration_secs AS intro_ratio
+FROM file
+WHERE analysis.is_intro_dominated = true
+ORDER BY intro_ratio DESC;
+
+-- Files with unusually high keyframe density (screencap, slideshow, or over-encoded)
+SELECT path, fingerprints.iframe.keyframe_density_per_min,
+       fingerprints.iframe.avg_gop_secs
+FROM file
+WHERE fingerprints.iframe.keyframe_density_per_min > 60
+ORDER BY fingerprints.iframe.keyframe_density_per_min DESC;
+
+-- Files with decode errors (corrupted rips, truncated downloads)
+SELECT path, analysis.total_decode_errors,
+       analysis.decode_errors[*].error_type,
+       analysis.decode_errors[*].start_secs
+FROM file WHERE analysis.has_decode_errors = true
+ORDER BY analysis.total_decode_errors DESC;
+
+-- Files where audio fingerprint is unreliable (silence-dominated)
+SELECT path, fingerprints.chromaprint.silence_ratio,
+       fingerprints.chromaprint.duration_analyzed_secs
+FROM file
+WHERE fingerprints.chromaprint.is_reliable = false
+  AND media_type IN ["video", "audio"];
+
+-- Files with abrupt intro endings (score > 80) — good for intro-skip grouping
+SELECT path,
+       fingerprints.scene.effective_skip_start_secs AS intro_ends_at,
+       fingerprints.scene.intro_cut_score AS cut_sharpness
+FROM file
+WHERE fingerprints.scene.intro_cut_score > 80
+ORDER BY fingerprints.scene.effective_skip_start_secs ASC;
+
+-- Compare all per-frame pHash scores for a specific file (debugging a borderline match)
+SELECT fingerprints.phash.samples[*].ts AS ts,
+       fingerprints.phash.samples[*].brightness AS brightness,
+       fingerprints.phash.samples[*].skipped AS skipped,
+       fingerprints.phash.samples[*].skip_reason AS reason
+FROM file WHERE path = $target_path;
+
+-- ── Events ───────────────────────────────────────────────────────────────────
+
 DEFINE EVENT IF NOT EXISTS on_dup_created ON TABLE duplicate_of
     WHEN $event = "CREATE" THEN {
         UPDATE scan_job SET duplicates_found += 1 WHERE id = $value.discovered_in;
     };
 
--- Function: find best-quality file in a cluster
+-- ── Functions ────────────────────────────────────────────────────────────────
+
+-- Best-quality file in a cluster (highest bitrate × resolution)
 DEFINE FUNCTION IF NOT EXISTS fn::best_in_cluster($ids: array) {
     RETURN (
         SELECT id, path,
@@ -1063,6 +1404,14 @@ DEFINE FUNCTION IF NOT EXISTS fn::best_in_cluster($ids: array) {
             * (container.width ?? 0) AS quality_score
         FROM file WHERE id IN $ids ORDER BY quality_score DESC LIMIT 1
     )[0];
+};
+
+-- Files in a cluster that have unreliable fingerprints (warn user before auto-delete)
+DEFINE FUNCTION IF NOT EXISTS fn::unreliable_in_cluster($ids: array) {
+    RETURN SELECT id, path, analysis.is_unreliable_fingerprint,
+                  fingerprints.chromaprint.silence_ratio,
+                  analysis.dark_frame_ratio
+           FROM file WHERE id IN $ids AND analysis.is_unreliable_fingerprint = true;
 };
 ```
 
