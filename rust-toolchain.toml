@@ -1,0 +1,13 @@
+# Nightly is required for wasm64-unknown-unknown (build-std, memory64 target).
+# When the wasm64 ecosystem matures and stable gains build-std support,
+# this can be switched back to "stable".
+#
+# For wasm32 (current default) either channel works fine.
+[toolchain]
+channel = "nightly"
+components = ["rustfmt", "clippy", "rust-src"]
+targets = [
+    "wasm32-unknown-unknown",
+    # Uncomment when wasm-bindgen + Dioxus dx CLI support memory64:
+    # "wasm64-unknown-unknown",
+]

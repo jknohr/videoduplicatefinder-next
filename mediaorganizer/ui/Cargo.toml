@@ -12,7 +12,8 @@ path = "src/main.rs"
 # Only one platform flag should be active per build.
 #
 #   cargo build --features desktop   →  native GPU app (Wayland / Win / Mac)
-#   cargo build --features web       →  WASM client + Axum server binary
+#   cargo build --features web       →  WASM32 client + Axum server binary
+#   cargo build --features wasm64    →  WASM64 client + Axum server (no 4 GB limit — next-gen)
 #   cargo build --features mobile    →  iOS / Android binary
 #
 # DX build tool recognises the `server` feature and creates two builds:
@@ -32,6 +33,12 @@ server  = ["dioxus/server", "dep:tokio", "dep:core"]
 desktop = ["dioxus/desktop", "server"]
 web     = ["dioxus/web", "dep:axum"]
 mobile  = ["dioxus/mobile", "server"]
+
+# wasm64: same as `web` but targets wasm64-unknown-unknown (no 4 GB limit).
+# Requires: uncommenting the build target in .cargo/config.toml and
+# wasm-bindgen + Dioxus dx CLI gaining memory64 support (tracking: wasm-bindgen#1464).
+# Use this flag when building for large media libraries where WASM address space matters.
+wasm64  = ["web"]
 
 [dependencies]
 # Core library — optional so it is not compiled into the WASM client bundle.
