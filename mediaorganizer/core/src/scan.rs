@@ -212,7 +212,7 @@ impl<D: Database> ScanEngine<D> {
         for (path, result) in results {
             match result {
                 Ok(record) => {
-                    let first_hash = record.phashes.values().next().copied();
+                    let first_hash = record.first_phash();
                     self.db.upsert_file(record)?;
                     if let Some(h) = first_hash {
                         self.emit(ScanProgress::FileHashed { path, phash: h });
@@ -234,11 +234,11 @@ impl<D: Database> ScanEngine<D> {
         let all = self.db.all_files()?;
 
         let (mut images, mut videos): (Vec<_>, Vec<_>) =
-            all.into_iter().partition(|f| f.is_image);
+            all.into_iter().partition(|f| f.is_image());
 
         // Filter out files with no hash data
-        images.retain(|f| !f.phashes.is_empty());
-        videos.retain(|f| !f.phashes.is_empty());
+        images.retain(|f| !f.phash_hashes().is_empty());
+        videos.retain(|f| !f.phash_hashes().is_empty());
 
         let total = images.len() + videos.len();
         let total_pairs = total * total.saturating_sub(1) / 2;
@@ -333,13 +333,9 @@ impl<D: Database> ScanEngine<D> {
                 }
             }
 
-            pairs_lock.lock().unwrap().push(DuplicatePair {
-                file_a: rec_a.id.clone(),
-                file_b: rec_b.id.clone(),
-                similarity: sim,
-                method,
-                clip_offset_secs: offset,
-            });
+            let mut new_pair = DuplicatePair::new(rec_a.id.clone(), rec_b.id.clone(), sim, method);
+            new_pair.clip_offset_secs = offset;
+            pairs_lock.lock().unwrap().push(new_pair);
         };
 
         // Compare images (always linear, no buckets)
@@ -398,8 +394,13 @@ impl<D: Database> ScanEngine<D> {
         // Eligible: has non-empty, non-silent audio fingerprint
         let mut candidates: Vec<FileRecord> = all
             .into_iter()
-            .filter(|f| !f.is_image && !f.audio_fingerprint.is_empty()
-                && !is_silent_fingerprint(&f.audio_fingerprint))
+            .filter(|f| {
+                if f.is_image() {
+                    return false;
+                }
+                let fp = f.audio_fingerprint();
+                !fp.is_empty() && !is_silent_fingerprint(&fp)
+            })
             .collect();
 
         if candidates.len() < 2 {
@@ -408,9 +409,9 @@ impl<D: Database> ScanEngine<D> {
 
         // Sort longest first (matching C# OrderByDescending duration)
         candidates.sort_by(|a, b| {
-            let da = a.media_info.as_ref().map(|m| m.duration_secs).unwrap_or(0.0);
-            let db_ = b.media_info.as_ref().map(|m| m.duration_secs).unwrap_or(0.0);
-            db_.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+            b.duration_secs()
+                .partial_cmp(&a.duration_secs())
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let sim_threshold = self.settings.partial_clip_min_similarity;
@@ -419,22 +420,22 @@ impl<D: Database> ScanEngine<D> {
 
         for i in 0..candidates.len().saturating_sub(1) {
             let source = &candidates[i];
-            let source_sec =
-                source.media_info.as_ref().map(|m| m.duration_secs).unwrap_or(0.0);
+            let source_sec = source.duration_secs();
             if source_sec < 1.0 {
                 continue;
             }
+            let source_fp = source.audio_fingerprint();
 
             for j in (i + 1)..candidates.len() {
                 let clip = &candidates[j];
-                let clip_sec =
-                    clip.media_info.as_ref().map(|m| m.duration_secs).unwrap_or(0.0);
+                let clip_sec = clip.duration_secs();
                 if clip_sec < 1.0 {
                     continue;
                 }
+                let clip_fp = clip.audio_fingerprint();
 
                 // Pre-filter: clip must be shorter than source (sorted desc, so j > i is shorter)
-                if clip.audio_fingerprint.len() >= source.audio_fingerprint.len() {
+                if clip_fp.len() >= source_fp.len() {
                     continue;
                 }
 
@@ -443,20 +444,18 @@ impl<D: Database> ScanEngine<D> {
                     continue;
                 }
 
-                let (sim, offset_secs) = audio::fingerprint_sliding_window(
-                    &clip.audio_fingerprint,
-                    &source.audio_fingerprint,
-                    sim_threshold,
-                );
+                let (sim, offset_secs) =
+                    audio::fingerprint_sliding_window(&clip_fp, &source_fp, sim_threshold);
 
                 if sim >= sim_threshold {
-                    new_pairs.push(DuplicatePair {
-                        file_a: source.id.clone(),
-                        file_b: clip.id.clone(),
-                        similarity: sim,
-                        method: MatchMethod::AudioFingerprint,
-                        clip_offset_secs: Some(offset_secs as f64),
-                    });
+                    let mut pair = DuplicatePair::new(
+                        source.id.clone(),
+                        clip.id.clone(),
+                        sim,
+                        MatchMethod::AudioFingerprint,
+                    );
+                    pair.clip_offset_secs = Some(offset_secs as f64);
+                    new_pairs.push(pair);
                 }
             }
         }
@@ -480,7 +479,7 @@ impl<D: Database> ScanEngine<D> {
         let all = self.db.all_files()?;
         let candidates: Vec<FileRecord> = all
             .into_iter()
-            .filter(|f| !f.is_image && f.iframe_phashes.len() >= 2)
+            .filter(|f| !f.is_image() && f.iframe_hashes().len() >= 2)
             .collect();
 
         if candidates.len() < 2 {
@@ -497,16 +496,18 @@ impl<D: Database> ScanEngine<D> {
             for j in (i + 1)..candidates.len() {
                 let b = &candidates[j];
 
+                let a_hashes = a.iframe_hashes();
+                let b_hashes = b.iframe_hashes();
                 let (shorter, longer, short_rec, long_rec) =
-                    if a.iframe_phashes.len() <= b.iframe_phashes.len() {
-                        (&a.iframe_phashes, &b.iframe_phashes, a, b)
+                    if a_hashes.len() <= b_hashes.len() {
+                        (a_hashes, b_hashes, a, b)
                     } else {
-                        (&b.iframe_phashes, &a.iframe_phashes, b, a)
+                        (b_hashes, a_hashes, b, a)
                     };
 
                 let result = arrays_match(
-                    shorter,
-                    longer,
+                    &shorter,
+                    &longer,
                     settings.iframe_match_percent,
                     settings.iframe_min_consecutive,
                     settings.iframe_hash_threshold,
@@ -514,10 +515,10 @@ impl<D: Database> ScanEngine<D> {
                 );
 
                 if let Some(r) = result {
-                    // Convert offset index to seconds using the longer video's timestamps
-                    let offset_secs = if !long_rec.iframe_timestamps.is_empty() {
-                        let idx = r.offset.min(long_rec.iframe_timestamps.len() - 1);
-                        long_rec.iframe_timestamps[idx]
+                    let long_ts = long_rec.iframe_timestamps();
+                    let offset_secs = if !long_ts.is_empty() {
+                        let idx = r.offset.min(long_ts.len() - 1);
+                        long_ts[idx]
                     } else {
                         r.offset as f64 * settings.iframe_sample_interval_secs
                     };
@@ -530,13 +531,15 @@ impl<D: Database> ScanEngine<D> {
                         offset_secs,
                     );
 
-                    new_pairs.push(DuplicatePair {
-                        file_a: long_rec.id.clone(),
-                        file_b: short_rec.id.clone(),
-                        similarity: r.similarity,
-                        method: MatchMethod::IframeTimeline,
-                        clip_offset_secs: Some(offset_secs),
-                    });
+                    let mut pair = DuplicatePair::new(
+                        long_rec.id.clone(),
+                        short_rec.id.clone(),
+                        r.similarity,
+                        MatchMethod::IframeTimeline,
+                    );
+                    pair.clip_offset_secs = Some(offset_secs);
+                    pair.consecutive_frames = Some(r.consecutive_run as u32);
+                    new_pairs.push(pair);
                 }
             }
         }
@@ -561,17 +564,15 @@ fn hash_one_file(path: &Utf8Path, settings: &Settings) -> VdfResult<FileRecord> 
     let size = std::fs::metadata(path)?.len();
     let mut record = FileRecord::new(path.to_owned(), size);
 
-    let is_image = {
-        let ext = path.extension().unwrap_or("").to_lowercase();
-        IMAGE_EXTENSIONS.contains(&ext.as_str())
-    };
-    record.is_image = is_image;
+    let is_image = record.is_image();
 
     if is_image {
         // Load image, resize to 32×32, extract grayscale bytes
         if let Ok(gray) = load_image_as_gray32(path) {
             let h = compute_phash(&gray);
-            record.phashes.insert(0, h);
+            let mut map = std::collections::HashMap::new();
+            map.insert(0u64, h);
+            record.set_phash_from_map(&map);
         } else {
             return Err(crate::error::VdfError::FfmpegGeneral {
                 code: -1,
@@ -584,7 +585,7 @@ fn hash_one_file(path: &Utf8Path, settings: &Settings) -> VdfResult<FileRecord> 
     // Probe media info
     let info = ffmpeg::probe_media(path)?;
     let duration = info.duration_secs;
-    record.media_info = Some(info);
+    record.set_media_info(info);
 
     // Standard pHash samples using the configured thumbnail count
     let timestamps = settings.sample_timestamps(duration, settings.thumbnail_count);
@@ -594,9 +595,9 @@ fn hash_one_file(path: &Utf8Path, settings: &Settings) -> VdfResult<FileRecord> 
         settings.effective_skip_start(duration),
         settings.effective_skip_end(duration),
     )?;
-    for (ts_ms, gray) in frames {
-        record.phashes.insert(ts_ms, compute_phash(&gray));
-    }
+    let phash_map: std::collections::HashMap<u64, u64> =
+        frames.into_iter().map(|(ts, gray)| (ts, compute_phash(&gray))).collect();
+    record.set_phash_from_map(&phash_map);
 
     // I-frame timeline fingerprint
     if settings.iframe_fingerprint {
@@ -613,8 +614,8 @@ fn hash_one_file(path: &Utf8Path, settings: &Settings) -> VdfResult<FileRecord> 
             settings.effective_skip_start(duration),
             settings.effective_skip_end(duration),
         )?;
-        record.iframe_timestamps = ts_list;
-        record.iframe_phashes = gray_frames.values().map(|g| compute_phash(g)).collect();
+        let iframe_hashes: Vec<u64> = gray_frames.values().map(|g| compute_phash(g)).collect();
+        record.set_iframe_fingerprint(ts_list, iframe_hashes);
     }
 
     // Audio fingerprint
@@ -626,7 +627,7 @@ fn hash_one_file(path: &Utf8Path, settings: &Settings) -> VdfResult<FileRecord> 
                     // silent track at 100% — store empty to skip in comparison.
                     warn!("silent audio fingerprint detected, skipping: {path}");
                 } else {
-                    record.audio_fingerprint = fp;
+                    record.set_audio_fingerprint(fp);
                 }
             }
             Ok(None) => {} // no audio stream
@@ -731,9 +732,7 @@ fn folder_filter_passes(a: &FileRecord, b: &FileRecord, settings: &Settings) -> 
 /// Check duplicate using pHash at the first thumbnail position only.
 /// Mirrors C# CheckIfDuplicate with UsePHashing=true: only positionList[0] is checked.
 fn phash_check_duplicate(a: &FileRecord, b: &FileRecord, settings: &Settings) -> bool {
-    let ha = a.phashes.values().next().copied();
-    let hb = b.phashes.values().next().copied();
-    match (ha, hb) {
+    match (a.first_phash(), b.first_phash()) {
         (Some(ha), Some(hb)) => phash_is_duplicate(ha, hb, settings.min_similarity),
         _ => false,
     }
@@ -741,18 +740,20 @@ fn phash_check_duplicate(a: &FileRecord, b: &FileRecord, settings: &Settings) ->
 
 /// Compute similarity between the first pHashes of two records (for DuplicatePair.similarity).
 fn phash_first_similarity(a: &FileRecord, b: &FileRecord) -> f32 {
-    let ha = a.phashes.values().next().copied().unwrap_or(0);
-    let hb = b.phashes.values().next().copied().unwrap_or(0);
+    let ha = a.first_phash().unwrap_or(0);
+    let hb = b.first_phash().unwrap_or(0);
     phash_similarity(ha, hb)
 }
 
 /// Duration tolerance check matching C# GetDurationToleranceSeconds.
 fn duration_filter_passes(a: &FileRecord, b: &FileRecord, settings: &Settings) -> bool {
-    let (Some(ia), Some(ib)) = (&a.media_info, &b.media_info) else {
+    let da = a.duration_secs();
+    let db = b.duration_secs();
+    if da == 0.0 || db == 0.0 {
         return true; // no duration info — don't filter
-    };
-    let longer = ia.duration_secs.max(ib.duration_secs);
-    let diff = (ia.duration_secs - ib.duration_secs).abs();
+    }
+    let longer = da.max(db);
+    let diff = (da - db).abs();
     let tolerance = settings.duration_tolerance_secs(longer);
     tolerance <= 0.0 || diff <= tolerance
 }
@@ -792,7 +793,7 @@ fn compare_images(
         let a = &images[i];
         // Pre-compute flipped hash for image a if enabled
         let flipped_a: Option<u64> = if settings.compare_horizontally_flipped {
-            a.phashes.values().next().map(|&h| {
+            a.first_phash().map(|h| {
                 // For images: flip the raw 32×32 gray and recompute (we don't have raw bytes here,
                 // so we use a placeholder — proper flip needs the gray bytes stored in DB)
                 // TODO: store raw gray bytes in FileRecord for flip support
@@ -869,7 +870,7 @@ fn compare_videos_bucketed(
     // Build duration buckets
     let mut buckets: HashMap<i64, Vec<usize>> = HashMap::new();
     for (idx, video) in videos.iter().enumerate() {
-        let dur = video.media_info.as_ref().map(|m| m.duration_secs).unwrap_or(0.0);
+        let dur = video.duration_secs();
         let key = (dur / BUCKET_SIZE_SECS as f64).floor() as i64;
         buckets.entry(key).or_default().push(idx);
     }
@@ -877,8 +878,7 @@ fn compare_videos_bucketed(
     for (&bucket_key, bucket_indices) in &buckets {
         for &i_pos in bucket_indices {
             let a = &videos[i_pos];
-            let dur_a =
-                a.media_info.as_ref().map(|m| m.duration_secs).unwrap_or(0.0);
+            let dur_a = a.duration_secs();
             let tolerance = settings.duration_tolerance_secs(dur_a);
 
             let min_key =
