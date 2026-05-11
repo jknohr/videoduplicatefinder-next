@@ -1,7 +1,7 @@
-//! Settings view — all vdf_core::config::Settings fields exposed as form controls.
+//! Settings view — all core::config::Settings fields exposed as form controls.
 
 use dioxus::prelude::*;
-use vdf_core::config::{FolderMatchMode, Settings};
+use core::config::{FolderMatchMode, Settings};
 
 use crate::state::ScanState;
 

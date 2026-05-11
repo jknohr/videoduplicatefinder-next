@@ -1,7 +1,7 @@
 //! Scan view: folder management, scan controls, live progress + log.
 
 use dioxus::prelude::*;
-use vdf_core::scan::ScanProgress;
+use core::scan::ScanProgress;
 
 use crate::app::Route;
 use crate::state::{AppState, ScanState};
@@ -219,11 +219,11 @@ fn ProgressBar(value: f32) -> Element {
 async fn run_scan(
     mut scan_state: Signal<ScanState>,
     mut app_state: Signal<AppState>,
-    settings: vdf_core::config::Settings,
+    settings: core::config::Settings,
 ) {
     use tokio::sync::mpsc;
-    use vdf_core::db::ScanDatabase;
-    use vdf_core::scan::ScanEngine;
+    use core::db::ScanDatabase;
+    use core::scan::ScanEngine;
 
     scan_state.write().reset();
     scan_state.write().is_scanning = true;

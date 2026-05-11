@@ -1,4 +1,4 @@
-//! Platform entry points for vdf_ui.
+//! Platform entry points for the UI crate.
 //!
 //! Feature flags select which runtime is linked:
 //!   --features desktop  →  Dioxus Blitz GPU renderer (Wayland/Win/Mac)

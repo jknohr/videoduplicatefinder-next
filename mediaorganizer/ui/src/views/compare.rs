@@ -4,7 +4,7 @@
 //! directly from the SurrealDB graph and renders a rich evidence panel.
 
 use dioxus::prelude::*;
-use vdf_core::db::{FileRecord, MatchMethod, ScanDatabase};
+use core::db::{FileRecord, MatchMethod, ScanDatabase};
 
 use crate::app::Route;
 
