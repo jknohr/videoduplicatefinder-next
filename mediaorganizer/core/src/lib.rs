@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod blacklist;
 pub mod comparison;
 pub mod config;
 pub mod db;
@@ -17,5 +18,6 @@ pub use db::{
     ScanDatabase, ScanJob, SurrealDatabase, UserTag,
 };
 pub use error::{VdfError, VdfResult};
+pub use blacklist::{Blacklist, BlacklistEntry as BlacklistGroup, compute_blacklisted_ids, load as load_blacklist, paths_equal, prune_missing, save as save_blacklist};
 pub use ranker::{BestFlags, Criterion, compute_best_flags, default_criteria, pick_keeper};
 pub use scan::ScanEngine;
