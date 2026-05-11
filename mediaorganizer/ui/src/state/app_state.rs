@@ -51,6 +51,8 @@ pub struct AppState {
     pub sort: ResultSort,
     /// Filter: only show clusters matching this method.
     pub method_filter: Option<String>,
+    /// File IDs selected by auto-select for bulk trash/delete.
+    pub selected_for_action: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

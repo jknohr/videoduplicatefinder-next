@@ -1,7 +1,7 @@
 //! Settings view — all UiSettings fields exposed as form controls.
 
 use dioxus::prelude::*;
-use crate::settings::{FolderMatchMode, UiSettings};
+use crate::settings::{FolderMatchMode, HardwareAccel, UiSettings};
 use crate::state::ScanState;
 
 #[component]
@@ -127,6 +127,81 @@ pub fn SettingsView() -> Element {
                             selected: scan_state.read().settings.folder_match_mode == FolderMatchMode::DifferentFolderOnly,
                             "Different folders only"
                         }
+                    }
+                }
+
+                // ── MPEG-7 / SSIM ─────────────────────────────────────────
+                section { class: "settings-section",
+                    h2 { "Advanced Matching" }
+
+                    CheckboxField {
+                        label: "MPEG-7 video signature",
+                        hint: "Low-level content signature — very accurate, requires FFmpeg mpeg7 build.",
+                        checked: scan_state.read().settings.mpeg7_signature,
+                        onchange: move |v| scan_state.write().settings.mpeg7_signature = v,
+                    }
+
+                    CheckboxField {
+                        label: "SSIM second-pass verification",
+                        hint: "Run structural similarity check on borderline pHash matches to reduce false positives.",
+                        checked: scan_state.read().settings.ssim_verification,
+                        onchange: move |v| scan_state.write().settings.ssim_verification = v,
+                    }
+
+                    if scan_state.read().settings.ssim_verification {
+                        SliderField {
+                            label: "SSIM re-check lower bound (sim ≥ this → verify)",
+                            min: 0.5, max: 1.0, step: 0.01,
+                            value: scan_state.read().settings.ssim_verify_min_sim,
+                            display: format!("{:.0}%", scan_state.read().settings.ssim_verify_min_sim * 100.0),
+                            onchange: move |v| scan_state.write().settings.ssim_verify_min_sim = v,
+                        }
+                        SliderField {
+                            label: "SSIM re-check upper bound (sim ≤ this → verify)",
+                            min: 0.5, max: 1.0, step: 0.01,
+                            value: scan_state.read().settings.ssim_verify_max_sim,
+                            display: format!("{:.0}%", scan_state.read().settings.ssim_verify_max_sim * 100.0),
+                            onchange: move |v| scan_state.write().settings.ssim_verify_max_sim = v,
+                        }
+                        SliderField {
+                            label: "SSIM reject threshold (below this → discard match)",
+                            min: 0.0, max: 1.0, step: 0.01,
+                            value: scan_state.read().settings.ssim_reject_threshold,
+                            display: format!("{:.0}%", scan_state.read().settings.ssim_reject_threshold * 100.0),
+                            onchange: move |v| scan_state.write().settings.ssim_reject_threshold = v,
+                        }
+                        NumberField {
+                            label: "SSIM sample window (seconds)",
+                            value: scan_state.read().settings.ssim_window_secs as f32,
+                            min: 1.0,
+                            onchange: move |v| scan_state.write().settings.ssim_window_secs = v as f64,
+                        }
+                    }
+                }
+
+                // ── Hardware acceleration ─────────────────────────────────
+                section { class: "settings-section",
+                    h2 { "Hardware Acceleration" }
+                    p { class: "field-hint text-muted",
+                        "Offloads video decoding to GPU. Requires appropriate FFmpeg build and drivers."
+                    }
+                    label { class: "field-label", "Decoder" }
+                    select {
+                        class: "select",
+                        onchange: move |e| {
+                            scan_state.write().settings.hardware_accel = match e.value().as_str() {
+                                "vaapi"        => HardwareAccel::Vaapi,
+                                "cuda"         => HardwareAccel::Cuda,
+                                "videotoolbox" => HardwareAccel::VideoToolbox,
+                                "d3d11va"      => HardwareAccel::D3d11va,
+                                _              => HardwareAccel::None,
+                            };
+                        },
+                        option { value: "none",         selected: scan_state.read().settings.hardware_accel == HardwareAccel::None,         "None (CPU)" }
+                        option { value: "vaapi",        selected: scan_state.read().settings.hardware_accel == HardwareAccel::Vaapi,        "VA-API (Linux Intel/AMD)" }
+                        option { value: "cuda",         selected: scan_state.read().settings.hardware_accel == HardwareAccel::Cuda,         "NVDEC / CUDA (NVIDIA)" }
+                        option { value: "videotoolbox", selected: scan_state.read().settings.hardware_accel == HardwareAccel::VideoToolbox, "VideoToolbox (macOS)" }
+                        option { value: "d3d11va",      selected: scan_state.read().settings.hardware_accel == HardwareAccel::D3d11va,      "D3D11VA (Windows)" }
                     }
                 }
 

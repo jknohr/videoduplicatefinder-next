@@ -15,6 +15,17 @@ pub enum FolderMatchMode {
     DifferentFolderOnly,
 }
 
+/// Mirror of app_core::config::HardwareAccel — always compiled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum HardwareAccel {
+    #[default]
+    None,
+    Vaapi,
+    Cuda,
+    VideoToolbox,
+    D3d11va,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UiSettings {
     pub include_dirs: Vec<Utf8PathBuf>,
@@ -38,6 +49,16 @@ pub struct UiSettings {
     pub include_images: bool,
     pub include_sub_directories: bool,
     pub folder_match_mode: FolderMatchMode,
+    // MPEG-7 signature matching
+    pub mpeg7_signature: bool,
+    // SSIM second-pass verification
+    pub ssim_verification: bool,
+    pub ssim_verify_min_sim: f32,
+    pub ssim_verify_max_sim: f32,
+    pub ssim_reject_threshold: f32,
+    pub ssim_window_secs: f64,
+    // Hardware acceleration for FFmpeg decode
+    pub hardware_accel: HardwareAccel,
 }
 
 impl Default for UiSettings {
@@ -64,6 +85,13 @@ impl Default for UiSettings {
             include_images: false,
             include_sub_directories: true,
             folder_match_mode: FolderMatchMode::None,
+            mpeg7_signature: false,
+            ssim_verification: false,
+            ssim_verify_min_sim: 0.80,
+            ssim_verify_max_sim: 0.95,
+            ssim_reject_threshold: 0.90,
+            ssim_window_secs: 10.0,
+            hardware_accel: HardwareAccel::None,
         }
     }
 }
@@ -96,6 +124,19 @@ impl From<UiSettings> for app_core::config::Settings {
             FolderMatchMode::None => app_core::config::FolderMatchMode::None,
             FolderMatchMode::SameFolderOnly => app_core::config::FolderMatchMode::SameFolderOnly,
             FolderMatchMode::DifferentFolderOnly => app_core::config::FolderMatchMode::DifferentFolderOnly,
+        };
+        c.mpeg7_signature = s.mpeg7_signature;
+        c.ssim_verification = s.ssim_verification;
+        c.ssim_verify_min_sim = s.ssim_verify_min_sim;
+        c.ssim_verify_max_sim = s.ssim_verify_max_sim;
+        c.ssim_reject_threshold = s.ssim_reject_threshold;
+        c.ssim_window_secs = s.ssim_window_secs;
+        c.hardware_accel = match s.hardware_accel {
+            HardwareAccel::None         => app_core::config::HardwareAccel::None,
+            HardwareAccel::Vaapi        => app_core::config::HardwareAccel::Vaapi,
+            HardwareAccel::Cuda         => app_core::config::HardwareAccel::Cuda,
+            HardwareAccel::VideoToolbox => app_core::config::HardwareAccel::VideoToolbox,
+            HardwareAccel::D3d11va      => app_core::config::HardwareAccel::D3d11va,
         };
         c
     }
