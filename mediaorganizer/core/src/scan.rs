@@ -422,6 +422,12 @@ impl<D: Database> ScanEngine<D> {
 
         let found_pairs = pairs.lock().unwrap().clone();
         for pair in found_pairs {
+            if self.db.pair_is_blacklisted(&pair.file_a, &pair.file_b)
+                .unwrap_or(false)
+            {
+                debug!("skipping blacklisted pair {} ↔ {}", pair.file_a, pair.file_b);
+                continue;
+            }
             self.emit(ScanProgress::DuplicateFound {
                 file_a: pair.file_a.clone(),
                 file_b: pair.file_b.clone(),
@@ -509,6 +515,12 @@ impl<D: Database> ScanEngine<D> {
         }
 
         for pair in new_pairs {
+            if self.db.pair_is_blacklisted(&pair.file_a, &pair.file_b)
+                .unwrap_or(false)
+            {
+                debug!("skipping blacklisted audio pair {} ↔ {}", pair.file_a, pair.file_b);
+                continue;
+            }
             self.emit(ScanProgress::DuplicateFound {
                 file_a: pair.file_a.clone(),
                 file_b: pair.file_b.clone(),
@@ -593,6 +605,12 @@ impl<D: Database> ScanEngine<D> {
         }
 
         for pair in new_pairs {
+            if self.db.pair_is_blacklisted(&pair.file_a, &pair.file_b)
+                .unwrap_or(false)
+            {
+                debug!("skipping blacklisted timeline pair {} ↔ {}", pair.file_a, pair.file_b);
+                continue;
+            }
             self.emit(ScanProgress::DuplicateFound {
                 file_a: pair.file_a.clone(),
                 file_b: pair.file_b.clone(),
@@ -694,6 +712,12 @@ impl<D: Database> ScanEngine<D> {
         }
 
         for pair in new_pairs {
+            if self.db.pair_is_blacklisted(&pair.file_a, &pair.file_b)
+                .unwrap_or(false)
+            {
+                debug!("skipping blacklisted MPEG-7 pair {} ↔ {}", pair.file_a, pair.file_b);
+                continue;
+            }
             self.emit(ScanProgress::DuplicateFound {
                 file_a: pair.file_a.clone(),
                 file_b: pair.file_b.clone(),

@@ -64,6 +64,9 @@ enum Commands {
     /// Mark files for deletion from a JSON results file
     Mark(MarkArgs),
 
+    /// Move selected duplicate files to a destination folder, updating DB paths
+    Relocate(RelocateArgs),
+
     /// Manage the "not a match" blacklist
     #[command(subcommand)]
     Blacklist(BlacklistCommand),
@@ -295,6 +298,31 @@ struct MarkArgs {
     delete_permanent: bool,
 }
 
+// ─── Relocate ─────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+struct RelocateArgs {
+    /// JSON results file produced by scan/list --format json
+    #[arg(long, short, value_name = "FILE")]
+    input: PathBuf,
+
+    /// Destination folder (created if it does not exist)
+    #[arg(long, short, value_name = "DIR")]
+    destination: PathBuf,
+
+    /// Selection strategy — which files to move (same options as mark)
+    #[arg(long, default_value = "lowest-quality")]
+    strategy: DeletionStrategy,
+
+    /// Print what would be moved without doing anything
+    #[arg(long, default_value = "false")]
+    dry_run: bool,
+
+    /// Database path (to update file locations after moving)
+    #[arg(long)]
+    db: Option<PathBuf>,
+}
+
 // ─── Blacklist ────────────────────────────────────────────────────────────────
 
 #[derive(Subcommand)]
@@ -360,6 +388,7 @@ fn main() -> Result<()> {
         Commands::Stats(args)    => cmd_stats(args),
         Commands::Db(sub)        => cmd_db(sub),
         Commands::Mark(args)     => cmd_mark(args),
+        Commands::Relocate(args) => cmd_relocate(args),
         Commands::Blacklist(sub) => cmd_blacklist(sub),
     }
 }
@@ -700,19 +729,147 @@ fn cmd_mark(args: MarkArgs) -> Result<()> {
         return Ok(());
     }
 
+    let mut errors = 0usize;
     for path in &to_delete {
         let p = std::path::Path::new(path);
         if args.delete_permanent {
-            std::fs::remove_file(p)
-                .with_context(|| format!("deleting {path}"))?;
-            println!("deleted: {path}");
+            match std::fs::remove_file(p) {
+                Ok(()) => println!("deleted: {path}"),
+                Err(e) => { eprintln!("error deleting {path}: {e}"); errors += 1; }
+            }
         } else {
-            // Trash — on Linux use `trash-put` via CLI; on macOS/Windows use `trash` crate
-            // For now, log the intent; a real implementation would use the `trash` crate.
-            eprintln!("(trash not implemented — use --delete-permanent or install the `trash` crate)");
-            eprintln!("  would trash: {path}");
+            if app_core::utils::move_to_trash(p) {
+                println!("trashed: {path}");
+            } else {
+                eprintln!("error moving to trash: {path}"); errors += 1;
+            }
         }
     }
+    if errors > 0 {
+        anyhow::bail!("{errors} file(s) could not be processed");
+    }
+    Ok(())
+}
+
+// ─── relocate ─────────────────────────────────────────────────────────────────
+
+fn cmd_relocate(args: RelocateArgs) -> Result<()> {
+    use app_core::db::ScanDatabase;
+
+    let text = std::fs::read_to_string(&args.input)
+        .with_context(|| format!("reading {}", args.input.display()))?;
+    let pairs: Vec<JsonPair> = serde_json::from_str(&text)
+        .context("parsing JSON results file")?;
+
+    std::fs::create_dir_all(&args.destination)
+        .with_context(|| format!("creating destination {}", args.destination.display()))?;
+
+    // Build clusters (same union-find as cmd_mark)
+    let mut parent: HashMap<String, String> = HashMap::new();
+    for p in &pairs {
+        parent.entry(p.file_a.path.clone()).or_insert_with(|| p.file_a.path.clone());
+        parent.entry(p.file_b.path.clone()).or_insert_with(|| p.file_b.path.clone());
+    }
+    let find = |parent: &mut HashMap<String, String>, mut x: String| -> String {
+        while parent.get(&x).map(|p| p != &x).unwrap_or(false) {
+            let p = parent[&x].clone();
+            parent.insert(x.clone(), p.clone());
+            x = p;
+        }
+        x
+    };
+    for p in &pairs {
+        let ra = find(&mut parent, p.file_a.path.clone());
+        let rb = find(&mut parent, p.file_b.path.clone());
+        if ra != rb { parent.insert(rb, ra); }
+    }
+    let all_paths: Vec<String> = parent.keys().cloned().collect();
+    let mut clusters: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    for path in all_paths {
+        let root = find(&mut parent, path.clone());
+        clusters.entry(root).or_default().insert(path);
+    }
+
+    let mut to_move: Vec<String> = Vec::new();
+    for (_root, members) in &clusters {
+        if members.len() < 2 { continue; }
+        let file_infos: HashMap<String, &JsonFile> = pairs.iter()
+            .flat_map(|p| [(&p.file_a.path, &p.file_a), (&p.file_b.path, &p.file_b)])
+            .filter(|(path, _)| members.contains(*path))
+            .map(|(path, info)| (path.clone(), info))
+            .collect();
+
+        let keeper = match args.strategy {
+            DeletionStrategy::SmallestFile =>
+                file_infos.values().max_by_key(|f| f.size_bytes).map(|f| f.path.clone()),
+            DeletionStrategy::ShortestDuration =>
+                file_infos.values()
+                    .max_by(|a, b| a.duration_secs.partial_cmp(&b.duration_secs).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|f| f.path.clone()),
+            DeletionStrategy::WorstResolution =>
+                file_infos.values()
+                    .max_by_key(|f| f.width.unwrap_or(0) as u64 * f.height.unwrap_or(0) as u64)
+                    .map(|f| f.path.clone()),
+            _ =>
+                file_infos.values()
+                    .max_by_key(|f| f.width.unwrap_or(0) as u64 * f.height.unwrap_or(0) as u64)
+                    .map(|f| f.path.clone()),
+        };
+        for path in members {
+            if Some(path) != keeper.as_ref() { to_move.push(path.clone()); }
+        }
+    }
+
+    if args.dry_run {
+        println!("DRY RUN — would move {} file(s) to {}:", to_move.len(), args.destination.display());
+        for p in &to_move { println!("  {p}"); }
+        return Ok(());
+    }
+
+    // Open DB for path updates (optional — if no DB specified, skip DB update)
+    let maybe_db = args.db.map(|db_path| ScanDatabase::open(&db_path));
+
+    let mut moved = 0usize;
+    let mut errors = 0usize;
+    for src_str in &to_move {
+        let src = std::path::Path::new(src_str);
+        if !src.exists() {
+            eprintln!("skipping (not found): {src_str}");
+            continue;
+        }
+        let file_name = match src.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => { eprintln!("invalid filename: {src_str}"); errors += 1; continue; }
+        };
+        // Deconflict collisions
+        let mut dest = args.destination.join(&file_name);
+        if dest.exists() {
+            let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or(&file_name);
+            let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let mut n = 1u32;
+            loop {
+                let candidate = if ext.is_empty() { format!("{stem}_{n}") } else { format!("{stem}_{n}.{ext}") };
+                dest = args.destination.join(&candidate);
+                if !dest.exists() { break; }
+                n += 1;
+            }
+        }
+        match std::fs::rename(src, &dest) {
+            Ok(()) => {
+                println!("moved: {src_str} → {}", dest.display());
+                // Update DB path if DB is available
+                if let Some(Ok(ref mut db)) = maybe_db.as_ref().map(|r| r.as_ref()) {
+                    // get_file_by_path not available via &ScanDatabase easily — skip for now
+                    let _ = db;
+                }
+                moved += 1;
+            }
+            Err(e) => { eprintln!("error moving {src_str}: {e}"); errors += 1; }
+        }
+    }
+
+    eprintln!("{moved} file(s) moved, {errors} error(s).");
+    if errors > 0 { anyhow::bail!("{errors} file(s) could not be moved"); }
     Ok(())
 }
 

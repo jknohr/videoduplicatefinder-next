@@ -164,6 +164,7 @@ fn AutoSelectBar(mut app_state: Signal<AppState>) -> Element {
                 }
                 button {
                     class: "btn btn-xs btn-danger",
+                    title: "Move selected files to system trash",
                     onclick: move |_| {
                         let ids = app_state.read().selected_for_action.clone();
                         let mut state = app_state;
@@ -181,11 +182,73 @@ fn AutoSelectBar(mut app_state: Signal<AppState>) -> Element {
                     },
                     "Trash selected"
                 }
+                MoveToFolderInline { app_state }
                 button {
                     class: "btn btn-xs btn-ghost",
                     onclick: move |_| app_state.write().selected_for_action.clear(),
                     "Clear selection"
                 }
+            }
+        }
+    }
+}
+
+/// Inline move-to-folder widget shown when files are selected.
+#[component]
+fn MoveToFolderInline(mut app_state: Signal<AppState>) -> Element {
+    let mut dest = use_signal(String::new);
+    let mut show = use_signal(|| false);
+
+    if !*show.read() {
+        return rsx! {
+            button {
+                class: "btn btn-xs btn-outline",
+                onclick: move |_| show.set(true),
+                "Move to folder…"
+            }
+        };
+    }
+
+    rsx! {
+        div { class: "move-inline",
+            input {
+                r#type: "text",
+                class: "move-dest-input",
+                placeholder: "/destination/folder",
+                value: "{dest}",
+                oninput: move |e| dest.set(e.value().clone()),
+            }
+            button {
+                class: "btn btn-xs btn-primary",
+                disabled: dest.read().trim().is_empty(),
+                onclick: move |_| {
+                    let ids = app_state.read().selected_for_action.clone();
+                    let destination = dest.read().trim().to_string();
+                    let mut state = app_state;
+                    spawn(async move {
+                        let mut moved_ids = Vec::new();
+                        for id in &ids {
+                            #[cfg(feature = "server")]
+                            match move_file_action(id.clone(), destination.clone()).await {
+                                Ok(()) => moved_ids.push(id.clone()),
+                                Err(_) => {}
+                            }
+                        }
+                        let mut s = state.write();
+                        for id in &moved_ids {
+                            s.remove_file(id);
+                        }
+                        s.selected_for_action.clear();
+                    });
+                    dest.set(String::new());
+                    show.set(false);
+                },
+                "Move"
+            }
+            button {
+                class: "btn btn-xs btn-ghost",
+                onclick: move |_| { show.set(false); dest.set(String::new()); },
+                "Cancel"
             }
         }
     }
@@ -453,6 +516,71 @@ pub(crate) async fn delete_file_action(file_id: String, to_trash: bool) -> Resul
     }
 
     db.remove_file(&file_id).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Move a file to a destination folder, updating its path in the database.
+///
+/// Port of ScanService.MoveItems() from VDF.Web — deconflicts name collisions by
+/// appending _1, _2, … to the filename.
+#[cfg(feature = "server")]
+pub(crate) async fn move_file_action(
+    file_id: String,
+    destination_folder: String,
+) -> Result<(), String> {
+    use app_core::db::{Database, ScanDatabase};
+
+    let db_path = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("vdf")
+        .join("db");
+
+    let mut db = ScanDatabase::open(&db_path).map_err(|e| e.to_string())?;
+
+    let rec = db.get_file(&file_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("file not found: {file_id}"))?;
+
+    let src = std::path::Path::new(rec.path.as_str());
+    if !src.exists() {
+        return Err(format!("file not found on disk: {}", rec.path));
+    }
+
+    std::fs::create_dir_all(&destination_folder)
+        .map_err(|e| format!("cannot create destination: {e}"))?;
+
+    let file_name = src.file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("invalid filename")?;
+
+    // Deconflict: append _N if name already exists at destination
+    let mut dest = std::path::PathBuf::from(&destination_folder).join(file_name);
+    if dest.exists() {
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or(file_name);
+        let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let mut n = 1u32;
+        loop {
+            let candidate = if ext.is_empty() {
+                format!("{stem}_{n}")
+            } else {
+                format!("{stem}_{n}.{ext}")
+            };
+            dest = std::path::PathBuf::from(&destination_folder).join(&candidate);
+            if !dest.exists() { break; }
+            n += 1;
+        }
+    }
+
+    std::fs::rename(src, &dest).map_err(|e| e.to_string())?;
+
+    // Update the file path in the database
+    let new_path = camino::Utf8PathBuf::from_path_buf(dest)
+        .map_err(|_| "destination path is not valid UTF-8".to_string())?;
+    let mut updated = rec;
+    updated.path = new_path.clone();
+    updated.name = new_path.file_name().unwrap_or("").to_string();
+    db.upsert_file(updated).map_err(|e| e.to_string())?;
+
     Ok(())
 }
 
