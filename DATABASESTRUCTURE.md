@@ -873,14 +873,69 @@ DEFINE FIELD IF NOT EXISTS fingerprints.iframe.avg_gop_secs             ON file 
 DEFINE FIELD IF NOT EXISTS fingerprints.iframe.min_gop_secs             ON file TYPE option<float>;
 DEFINE FIELD IF NOT EXISTS fingerprints.iframe.max_gop_secs             ON file TYPE option<float>;
 
--- Sampled subset — evenly-spaced positions chosen from the full keyframe list
--- Each: { ts: float, hash: int }
+-- Sampled subset — evenly-spaced positions chosen from the full keyframe list.
+-- Each sample carries the pHash for sliding-window comparison PLUS the full set of
+-- per-frame encode quality metrics from FFmpeg vstats output:
+--
+--   vstats field   → sample field        description
+--   ────────────────────────────────────────────────────────────────────────
+--   frame=         → frame_num           absolute frame index in the file
+--   q=             → q                   quantiser / frame quality (low = better)
+--   PSNR=          → psnr                Peak Signal-to-Noise Ratio in dB (higher = better)
+--                                        only present when ffmpeg -psnr flag is active
+--   f_size=        → f_size_bytes        encoded packet size in bytes
+--   s_size=        → s_size_kib          cumulative stream size in KiB at this frame
+--   time=          → ts                  presentation timestamp in seconds (same as ts field)
+--   br=            → br_kbps             instantaneous bitrate kbit/s at this frame
+--   avg_br=        → avg_br_kbps         average bitrate kbit/s up to this frame
+--   type=          → picture_type        "I", "P", or "B" — all sampled frames will be "I"
+--                                        but stored explicitly so queries can verify
+--
+-- q and f_size together identify outlier frames: a keyframe with q > 30 + large f_size
+-- indicates a scene with complex content or poor encode settings. Used by the
+-- encode-quality analysis and by the UI comparison panel.
 DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples                  ON file TYPE array<object>;
 DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples[*].ts            ON file TYPE float;
+    -- presentation timestamp in seconds (from FFmpeg time= or PTS × time_base)
 DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples[*].hash          ON file TYPE int;
+    -- 64-bit perceptual hash of the decoded frame (scaled to 32×32 grayscale)
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples[*].frame_num     ON file TYPE option<int>;
+    -- absolute frame index (FFmpeg frame=); null if packet-level scan skipped decode
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples[*].q             ON file TYPE option<float>;
+    -- quantiser quality factor; lower = better quality; typical I-frame range 1–31
+    -- (H.264 QP 0–51; VP9 0–63; maps to q via codec-specific formula)
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples[*].psnr          ON file TYPE option<float>;
+    -- PSNR dB; null unless ffmpeg was invoked with -psnr; > 40 dB = visually lossless
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples[*].f_size_bytes  ON file TYPE option<int>;
+    -- encoded packet size in bytes for this frame; large outliers = scene complexity spike
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples[*].s_size_kib   ON file TYPE option<float>;
+    -- cumulative stream KiB at this frame; useful for byte-offset indexing
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples[*].br_kbps       ON file TYPE option<float>;
+    -- instantaneous bitrate kbit/s at this frame
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples[*].avg_br_kbps   ON file TYPE option<float>;
+    -- average bitrate kbit/s up to and including this frame
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples[*].picture_type  ON file TYPE option<string>;
+    -- "I", "P", or "B"; all sampled I-frame entries will be "I" but stored for verification
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples[*].brightness     ON file TYPE option<float>;
+    -- mean luminance of decoded frame 0.0–1.0; null if frame was too dark to decode usefully
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples[*].skipped        ON file TYPE bool DEFAULT false;
+    -- true if this sample position was skipped (too dark, decode error, etc.)
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.samples[*].skip_reason    ON file TYPE option<string>;
+    -- "too_dark" | "decode_error" | "no_keyframe_nearby" | null
+
 DEFINE FIELD IF NOT EXISTS fingerprints.iframe.sample_count             ON file TYPE int DEFAULT 0;
 DEFINE FIELD IF NOT EXISTS fingerprints.iframe.sample_interval_secs     ON file TYPE option<float>;
     -- actual interval used (may differ from settings if max_samples was hit)
+
+-- Aggregate encode-quality metrics derived from sample q and f_size values
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.avg_q                    ON file TYPE option<float>;
+    -- mean quantiser across all sampled I-frames
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.max_q                    ON file TYPE option<float>;
+    -- worst (highest) quantiser seen in any sampled I-frame — indicates quality floor
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.avg_br_kbps              ON file TYPE option<float>;
+    -- average bitrate across all sampled positions (from avg_br field of last sample)
+DEFINE FIELD IF NOT EXISTS fingerprints.iframe.psnr_avg                 ON file TYPE option<float>;
+    -- mean PSNR across frames where it was measured; null if -psnr not active
 ```
 
 ---
