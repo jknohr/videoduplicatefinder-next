@@ -208,6 +208,10 @@ pub fn SettingsView() -> Element {
                 // ── Skip start / end ──────────────────────────────────────
                 section { class: "settings-section",
                     h2 { "Skip Start / End" }
+                    p { class: "field-hint text-muted",
+                        "Effective skip = max(seconds, duration × percent ÷ 100). \
+                         Set either to 0 to ignore that dimension."
+                    }
 
                     NumberField {
                         label: "Skip start (seconds)",
@@ -216,11 +220,27 @@ pub fn SettingsView() -> Element {
                         onchange: move |v| scan_state.write().settings.skip_start_secs = v as f64,
                     }
 
+                    SliderField {
+                        label: "Skip start (% of duration)",
+                        min: 0.0, max: 50.0, step: 0.5,
+                        value: scan_state.read().settings.skip_start_percent,
+                        display: format!("{:.1}%", scan_state.read().settings.skip_start_percent),
+                        onchange: move |v| scan_state.write().settings.skip_start_percent = v,
+                    }
+
                     NumberField {
                         label: "Skip end (seconds)",
                         value: scan_state.read().settings.skip_end_secs as f32,
                         min: 0.0,
                         onchange: move |v| scan_state.write().settings.skip_end_secs = v as f64,
+                    }
+
+                    SliderField {
+                        label: "Skip end (% of duration)",
+                        min: 0.0, max: 50.0, step: 0.5,
+                        value: scan_state.read().settings.skip_end_percent,
+                        display: format!("{:.1}%", scan_state.read().settings.skip_end_percent),
+                        onchange: move |v| scan_state.write().settings.skip_end_percent = v,
                     }
                 }
 

@@ -158,9 +158,17 @@ struct ScanArgs {
     #[arg(long, default_value = "0.0")]
     skip_start: f64,
 
+    /// Percentage of duration to skip at video start (effective = max of seconds and percent)
+    #[arg(long, default_value = "0.0")]
+    skip_start_percent: f32,
+
     /// Seconds to skip at video end
     #[arg(long, default_value = "0.0")]
     skip_end: f64,
+
+    /// Percentage of duration to skip at video end (effective = max of seconds and percent)
+    #[arg(long, default_value = "0.0")]
+    skip_end_percent: f32,
 
     /// Output format
     #[arg(long, default_value = "text")]
@@ -419,7 +427,9 @@ fn cmd_scan(args: ScanArgs) -> Result<()> {
     settings.exclude_hard_links = args.exclude_hard_links;
     settings.include_images = args.include_images;
     settings.skip_start_secs = args.skip_start;
+    settings.skip_start_percent = args.skip_start_percent;
     settings.skip_end_secs = args.skip_end;
+    settings.skip_end_percent = args.skip_end_percent;
 
     let progress: Arc<dyn Fn(ScanProgress) + Send + Sync> = Arc::new(|ev| match ev {
         ScanProgress::FileDiscovered { path } => info!("found   {path}"),

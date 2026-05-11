@@ -45,7 +45,9 @@ pub struct UiSettings {
     pub partial_clip_detection: bool,
     pub partial_clip_min_similarity: f32,
     pub skip_start_secs: f64,
+    pub skip_start_percent: f32,
     pub skip_end_secs: f64,
+    pub skip_end_percent: f32,
     pub include_images: bool,
     pub include_sub_directories: bool,
     pub folder_match_mode: FolderMatchMode,
@@ -81,7 +83,9 @@ impl Default for UiSettings {
             partial_clip_detection: false,
             partial_clip_min_similarity: 0.99,
             skip_start_secs: 0.0,
+            skip_start_percent: 0.0,
             skip_end_secs: 0.0,
+            skip_end_percent: 0.0,
             include_images: false,
             include_sub_directories: true,
             folder_match_mode: FolderMatchMode::None,
@@ -117,7 +121,9 @@ impl From<UiSettings> for app_core::config::Settings {
         c.partial_clip_detection = s.partial_clip_detection;
         c.partial_clip_min_similarity = s.partial_clip_min_similarity;
         c.skip_start_secs = s.skip_start_secs;
+        c.skip_start_percent = s.skip_start_percent;
         c.skip_end_secs = s.skip_end_secs;
+        c.skip_end_percent = s.skip_end_percent;
         c.include_images = s.include_images;
         c.include_sub_directories = s.include_sub_directories;
         c.folder_match_mode = match s.folder_match_mode {
