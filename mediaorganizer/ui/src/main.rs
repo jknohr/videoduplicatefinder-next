@@ -23,10 +23,12 @@ fn main() {
 }
 
 #[cfg(feature = "web")]
-#[tokio::main]
-async fn main() {
+fn main() {
+    // DX build tool creates two outputs from this single entry point:
+    //   - WASM client bundle (server feature OFF — tokio not linked)
+    //   - Axum server binary (server feature ON) that serves the bundle + #[server] fns
+    #[cfg(feature = "server")]
     init_logging();
-    // Fullstack mode: Axum serves the WASM bundle + processes #[server] functions.
     dioxus::LaunchBuilder::fullstack().launch(App);
 }
 

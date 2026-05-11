@@ -9,30 +9,47 @@ name = "mediaorganizer-ui"
 path = "src/main.rs"
 
 # Feature flags select the compile target.
-# Only one should be active per build.
+# Only one platform flag should be active per build.
 #
 #   cargo build --features desktop   →  native GPU app (Wayland / Win / Mac)
-#   cargo build --features web       →  WASM bundle + embedded Axum server
+#   cargo build --features web       →  WASM client + Axum server binary
 #   cargo build --features mobile    →  iOS / Android binary
+#
+# DX build tool recognises the `server` feature and creates two builds:
+#   - client: WASM bundle (server feature OFF, tokio not linked)
+#   - server: Axum binary (server feature ON, tokio + core linked)
 #
 # cargo check with no features still type-checks all component code.
 [features]
 default = []
-desktop = ["dioxus/desktop"]
-web     = ["dioxus/web", "dep:axum", "tokio/full"]
-mobile  = ["dioxus/mobile"]
+
+# Activates #[server] fn bodies, links tokio + core (SurrealDB).
+# Never active in WASM compilation — tokio is incompatible with WASM.
+server  = ["dioxus/server", "dep:tokio", "dep:core"]
+
+# Platform targets.
+# desktop and mobile include `server` so #[server] fns execute in-process.
+desktop = ["dioxus/desktop", "server"]
+web     = ["dioxus/web", "dep:axum"]
+mobile  = ["dioxus/mobile", "server"]
 
 [dependencies]
-core = { path = "../core" }
+# Core library — optional so it is not compiled into the WASM client bundle.
+# Enabled by the `server` feature only.
+core = { path = "../core", optional = true }
 
-dioxus   = { version = "0.7", default-features = false, features = ["router"] }
+# Dioxus 0.7: fullstack feature enables #[server] stub generation on the client side.
+dioxus   = { version = "0.7", default-features = false, features = ["router", "fullstack"] }
 anyhow   = { workspace = true }
 tracing  = { workspace = true }
 serde    = { workspace = true }
 serde_json = { workspace = true }
-tokio    = { workspace = true }
 camino   = { workspace = true }
 dirs     = { workspace = true }
 
-# Only linked for the `web` target
+# tokio: optional — WASM client must not link tokio full runtime.
+# Pulled in by the `server` feature for desktop / mobile / web-server builds.
+tokio    = { workspace = true, optional = true }
+
+# Only linked for the `web` server target
 axum = { version = "0.8", optional = true }
