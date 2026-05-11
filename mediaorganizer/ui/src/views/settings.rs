@@ -1,8 +1,7 @@
-//! Settings view — all core::config::Settings fields exposed as form controls.
+//! Settings view — all UiSettings fields exposed as form controls.
 
 use dioxus::prelude::*;
-use core::config::{FolderMatchMode, Settings};
-
+use crate::settings::{FolderMatchMode, UiSettings};
 use crate::state::ScanState;
 
 #[component]
@@ -30,7 +29,7 @@ pub fn SettingsView() -> Element {
                         label: "Duration tolerance (%)",
                         min: 0.0, max: 100.0, step: 1.0,
                         value: scan_state.read().settings.percent_duration_difference as f32,
-                        display: format!("{:.0}%", scan_state.read().settings.percent_duration_difference),
+                        display: format!("{:.0}%", scan_state.read().settings.percent_duration_difference as f32),
                         onchange: move |v| scan_state.write().settings.percent_duration_difference = v as f64,
                     }
 
@@ -161,7 +160,7 @@ pub fn SettingsView() -> Element {
                     button {
                         class: "btn btn-ghost",
                         r#type: "button",
-                        onclick: move |_| scan_state.write().settings = Settings::default(),
+                        onclick: move |_| scan_state.write().settings = UiSettings::default(),
                         "Reset to defaults"
                     }
                 }
@@ -248,7 +247,7 @@ fn CheckboxField(
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 
-fn save_settings(settings: &Settings) {
+fn save_settings(settings: &UiSettings) {
     let dir = dirs::config_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("vdf");

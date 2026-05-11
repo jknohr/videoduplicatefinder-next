@@ -4,11 +4,14 @@
 //! The graph traversal (union-find over edges) is done in AppState::load_clusters.
 
 use dioxus::prelude::*;
-use core::db::MatchMethod;
-
 use crate::app::Route;
 use crate::state::AppState;
 use crate::state::app_state::{DuplicateCluster, ResultSort};
+
+#[cfg(feature = "server")]
+use core::db::DuplicatePair;
+#[cfg(not(feature = "server"))]
+use crate::state::app_state::stubs::DuplicatePair;
 
 #[component]
 pub fn ResultsView() -> Element {
@@ -29,8 +32,8 @@ pub fn ResultsView() -> Element {
                 EmptyState {}
             } else {
                 div { class: "cluster-list",
-                    for (idx, cluster) in clusters.iter().enumerate() {
-                        ClusterCard { key: "{idx}", cluster: cluster.clone(), app_state }
+                    for cluster in clusters.iter() {
+                        {cluster_card(cluster, app_state)}
                     }
                 }
             }
@@ -101,8 +104,7 @@ fn apply_sort(clusters: &mut Vec<DuplicateCluster>, sort: ResultSort) {
 
 // ── Cluster card ──────────────────────────────────────────────────────────────
 
-#[component]
-fn ClusterCard(cluster: DuplicateCluster, mut app_state: Signal<AppState>) -> Element {
+fn cluster_card(cluster: &DuplicateCluster, mut app_state: Signal<AppState>) -> Element {
     let method_filter = app_state.read().method_filter.clone();
     let best_edge = cluster.edges.iter()
         .max_by(|a, b| a.similarity.partial_cmp(&b.similarity).unwrap_or(std::cmp::Ordering::Equal))
@@ -110,62 +112,78 @@ fn ClusterCard(cluster: DuplicateCluster, mut app_state: Signal<AppState>) -> El
 
     let Some(edge) = best_edge else { return rsx! {} };
 
+    let method_str = method_label(&edge);
+
     // Skip if method filter is active and doesn't match
     if let Some(ref filter) = method_filter {
-        if format!("{:?}", edge.method) != *filter {
+        if &method_str != filter {
             return rsx! {};
         }
     }
 
+    // Precompute all owned values before entering rsx! (closures must be 'static)
+    let max_similarity = cluster.max_similarity;
+    let file_count = cluster.files.len();
+    let clip_offset = edge.clip_offset_secs;
+    let fa = cluster.files.first().map(|f| f.id.clone()).unwrap_or_default();
+    let fb = cluster.files.get(1).map(|f| f.id.clone()).unwrap_or_default();
+
+    // File rows: pre-build display tuples
+    let file_rows: Vec<(String, String, f64, u32, u32, u64)> = cluster.files.iter().map(|f| {
+        (
+            f.name.clone(),
+            f.path.to_string(),
+            f.duration_secs(),
+            f.width().unwrap_or(0),
+            f.height().unwrap_or(0),
+            f.size_bytes,
+        )
+    }).collect();
+
     rsx! {
         div { class: "cluster-card",
-            // Header: similarity badge + method badge + file count
             div { class: "cluster-header",
-                SimilarityBadge { value: cluster.max_similarity }
-                MethodBadge { method: edge.method }
-                span { class: "file-count", "{cluster.files.len()} files" }
+                SimilarityBadge { value: max_similarity }
+                MethodBadge { method: method_str.clone() }
+                span { class: "file-count", "{file_count} files" }
             }
 
-            // File list
             div { class: "cluster-files",
-                for file in cluster.files.iter() {
+                for (name, path, dur, w, h, size) in file_rows {
                     div { class: "file-row",
-                        div { class: "file-name", "{file.name}" }
+                        div { class: "file-name", "{name}" }
                         div { class: "file-meta",
-                            if let Some(ref info) = file.media_info {
-                                span { class: "tag", "{format_duration(info.duration_secs)}" }
-                                span { class: "tag", "{info.width}×{info.height}" }
+                            if dur > 0.0 {
+                                span { class: "tag", "{format_duration(dur)}" }
                             }
-                            span { class: "tag", "{format_bytes(file.size_bytes)}" }
+                            if w > 0 {
+                                span { class: "tag", "{w}×{h}" }
+                            }
+                            span { class: "tag", "{format_bytes(size)}" }
                         }
-                        div { class: "file-path text-muted", "{file.path}" }
+                        div { class: "file-path text-muted", "{path}" }
                     }
                 }
             }
 
-            // Evidence from the duplicate_of edge
-            if let Some(offset) = edge.clip_offset_secs {
+            if let Some(offset) = clip_offset {
                 div { class: "evidence-row",
                     span { class: "evidence-label", "Clip offset:" }
                     span { "{offset:.1}s into the longer file" }
                 }
             }
 
-            // Actions
             div { class: "cluster-actions",
-                if cluster.files.len() == 2 {
+                if file_count == 2 {
                     button {
                         class: "btn btn-sm btn-outline",
                         onclick: {
-                            let fa = cluster.files[0].id.clone();
-                            let fb = cluster.files[1].id.clone();
-                            move |_| { app_state.write().selected_pair = Some((fa.clone(), fb.clone())); }
+                            let fa2 = fa.clone();
+                            let fb2 = fb.clone();
+                            move |_| { app_state.write().selected_pair = Some((fa2.clone(), fb2.clone())); }
                         },
                         Link {
-                            to: Route::CompareView {
-                                file_a: cluster.files[0].id.clone(),
-                                file_b: cluster.files[1].id.clone(),
-                            },
+                            to: Route::CompareView { file_a: fa.clone(), file_b: fb.clone() },
                             "Compare side-by-side →"
                         }
                     }
@@ -187,14 +205,15 @@ fn SimilarityBadge(value: f32) -> Element {
 }
 
 #[component]
-fn MethodBadge(method: MatchMethod) -> Element {
-    let (label, class) = match method {
-        MatchMethod::FrameSimilarity    => ("Frame hash",         "badge badge-blue"),
-        MatchMethod::IframeTimeline     => ("I-frame timeline",   "badge badge-purple"),
-        MatchMethod::AudioFingerprint   => ("Audio fingerprint",  "badge badge-green"),
-        MatchMethod::Mpeg7Signature     => ("MPEG-7",             "badge badge-orange"),
-        MatchMethod::SsimVerified       => ("SSIM verified",      "badge badge-teal"),
-        MatchMethod::TemporalAverageHash => ("Temporal avg",      "badge badge-gray"),
+fn MethodBadge(method: String) -> Element {
+    let (label, class) = match method.as_str() {
+        "FrameSimilarity"    => ("Frame hash",         "badge badge-blue"),
+        "IframeTimeline"     => ("I-frame timeline",   "badge badge-purple"),
+        "AudioFingerprint"   => ("Audio fingerprint",  "badge badge-green"),
+        "Mpeg7Signature"     => ("MPEG-7",             "badge badge-orange"),
+        "SsimVerified"       => ("SSIM verified",      "badge badge-teal"),
+        "TemporalAverageHash" => ("Temporal avg",      "badge badge-gray"),
+        other                => (other,                "badge badge-gray"),
     };
     rsx! { span { class, "{label}" } }
 }
@@ -214,6 +233,13 @@ fn EmptyState() -> Element {
 }
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
+
+fn method_label(pair: &DuplicatePair) -> String {
+    #[cfg(feature = "server")]
+    { format!("{:?}", pair.method) }
+    #[cfg(not(feature = "server"))]
+    { pair.method_str.clone() }
+}
 
 fn format_duration(secs: f64) -> String {
     let h = (secs / 3600.0) as u64;

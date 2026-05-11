@@ -46,9 +46,13 @@ wasm64  = ["web"]
 core = { path = "../core", optional = true }
 
 # Dioxus 0.7: fullstack feature enables #[server] stub generation on the client side.
-dioxus   = { version = "0.7", default-features = false, features = ["router", "fullstack"] }
+# The base component system requires: macro (rsx!/component attr), html (element types),
+# signals (Signal<T>), hooks (use_context/use_signal/use_resource), and hot-reload.
+# Platform features (desktop/web/mobile) add their renderers on top of this base set.
+dioxus   = { version = "0.7", default-features = false, features = ["router", "fullstack", "macro", "html", "signals", "hooks"] }
 anyhow   = { workspace = true }
 tracing  = { workspace = true }
+tracing-subscriber = { workspace = true }
 serde    = { workspace = true }
 serde_json = { workspace = true }
 camino   = { workspace = true }

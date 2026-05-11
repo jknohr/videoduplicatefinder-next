@@ -1,6 +1,6 @@
 //! Reactive scan progress state shared across all components.
 
-use core::config::Settings;
+use crate::settings::UiSettings;
 
 /// One entry in the live log panel.
 #[derive(Debug, Clone)]
@@ -22,7 +22,7 @@ pub enum LogLevel {
 /// Components read and write it via `use_context::<Signal<ScanState>>()`.
 #[derive(Debug, Clone)]
 pub struct ScanState {
-    pub settings: Settings,
+    pub settings: UiSettings,
     pub is_scanning: bool,
     /// 0.0 = not started, 1.0 = complete.
     pub progress: f32,
@@ -37,7 +37,7 @@ pub struct ScanState {
 impl Default for ScanState {
     fn default() -> Self {
         Self {
-            settings: Settings::default(),
+            settings: UiSettings::default(),
             is_scanning: false,
             progress: 0.0,
             files_found: 0,

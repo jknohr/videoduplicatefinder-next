@@ -1,6 +1,28 @@
 //! Global application state: loaded duplicate pairs and UI selection.
 
+#[cfg(feature = "server")]
 use core::db::{DuplicatePair, FileRecord};
+#[cfg(not(feature = "server"))]
+pub mod stubs {
+    #[derive(Debug, Clone, Default)] pub struct DuplicatePair {
+        pub file_a: String, pub file_b: String, pub similarity: f32,
+        pub clip_offset_secs: Option<f64>,
+        pub method_str: String,
+    }
+    #[derive(Debug, Clone, Default)] pub struct FileRecord {
+        pub id: String,
+        pub path: camino::Utf8PathBuf,
+        pub name: String,
+        pub size_bytes: u64,
+    }
+    impl FileRecord {
+        pub fn duration_secs(&self) -> f64 { 0.0 }
+        pub fn width(&self) -> Option<u32> { None }
+        pub fn height(&self) -> Option<u32> { None }
+    }
+}
+#[cfg(not(feature = "server"))]
+use stubs::{DuplicatePair, FileRecord};
 
 /// A duplicate cluster: a group of files all connected by duplicate_of edges.
 ///

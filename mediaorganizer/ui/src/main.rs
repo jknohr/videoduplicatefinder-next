@@ -8,6 +8,7 @@
 //! All three targets compile the same component tree from app.rs / views/*.
 
 mod app;
+mod settings;
 mod state;
 mod views;
 

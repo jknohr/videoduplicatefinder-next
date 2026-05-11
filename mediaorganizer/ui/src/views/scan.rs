@@ -1,9 +1,11 @@
 //! Scan view: folder management, scan controls, live progress + log.
 
 use dioxus::prelude::*;
+#[cfg(feature = "server")]
 use core::scan::ScanProgress;
 
 use crate::app::Route;
+use crate::settings::UiSettings;
 use crate::state::{AppState, ScanState};
 use crate::state::scan_state::LogLevel;
 
@@ -73,10 +75,13 @@ pub fn ScanView() -> Element {
                         class: "btn btn-primary",
                         disabled: scan_state.read().settings.include_dirs.is_empty(),
                         onclick: move |_| {
-                            let settings = scan_state.read().settings.clone();
-                            spawn(async move {
-                                run_scan(scan_state, app_state, settings).await;
-                            });
+                            #[cfg(feature = "server")]
+                            {
+                                let ui_settings = scan_state.read().settings.clone();
+                                spawn(async move {
+                                    run_scan(scan_state, app_state, ui_settings).await;
+                                });
+                            }
                         },
                         "Start Scan"
                     }
@@ -216,14 +221,17 @@ fn ProgressBar(value: f32) -> Element {
 ///
 /// On the web target this becomes a #[server] call and uses SSE; the async
 /// bridge is the same from the component's perspective.
+#[cfg(feature = "server")]
 async fn run_scan(
     mut scan_state: Signal<ScanState>,
     mut app_state: Signal<AppState>,
-    settings: core::config::Settings,
+    ui_settings: UiSettings,
 ) {
     use tokio::sync::mpsc;
     use core::db::ScanDatabase;
     use core::scan::ScanEngine;
+
+    let settings: core::config::Settings = ui_settings.into();
 
     scan_state.write().reset();
     scan_state.write().is_scanning = true;
@@ -246,10 +254,9 @@ async fn run_scan(
     };
 
     // Run scan on a blocking thread so async runtime stays responsive
-    let settings_clone = settings.clone();
     let handle = tokio::task::spawn_blocking(move || {
         let cb = std::sync::Arc::new(move |ev| { let _ = tx.send(ev); });
-        let mut engine = ScanEngine::new(settings_clone, db).with_progress(cb);
+        let mut engine = ScanEngine::new(settings, db).with_progress(cb);
         engine.run()
     });
 
