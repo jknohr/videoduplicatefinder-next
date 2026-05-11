@@ -58,6 +58,33 @@ pub async fn trigger_scan(ui_settings: UiSettings) -> Result<(), ServerFnError> 
     Ok(())
 }
 
+/// Read container-level metadata tags for a media file (ffprobe).
+#[cfg(feature = "web")]
+#[server(endpoint = "/api/read_tags")]
+pub async fn read_tags(path: String) -> Result<std::collections::HashMap<String, String>, ServerFnError> {
+    use camino::Utf8Path;
+    let tags = app_core::read_metadata_tags(Utf8Path::new(&path));
+    Ok(tags)
+}
+
+/// Write container-level metadata tags to a media file (ffmpeg -c copy, atomic rename).
+#[cfg(feature = "web")]
+#[server(endpoint = "/api/write_tags")]
+pub async fn write_tags(
+    path: String,
+    tags: std::collections::HashMap<String, String>,
+) -> Result<(), ServerFnError> {
+    use camino::Utf8Path;
+    let (ok, err) = app_core::write_metadata_tags(Utf8Path::new(&path), &tags);
+    if ok {
+        Ok(())
+    } else {
+        Err(ServerFnError::ServerError(
+            err.unwrap_or_else(|| "write_tags failed".to_string())
+        ))
+    }
+}
+
 /// Load all duplicate clusters from the database.
 #[cfg(feature = "web")]
 #[server(endpoint = "/api/duplicates")]

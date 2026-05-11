@@ -738,6 +738,54 @@ pub fn get_scene_change_timestamps(
 /// Returns `(true, None)` on success, `(false, Some(reason))` on failure.
 ///
 /// Mirrors `FfmpegEngine.WriteMetadataTags` from C#.
+/// Read container-level metadata tags from a media file using `ffprobe`.
+///
+/// Mirrors `FFProbeEngine.GetMetadataTags` from C#.
+/// Excludes noise keys (`encoder`, `handler_name`, `vendor_id`).
+/// Returns an empty map if ffprobe is not found or the file has no tags.
+pub fn read_metadata_tags(path: &Utf8Path) -> std::collections::HashMap<String, String> {
+    const EXCLUDED: &[&str] = &["encoder", "handler_name", "vendor_id"];
+    let mut result = std::collections::HashMap::new();
+
+    let ffprobe = match which_ffprobe() {
+        Some(p) => p,
+        None => return result,
+    };
+    if !path.exists() {
+        return result;
+    }
+
+    let args = [
+        "-v", "quiet",
+        "-print_format", "json",
+        "-show_entries", "format_tags",
+        &long_path_fix(path.as_str()),
+    ];
+
+    let output = match std::process::Command::new(&ffprobe).args(args).output() {
+        Ok(o) => o,
+        Err(_) => return result,
+    };
+    if output.stdout.is_empty() {
+        return result;
+    }
+
+    if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+        if let Some(tags) = doc.get("format").and_then(|f| f.get("tags")).and_then(|t| t.as_object()) {
+            for (k, v) in tags {
+                let key = k.to_lowercase();
+                if EXCLUDED.iter().any(|ex| *ex == key) {
+                    continue;
+                }
+                if let Some(s) = v.as_str() {
+                    result.insert(key, s.to_string());
+                }
+            }
+        }
+    }
+    result
+}
+
 pub fn write_metadata_tags(
     path: &Utf8Path,
     tags: &std::collections::HashMap<String, String>,

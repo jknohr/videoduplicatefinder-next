@@ -4,8 +4,9 @@ use dioxus::prelude::*;
 
 use crate::state::{AppState, ScanState};
 use crate::views::{
-    blacklist::BlacklistView, compare::CompareView, results::ResultsView,
-    scan::ScanView, settings::SettingsView, stats::StatsView,
+    blacklist::BlacklistView, compare::CompareView, database::DatabaseView,
+    logs::LogsView, results::ResultsView, scan::ScanView, settings::SettingsView,
+    stats::StatsView,
 };
 
 /// Top-level routes.
@@ -21,6 +22,10 @@ pub enum Route {
     BlacklistView {},
     #[route("/compare/:file_a/:file_b")]
     CompareView { file_a: String, file_b: String },
+    #[route("/database")]
+    DatabaseView {},
+    #[route("/logs")]
+    LogsView {},
     #[route("/settings")]
     SettingsView {},
 }
@@ -46,6 +51,8 @@ pub fn Sidebar() -> Element {
             NavLink { to: Route::ResultsView {}, "Results" }
             NavLink { to: Route::StatsView {}, "Stats" }
             NavLink { to: Route::BlacklistView {}, "Blacklist" }
+            NavLink { to: Route::DatabaseView {}, "Database" }
+            NavLink { to: Route::LogsView {}, "Logs" }
             NavLink { to: Route::SettingsView {}, "Settings" }
         }
     }

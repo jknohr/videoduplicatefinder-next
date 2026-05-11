@@ -26,7 +26,7 @@ pub use scan::ScanEngine;
 pub use ffmpeg::{
     which_ffmpeg, which_ffprobe, long_path_fix,
     extract_thumbnail_jpeg, extract_temporal_average_hash,
-    compute_ssim_at_offset, get_scene_change_timestamps, write_metadata_tags,
+    compute_ssim_at_offset, get_scene_change_timestamps, read_metadata_tags, write_metadata_tags,
     MediaInfo,
 };
 pub use utils::{

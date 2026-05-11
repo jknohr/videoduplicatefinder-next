@@ -312,6 +312,9 @@ fn cluster_card(cluster: &DuplicateCluster, mut app_state: Signal<AppState>) -> 
     // IDs for cluster-level actions
     let cluster_file_ids: Vec<String> = cluster.files.iter().map(|f| f.id.clone()).collect();
 
+    // Track which file's metadata editor is open (by file path, None = closed)
+    let mut meta_open_path: Signal<Option<String>> = use_signal(|| None);
+
     rsx! {
         div { class: "cluster-card",
             div { class: "cluster-header",
@@ -337,6 +340,24 @@ fn cluster_card(cluster: &DuplicateCluster, mut app_state: Signal<AppState>) -> 
                             div { class: "file-path text-muted", "{path}" }
                         }
                         div { class: "file-actions",
+                            // Metadata editor toggle
+                            button {
+                                class: "btn btn-xs btn-ghost",
+                                title: "Edit metadata tags",
+                                onclick: {
+                                    let p = path.clone();
+                                    let mut meta_open = meta_open_path;
+                                    move |_| {
+                                        let mut open = meta_open.write();
+                                        if open.as_deref() == Some(&p) {
+                                            *open = None;
+                                        } else {
+                                            *open = Some(p.clone());
+                                        }
+                                    }
+                                },
+                                "⋮"
+                            }
                             button {
                                 class: "btn btn-xs btn-outline",
                                 title: "Send to trash",
@@ -374,6 +395,10 @@ fn cluster_card(cluster: &DuplicateCluster, mut app_state: Signal<AppState>) -> 
                                 "✕"
                             }
                         }
+                    }
+                    // Inline metadata editor — visible when this file's path is selected
+                    if meta_open_path.read().as_deref() == Some(&path) {
+                        MetadataEditorInline { file_path: path.clone() }
                     }
                 }
             }
@@ -609,4 +634,95 @@ pub(crate) async fn blacklist_group_action(file_ids: Vec<String>) -> Result<(), 
     }
 
     Ok(())
+}
+
+// ── Metadata editor ───────────────────────────────────────────────────────────
+
+/// Inline metadata tag editor. Opens a panel below a file row showing all
+/// container tags read via ffprobe; allows editing and saving.
+///
+/// C# ref: VDF.GUI — EditMetadata dialog triggered from file context menu.
+#[component]
+pub fn MetadataEditorInline(file_path: String) -> Element {
+    let mut tags: Signal<Vec<(String, String)>> = use_signal(Vec::new);
+    let mut loading = use_signal(|| false);
+    let mut status: Signal<Option<String>> = use_signal(|| None);
+
+    // Load tags when the panel mounts
+    use_effect({
+        let path = file_path.clone();
+        let mut tags = tags.clone();
+        let mut loading = loading.clone();
+        move || {
+            #[cfg(feature = "server")]
+            {
+                *loading.write() = true;
+                let map = app_core::read_metadata_tags(camino::Utf8Path::new(&path));
+                let mut sorted: Vec<(String, String)> = map.into_iter().collect();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                *tags.write() = sorted;
+                *loading.write() = false;
+            }
+        }
+    });
+
+    let save = {
+        let path = file_path.clone();
+        let tags = tags.clone();
+        let mut status = status.clone();
+        move |_| {
+            let path2 = path.clone();
+            let map: std::collections::HashMap<String, String> = tags.read().iter().cloned().collect();
+            #[cfg(feature = "server")]
+            {
+                let (ok, err) = app_core::write_metadata_tags(camino::Utf8Path::new(&path2), &map);
+                if ok {
+                    *status.write() = Some("Saved.".to_string());
+                } else {
+                    *status.write() = Some(format!("Error: {}", err.unwrap_or_default()));
+                }
+            }
+        }
+    };
+
+    rsx! {
+        div { class: "metadata-editor",
+            if *loading.read() {
+                p { class: "text-muted", "Loading tags…" }
+            } else if tags.read().is_empty() {
+                p { class: "text-muted", "No container tags found." }
+            } else {
+                div { class: "tag-grid",
+                    for (idx, (key, val)) in tags.read().iter().enumerate() {
+                        div { class: "tag-row",
+                            span { class: "tag-key text-muted", "{key}" }
+                            input {
+                                class: "input tag-value",
+                                r#type: "text",
+                                value: "{val}",
+                                oninput: {
+                                    let mut tags = tags.clone();
+                                    move |e| {
+                                        if let Some(t) = tags.write().get_mut(idx) {
+                                            t.1 = e.value();
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    }
+                }
+                div { class: "metadata-actions",
+                    button {
+                        class: "btn btn-sm btn-primary",
+                        onclick: save,
+                        "Save tags"
+                    }
+                    if let Some(msg) = status.read().as_ref() {
+                        span { class: "status-msg text-muted", "{msg}" }
+                    }
+                }
+            }
+        }
+    }
 }
