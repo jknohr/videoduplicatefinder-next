@@ -109,6 +109,38 @@ impl<D: Database> ScanEngine<D> {
         Ok(())
     }
 
+    /// Run only the comparison phases on files that have already been hashed.
+    ///
+    /// This is the "compare-only" mode: skip re-scanning/hashing files and
+    /// proceed directly to duplicate detection and best-match annotation
+    /// against the existing DB fingerprints.
+    pub fn run_compare_only(&mut self) -> VdfResult<()> {
+        info!("compare-only: skipping hash phase, running comparison phases on existing DB");
+
+        self.scan_for_duplicates()?;
+
+        if self.settings.partial_clip_detection {
+            self.scan_for_partial_duplicates()?;
+        }
+
+        if self.settings.iframe_fingerprint {
+            self.scan_for_timeline_duplicates()?;
+        }
+
+        if self.settings.mpeg7_signature {
+            self.scan_for_mpeg7_duplicates()?;
+        }
+
+        info!("Highlighting best matches per duplicate group");
+        self.highlight_best_matches()?;
+
+        let dupes = self.db.all_duplicates()?.len();
+        self.db.flush()?;
+        let total_files = self.db.count_files()? as usize;
+        self.emit(ScanProgress::ScanComplete { files: total_files, duplicates: dupes });
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Phase 1: file discovery
     // ------------------------------------------------------------------

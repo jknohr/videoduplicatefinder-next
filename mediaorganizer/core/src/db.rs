@@ -966,6 +966,17 @@ pub trait Database: Send + Sync {
     // ── Housekeeping ──────────────────────────────────────────────────────────
     fn flush(&mut self) -> VdfResult<()>;
     fn db_version(&self) -> u32;
+
+    // ── Bulk operations ───────────────────────────────────────────────────────
+
+    /// Delete a file record and all its edges by record ID.
+    /// Equivalent to `delete_file` but also removes all `duplicate_of` edges
+    /// attached to the file node.
+    fn remove_file(&mut self, id: &str) -> VdfResult<()>;
+
+    /// Delete every file, location, duplicate edge, and scan-job record in
+    /// the database, leaving the schema intact.
+    fn clear_all(&mut self) -> VdfResult<()>;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1692,6 +1703,43 @@ impl Database for SurrealDatabase {
             .into_iter()
             .filter_map(|v| serde_json::from_value::<FileRecord>(v).ok())
             .collect())
+    }
+
+    fn remove_file(&mut self, id: &str) -> VdfResult<()> {
+        let id = id.to_string();
+        let db = &self.db;
+        self.rt
+            .block_on(async move {
+                // Delete all duplicate_of edges involving this file, then the file node.
+                db.query(
+                    "DELETE duplicate_of WHERE in = type::thing('file', $id) \
+                        OR out = type::thing('file', $id); \
+                     DELETE type::thing('file', $id);",
+                )
+                .bind(("id", id))
+                .await?;
+                Ok::<_, surrealdb::Error>(())
+            })
+            .map_err(|e| VdfError::Database(e.to_string()))
+    }
+
+    fn clear_all(&mut self) -> VdfResult<()> {
+        let db = &self.db;
+        self.rt
+            .block_on(async move {
+                db.query(
+                    "DELETE file; \
+                     DELETE location; \
+                     DELETE duplicate_of; \
+                     DELETE in_folder; \
+                     DELETE scan_job; \
+                     DELETE blacklist; \
+                     DELETE analysis;",
+                )
+                .await?;
+                Ok::<_, surrealdb::Error>(())
+            })
+            .map_err(|e| VdfError::Database(e.to_string()))
     }
 
     fn flush(&mut self) -> VdfResult<()> {
