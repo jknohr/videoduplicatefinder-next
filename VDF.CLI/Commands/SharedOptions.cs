@@ -138,8 +138,15 @@ namespace VDF.CLI.Commands {
 		DefaultValueFactory = _ => 40f
 	};
 	internal static readonly Option<int> IFrameMinConsecutive = new("--iframe-min-consecutive") {
-		Description = "Minimum consecutive matching I-frames. At 30 s/sample, 3 = 90 s of matching content. Default: 3.",
+		Description = "Minimum matching I-frames in a gap-bridged segment. At 30 s/sample, 3 = 90 s of content. Default: 3.",
 		DefaultValueFactory = _ => 3
+	};
+	internal static readonly Option<int> IFrameMaxGap = new("--iframe-max-gap") {
+		Description = "Max non-matching frames allowed within a segment before the run resets. " +
+		              "0 = strict consecutive (identical clip, same cut). " +
+		              "1-2 = re-edit with occasional alternate shots. " +
+		              "5+ = same source material with heavy re-editing. Default: 0.",
+		DefaultValueFactory = _ => 0
 	};
 	internal static readonly Option<float> IFrameHashThreshold = new("--iframe-hash-threshold") {
 		Description = "Per-frame Hamming similarity threshold (0–1) to count as matching. Default: 0.85.",
@@ -252,6 +259,7 @@ namespace VDF.CLI.Commands {
 				s.IFrameSampleIntervalSec  = r.GetValue(IFrameSampleInterval);
 				s.IFrameMatchPercent       = r.GetValue(IFrameMatchPercent) / 100f;
 				s.IFrameMinConsecutive     = r.GetValue(IFrameMinConsecutive);
+				s.IFrameMaxGap             = r.GetValue(IFrameMaxGap);
 				s.IFrameHashThreshold      = r.GetValue(IFrameHashThreshold);
 			}
 
@@ -313,6 +321,7 @@ namespace VDF.CLI.Commands {
 		cmd.Options.Add(IFrameSampleInterval);
 		cmd.Options.Add(IFrameMatchPercent);
 		cmd.Options.Add(IFrameMinConsecutive);
+		cmd.Options.Add(IFrameMaxGap);
 		cmd.Options.Add(IFrameHashThreshold);
 		cmd.Options.Add(TemporalAvgHash);
 		cmd.Options.Add(TemporalAvgStartSec);

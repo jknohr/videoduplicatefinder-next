@@ -142,10 +142,18 @@ namespace VDF.Core {
 		/// </summary>
 		public float IFrameMatchPercent = 0.40f;
 		/// <summary>
-		/// Minimum consecutive matching I-frames required. With 30-second intervals each
-		/// consecutive frame represents 30 seconds of matching content. Default 3 (= 90 s).
+		/// Minimum matching I-frames in a consecutive segment (gap-bridged if IFrameMaxGap &gt; 0).
+		/// With 30-second sample intervals, 3 = 90 seconds of matching content. Default 3.
 		/// </summary>
 		public int IFrameMinConsecutive = 3;
+		/// <summary>
+		/// Maximum non-matching frames allowed within a single matching segment before the run resets.
+		/// 0 = strict consecutive (identical clip, same cut). Higher values bridge across alternate
+		/// shots or brief inserts, enabling detection of re-edits and alternate cuts of the same
+		/// source material. At 30 s/sample: MaxGap=1 bridges one ~30-second differing shot.
+		/// Default 0 (strict).
+		/// </summary>
+		public int IFrameMaxGap = 0;
 		/// <summary>
 		/// Minimum per-frame Hamming similarity (0–1) to count an I-frame as matching.
 		/// Default 0.85 (~10 differing bits out of 64).

@@ -219,18 +219,64 @@
                    value="@((Scan.Settings.IFrameMatchPercent * 100).ToString(CultureInfo.InvariantCulture))"
                    @onchange="e => Scan.Settings.IFrameMatchPercent = (float)(ParseDouble(e.Value) / 100.0)" />
         </label>
-        <label>
-            Min consecutive matching frames (× interval = min matching duration)
-            <input type="number" min="1" max="50" step="1"
-                   value="@Scan.Settings.IFrameMinConsecutive.ToString(CultureInfo.InvariantCulture)"
+
+        <div class="slider-group">
+            <div class="slider-header">
+                <span class="slider-label">Min consecutive matching frames</span>
+                <span class="slider-value">@Scan.Settings.IFrameMinConsecutive
+                    <small>≈ @((Scan.Settings.IFrameMinConsecutive * Scan.Settings.IFrameSampleIntervalSec / 60.0).ToString("F0")) min of matching content</small>
+                </span>
+            </div>
+            <input type="range" min="1" max="20" step="1"
+                   value="@Scan.Settings.IFrameMinConsecutive"
                    @onchange="e => Scan.Settings.IFrameMinConsecutive = (int)ParseDouble(e.Value)" />
-        </label>
-        <label>
-            Per-frame hash similarity threshold %
-            <input type="number" min="50" max="100" step="1"
-                   value="@((Scan.Settings.IFrameHashThreshold * 100).ToString(CultureInfo.InvariantCulture))"
+            <div class="slider-ticks">
+                <span>1 — any brief clip</span>
+                <span>3 — short scene</span>
+                <span>8 — long scene</span>
+                <span>20 — only long identical sequences</span>
+            </div>
+        </div>
+
+        <div class="slider-group">
+            <div class="slider-header">
+                <span class="slider-label">Gap tolerance (non-matching frames allowed inside a segment)</span>
+                <span class="slider-value">@Scan.Settings.IFrameMaxGap
+                    @if (Scan.Settings.IFrameMaxGap == 0) { <small>strict — identical clip / same edit</small> }
+                    else if (Scan.Settings.IFrameMaxGap <= 2) { <small>re-edit / alternate shots</small> }
+                    else { <small>shared source material, heavy re-editing</small> }
+                </span>
+            </div>
+            <input type="range" min="0" max="10" step="1"
+                   value="@Scan.Settings.IFrameMaxGap"
+                   @onchange="e => Scan.Settings.IFrameMaxGap = (int)ParseDouble(e.Value)" />
+            <div class="slider-ticks">
+                <span>0 — exact same cut</span>
+                <span>1–2 — alternate angle/shot</span>
+                <span>5 — re-edited scene</span>
+                <span>10 — same source, different assembly</span>
+            </div>
+        </div>
+
+        <div class="slider-group">
+            <div class="slider-header">
+                <span class="slider-label">Per-frame similarity threshold</span>
+                <span class="slider-value">@((Scan.Settings.IFrameHashThreshold * 100).ToString("F0"))%
+                    @if (Scan.Settings.IFrameHashThreshold >= 0.90f) { <small>near-identical frames only</small> }
+                    else if (Scan.Settings.IFrameHashThreshold >= 0.75f) { <small>similar frames (same scene, maybe different camera/grade)</small> }
+                    else { <small>loose — same shot type / color palette</small> }
+                </span>
+            </div>
+            <input type="range" min="50" max="100" step="1"
+                   value="@((Scan.Settings.IFrameHashThreshold * 100).ToString("F0"))"
                    @onchange="e => Scan.Settings.IFrameHashThreshold = (float)(ParseDouble(e.Value) / 100.0)" />
-        </label>
+            <div class="slider-ticks">
+                <span>50% — loose</span>
+                <span>75% — same scene</span>
+                <span>85% — same footage</span>
+                <span>95% — near-pixel-perfect</span>
+            </div>
+        </div>
     }
 
     <h3>Temporal Average Hash</h3>

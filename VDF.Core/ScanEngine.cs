@@ -1498,6 +1498,7 @@ namespace VDF.Core {
 
 			float matchPercent     = Settings.IFrameMatchPercent;
 			int   minConsecutive   = Settings.IFrameMinConsecutive;
+			int   maxGap           = Settings.IFrameMaxGap;
 			float hashThreshold    = Settings.IFrameHashThreshold;
 
 			for (int i = 0; i < candidates.Count; i++) {
@@ -1518,7 +1519,7 @@ namespace VDF.Core {
 					}
 
 					var (sim, offsetIdx, consecutiveRun) =
-						Utils.TemporalHashUtils.SlidingWindowTimelineCompare(shorter, longer, hashThreshold);
+						Utils.TemporalHashUtils.SlidingWindowTimelineCompare(shorter, longer, hashThreshold, maxGap);
 
 					if (sim < matchPercent || consecutiveRun < minConsecutive) continue;
 
