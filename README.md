@@ -632,7 +632,7 @@ docker exec vdf-web nvidia-smi            # NVIDIA
 ### Volume reference
 
 | Volume | Purpose |
-|--------|---------|
+|--------|----------|
 | `/root/.config/VDF` | Settings (`web-settings.json`) and login credentials |
 | `/root/.local/state/VDF` | Scan database (`ScannedFiles.db`) — mount a named volume here so hashed data persists across container updates |
 | Your media paths | Mount each media directory you want to scan. Read-only (`:ro`) is recommended. |
@@ -660,7 +660,7 @@ chown -R $USER:$USER /path/to/your/videos   # or replace $USER:$USER with user:v
 On SELinux-enforcing systems, Docker bind-mounts are **denied by default**, even when the host permissions look correct. You must append a relabel suffix to every volume path:
 
 | Suffix | Meaning |
-|--------|---------|
+|--------|----------|
 | `:Z` | Relabel for this container only (private). Use for single-container setups. |
 | `:z` | Relabel as shared (multiple containers may access the same directory). |
 
