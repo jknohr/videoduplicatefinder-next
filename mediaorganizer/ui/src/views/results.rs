@@ -9,7 +9,7 @@ use crate::state::AppState;
 use crate::state::app_state::{DuplicateCluster, ResultSort};
 
 #[cfg(feature = "server")]
-use core::db::DuplicatePair;
+use app_core::db::DuplicatePair;
 #[cfg(not(feature = "server"))]
 use crate::state::app_state::stubs::DuplicatePair;
 

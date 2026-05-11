@@ -1,7 +1,7 @@
 //! Global application state: loaded duplicate pairs and UI selection.
 
 #[cfg(feature = "server")]
-use core::db::{DuplicatePair, FileRecord};
+use app_core::db::{DuplicatePair, FileRecord};
 #[cfg(not(feature = "server"))]
 pub mod stubs {
     #[derive(Debug, Clone, Default)] pub struct DuplicatePair {

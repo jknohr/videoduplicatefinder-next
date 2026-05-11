@@ -9,7 +9,9 @@
 #[cfg(feature = "web")]
 use dioxus::prelude::*;
 #[cfg(feature = "web")]
-use core::{config::Settings, scan::ScanProgress};
+use app_core::scan::ScanProgress;
+#[cfg(feature = "web")]
+use crate::settings::UiSettings;
 
 /// Trigger a scan on the server. Streams ScanProgress events back to the client.
 ///
@@ -24,10 +26,12 @@ use core::{config::Settings, scan::ScanProgress};
 /// ```
 #[cfg(feature = "web")]
 #[server(endpoint = "/api/scan")]
-pub async fn trigger_scan(settings: Settings) -> Result<(), ServerFnError> {
+pub async fn trigger_scan(ui_settings: UiSettings) -> Result<(), ServerFnError> {
     use tokio::sync::mpsc;
-    use core::db::ScanDatabase;
-    use core::scan::ScanEngine;
+    use app_core::db::{Database, ScanDatabase};
+    use app_core::scan::ScanEngine;
+
+    let settings: app_core::config::Settings = ui_settings.into();
 
     let db_path = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -58,10 +62,10 @@ pub async fn trigger_scan(settings: Settings) -> Result<(), ServerFnError> {
 #[cfg(feature = "web")]
 #[server(endpoint = "/api/duplicates")]
 pub async fn load_duplicates() -> Result<
-    (Vec<core::db::DuplicatePair>, Vec<core::db::FileRecord>),
+    (Vec<app_core::db::DuplicatePair>, Vec<app_core::db::FileRecord>),
     ServerFnError,
 > {
-    use core::db::ScanDatabase;
+    use app_core::db::{Database, ScanDatabase};
 
     let db_path = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))

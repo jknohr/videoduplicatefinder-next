@@ -34,9 +34,9 @@ impl MatchMethodDisplay {
 }
 
 #[cfg(feature = "server")]
-impl From<core::db::MatchMethod> for MatchMethodDisplay {
-    fn from(m: core::db::MatchMethod) -> Self {
-        use core::db::MatchMethod;
+impl From<app_core::db::MatchMethod> for MatchMethodDisplay {
+    fn from(m: app_core::db::MatchMethod) -> Self {
+        use app_core::db::MatchMethod;
         match m {
             MatchMethod::FrameSimilarity    => Self::FrameSimilarity,
             MatchMethod::IframeTimeline     => Self::IframeTimeline,
@@ -250,7 +250,7 @@ async fn load_pair(
 
     #[cfg(feature = "server")]
     {
-        use core::db::ScanDatabase;
+        use app_core::db::{Database, ScanDatabase};
 
         tokio::task::spawn_blocking(move || {
             let db_path = dirs::data_local_dir()
@@ -267,7 +267,7 @@ async fn load_pair(
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("file not found: {file_b}"))?;
 
-            let to_info = |r: core::db::FileRecord| FileInfo {
+            let to_info = |r: app_core::db::FileRecord| FileInfo {
                 id: r.id.clone(),
                 name: r.name.clone(),
                 path: r.path.to_string(),
@@ -276,7 +276,7 @@ async fn load_pair(
                 width: r.width().unwrap_or(0),
                 height: r.height().unwrap_or(0),
                 video_codec: r.video_streams.first()
-                    .and_then(|s| s.codec_name.clone())
+                    .map(|s| s.codec_name.clone())
                     .unwrap_or_default(),
                 has_audio: r.has_audio(),
             };

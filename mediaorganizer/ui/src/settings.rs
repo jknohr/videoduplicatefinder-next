@@ -1,12 +1,12 @@
 //! UI-local settings struct — always compiled, serializable for fullstack transport.
 //!
-//! On server feature: converts into core::config::Settings for the scan engine.
+//! On server feature: converts into app_core::config::Settings for the scan engine.
 //! On WASM client: used directly; transmitted to the server via serde.
 
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
-/// Mirror of core::config::FolderMatchMode — always compiled.
+/// Mirror of app_core::config::FolderMatchMode — always compiled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FolderMatchMode {
     #[default]
@@ -69,9 +69,9 @@ impl Default for UiSettings {
 }
 
 #[cfg(feature = "server")]
-impl From<UiSettings> for core::config::Settings {
+impl From<UiSettings> for app_core::config::Settings {
     fn from(s: UiSettings) -> Self {
-        let mut c = core::config::Settings::default();
+        let mut c = app_core::config::Settings::default();
         c.include_dirs = s.include_dirs;
         c.exclude_dirs = s.exclude_dirs;
         c.min_similarity = s.min_similarity;
@@ -93,9 +93,9 @@ impl From<UiSettings> for core::config::Settings {
         c.include_images = s.include_images;
         c.include_sub_directories = s.include_sub_directories;
         c.folder_match_mode = match s.folder_match_mode {
-            FolderMatchMode::None => core::config::FolderMatchMode::None,
-            FolderMatchMode::SameFolderOnly => core::config::FolderMatchMode::SameFolderOnly,
-            FolderMatchMode::DifferentFolderOnly => core::config::FolderMatchMode::DifferentFolderOnly,
+            FolderMatchMode::None => app_core::config::FolderMatchMode::None,
+            FolderMatchMode::SameFolderOnly => app_core::config::FolderMatchMode::SameFolderOnly,
+            FolderMatchMode::DifferentFolderOnly => app_core::config::FolderMatchMode::DifferentFolderOnly,
         };
         c
     }

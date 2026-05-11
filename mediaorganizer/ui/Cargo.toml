@@ -26,7 +26,7 @@ default = []
 
 # Activates #[server] fn bodies, links tokio + core (SurrealDB).
 # Never active in WASM compilation — tokio is incompatible with WASM.
-server  = ["dioxus/server", "dep:tokio", "dep:core"]
+server  = ["dioxus/server", "dep:tokio", "dep:app_core"]
 
 # Platform targets.
 # desktop and mobile include `server` so #[server] fns execute in-process.
@@ -42,8 +42,9 @@ wasm64  = ["web"]
 
 [dependencies]
 # Core library — optional so it is not compiled into the WASM client bundle.
+# Aliased as app_core to avoid shadowing Rust's built-in `core` crate.
 # Enabled by the `server` feature only.
-core = { path = "../core", optional = true }
+app_core = { path = "../core", package = "core", optional = true }
 
 # Dioxus 0.7: fullstack feature enables #[server] stub generation on the client side.
 # The base component system requires: macro (rsx!/component attr), html (element types),

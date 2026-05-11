@@ -2,7 +2,7 @@
 
 use dioxus::prelude::*;
 #[cfg(feature = "server")]
-use core::scan::ScanProgress;
+use app_core::scan::ScanProgress;
 
 use crate::app::Route;
 use crate::settings::UiSettings;
@@ -228,10 +228,10 @@ async fn run_scan(
     ui_settings: UiSettings,
 ) {
     use tokio::sync::mpsc;
-    use core::db::ScanDatabase;
-    use core::scan::ScanEngine;
+    use app_core::db::{Database, ScanDatabase};
+    use app_core::scan::ScanEngine;
 
-    let settings: core::config::Settings = ui_settings.into();
+    let settings: app_core::config::Settings = ui_settings.into();
 
     scan_state.write().reset();
     scan_state.write().is_scanning = true;
