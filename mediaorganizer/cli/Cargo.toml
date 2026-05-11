@@ -1,15 +1,15 @@
 [package]
-name = "vdf_cli"
+name = "cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "vdf-cli"
+name = "mediaorganizer"
 path = "src/main.rs"
 
 [dependencies]
-vdf_core = { path = "../vdf_core" }
+core = { path = "../core" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

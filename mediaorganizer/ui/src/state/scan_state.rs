@@ -1,6 +1,6 @@
 //! Reactive scan progress state shared across all components.
 
-use vdf_core::config::Settings;
+use core::config::Settings;
 
 /// One entry in the live log panel.
 #[derive(Debug, Clone)]

@@ -1,6 +1,6 @@
 //! Global application state: loaded duplicate pairs and UI selection.
 
-use vdf_core::db::{DuplicatePair, FileRecord};
+use core::db::{DuplicatePair, FileRecord};
 
 /// A duplicate cluster: a group of files all connected by duplicate_of edges.
 ///

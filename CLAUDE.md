@@ -7,38 +7,38 @@ fingerprints every media file (video + image + audio), and finds near-duplicates
 perceptual hashing, I-frame timeline matching, and Chromaprint audio fingerprinting.
 
 The original C# / .NET implementation lives in the root of this repo (Avalonia GUI, Blazor web,
-CLI). We are building a full Rust replacement in `vdf-rs/` that is **feature-complete**, not a
+CLI). We are building a full Rust replacement in `mediaorganizer/` that is **feature-complete**, not a
 prototype. The C# code is the authoritative spec — read it before porting anything.
 
 ---
 
-## The Rust Workspace: `vdf-rs/`
+## The Rust Workspace: `mediaorganizer/`
 
 ```
-vdf-rs/
+mediaorganizer/
 ├── Cargo.toml      workspace root
-├── vdf_core/       core library — all detection logic, DB, config
-├── vdf_ui/         ONE UI codebase — Dioxus 0.7, feature flags select the target
-└── vdf_cli/        headless CLI binary (clap) — no UI dependency
+├── core/       core library — all detection logic, DB, config
+├── ui/         ONE UI codebase — Dioxus 0.7, feature flags select the target
+└── cli/        headless CLI binary (clap) — no UI dependency
 ```
 
 **CRITICAL — DO NOT CREATE SEPARATE FOLDERS FOR server/gui/web.**
-`vdf_ui` is a single crate. Desktop, web, and mobile are **compile targets selected by feature
+`ui` is a single crate. Desktop, web, and mobile are **compile targets selected by feature
 flags**, not separate crates or directories:
 
 ```
-cargo build -p vdf_ui --features desktop   → native GPU desktop app (Wayland/Win/Mac)
-cargo build -p vdf_ui --features web       → WASM + Axum server binary (browser)
-cargo build -p vdf_ui --features mobile    → iOS / Android binary
+cargo build -p ui --features desktop   → native GPU desktop app (Wayland/Win/Mac)
+cargo build -p ui --features web       → WASM + Axum server binary (browser)
+cargo build -p ui --features mobile    → iOS / Android binary
 ```
 
-There is no `vdf_server/`, no `vdf_gui/`, no `vdf_web/`. Those names describe compile
+There is no separate server/, gui/, or web/ crate. Those names describe compile
 outputs, not source folders. The Dioxus component tree, the Axum server functions, and the
-platform entry points all live inside `vdf_ui/` behind feature flags.
+platform entry points all live inside `ui/` behind feature flags.
 
 ### Non-negotiable rules for every session
 
-1. **Read the C# source first.** Every file in `vdf-rs/` must be a faithful port of the
+1. **Read the C# source first.** Every file in `mediaorganizer/` must be a faithful port of the
    corresponding C# logic. Never simplify, never stub, never write dummy implementations.
    If a feature is complex, implement it completely or leave a `todo!()` with an explanation.
 
@@ -78,8 +78,8 @@ The `kv-rocksdb` backend is required — **never use `kv-mem` in production code
 | Crate | Role |
 |-------|------|
 | `tokio` (current_thread) | Async runtime; bridge to sync `Database` trait via `block_on` |
-| `thiserror` | Structured error enums in `vdf_core` |
-| `anyhow` | Binary-level error propagation in `vdf_ui` and `vdf_cli` |
+| `thiserror` | Structured error enums in `core` |
+| `anyhow` | Binary-level error propagation in `ui` and `cli` |
 | `tracing` + `tracing-subscriber` | Structured logging; live log panel in UI via custom Layer |
 | `serde` + `serde_json` | Config, JSON DB content, CLI output |
 
@@ -89,7 +89,7 @@ The `kv-rocksdb` backend is required — **never use `kv-mem` in production code
 |-------|------|
 | `dioxus` 0.7 | One component tree → desktop (WGPU/Blitz), web (WASM), mobile |
 | `axum` | Embedded HTTP/WS server for the `web` feature target |
-| `clap` | CLI argument parsing in `vdf_cli` |
+| `clap` | CLI argument parsing in `cli` |
 
 ---
 
@@ -104,9 +104,9 @@ Rust over staying on Avalonia 11.
 
 The key insight: **one component tree compiles to every target**. The same `rsx!{}` components
 render on GPU (desktop), in the browser (WASM), and on phone screens (mobile). Feature flags
-in `vdf_ui/Cargo.toml` select which platform runtime is linked.
+in `ui/Cargo.toml` select which platform runtime is linked.
 
-### `vdf_ui/Cargo.toml` feature layout
+### `ui/Cargo.toml` feature layout
 
 ```toml
 [features]
@@ -116,17 +116,17 @@ mobile  = ["dioxus/mobile"]
 
 [dependencies]
 dioxus   = { version = "0.7", default-features = false }
-vdf_core = { path = "../vdf_core" }
+core = { path = "../core" }
 anyhow   = { workspace = true }
 tracing  = { workspace = true }
 axum     = { workspace = true, optional = true }
 tokio    = { workspace = true }
 ```
 
-### `vdf_ui/` source layout
+### `ui/` source layout
 
 ```
-vdf_ui/
+ui/
 └── src/
     ├── main.rs           platform entry point — #[cfg(feature)] selects launch method
     ├── app.rs            App root component + Route enum
@@ -139,7 +139,7 @@ vdf_ui/
     │   ├── scan_state.rs Store<ScanState> — progress, live log entries
     │   └── app_state.rs  Store<AppState> — loaded duplicates, selected pair
     └── server/           (compiled only with `web` feature)
-        └── api.rs        #[server] functions — scan trigger, DB queries via vdf_core
+        └── api.rs        #[server] functions — scan trigger, DB queries via core
 ```
 
 ### Platform entry points (in `main.rs`)
@@ -439,17 +439,17 @@ Phase 3: compare_all() — O(n²) pairwise
 
 | Crate / File | Status | Notes |
 |-------------|--------|-------|
-| `vdf_core/src/error.rs` | Complete | `VdfError` enum, `VdfResult<T>` |
-| `vdf_core/src/config.rs` | Complete | All Settings fields from C# |
-| `vdf_core/src/phash.rs` | Complete | DCT pHash, Hamming similarity |
-| `vdf_core/src/comparison.rs` | Complete | Sliding-window I-frame matching |
-| `vdf_core/src/ffmpeg.rs` | Complete | probe_media, gray frames, iframe timestamps |
-| `vdf_core/src/audio.rs` | Complete | Full Chromaprint pipeline |
-| `vdf_core/src/db.rs` | Complete | SurrealDB 3.0 graph schema + CRUD + RELATE |
-| `vdf_core/src/scan.rs` | Complete | 3-phase scan engine |
-| `vdf_core/src/lib.rs` | Complete | Re-exports |
-| `vdf_cli/src/main.rs` | Complete | scan / list / show commands |
-| `vdf_ui/` | Not started | Dioxus 0.7 — one crate, desktop+web+mobile features |
+| `core/src/error.rs` | Complete | `VdfError` enum, `VdfResult<T>` |
+| `core/src/config.rs` | Complete | All Settings fields from C# |
+| `core/src/phash.rs` | Complete | DCT pHash, Hamming similarity |
+| `core/src/comparison.rs` | Complete | Sliding-window I-frame matching |
+| `core/src/ffmpeg.rs` | Complete | probe_media, gray frames, iframe timestamps |
+| `core/src/audio.rs` | Complete | Full Chromaprint pipeline |
+| `core/src/db.rs` | Complete | SurrealDB 3.0 graph schema + CRUD + RELATE |
+| `core/src/scan.rs` | Complete | 3-phase scan engine |
+| `core/src/lib.rs` | Complete | Re-exports |
+| `cli/src/main.rs` | Complete | scan / list / show commands |
+| `ui/` | Not started | Dioxus 0.7 — one crate, desktop+web+mobile features |
 
 ---
 

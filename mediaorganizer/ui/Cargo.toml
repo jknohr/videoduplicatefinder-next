@@ -1,0 +1,62 @@
+[package]
+name = "ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mediaorganizer-ui"
+path = "src/main.rs"
+
+# Feature flags select the compile target.
+# Only one platform flag should be active per build.
+#
+#   cargo build --features desktop   →  native GPU app (Wayland / Win / Mac)
+#   cargo build --features web       →  WASM32 client + Axum server binary
+#   cargo build --features wasm64    →  WASM64 client + Axum server (no 4 GB limit — next-gen)
+#   cargo build --features mobile    →  iOS / Android binary
+#
+# DX build tool recognises the `server` feature and creates two builds:
+#   - client: WASM bundle (server feature OFF, tokio not linked)
+#   - server: Axum binary (server feature ON, tokio + core linked)
+#
+# cargo check with no features still type-checks all component code.
+[features]
+default = []
+
+# Activates #[server] fn bodies, links tokio + core (SurrealDB).
+# Never active in WASM compilation — tokio is incompatible with WASM.
+server  = ["dioxus/server", "dep:tokio", "dep:core"]
+
+# Platform targets.
+# desktop and mobile include `server` so #[server] fns execute in-process.
+desktop = ["dioxus/desktop", "server"]
+web     = ["dioxus/web", "dep:axum"]
+mobile  = ["dioxus/mobile", "server"]
+
+# wasm64: same as `web` but targets wasm64-unknown-unknown (no 4 GB limit).
+# Requires: uncommenting the build target in .cargo/config.toml and
+# wasm-bindgen + Dioxus dx CLI gaining memory64 support (tracking: wasm-bindgen#1464).
+# Use this flag when building for large media libraries where WASM address space matters.
+wasm64  = ["web"]
+
+[dependencies]
+# Core library — optional so it is not compiled into the WASM client bundle.
+# Enabled by the `server` feature only.
+core = { path = "../core", optional = true }
+
+# Dioxus 0.7: fullstack feature enables #[server] stub generation on the client side.
+dioxus   = { version = "0.7", default-features = false, features = ["router", "fullstack"] }
+anyhow   = { workspace = true }
+tracing  = { workspace = true }
+serde    = { workspace = true }
+serde_json = { workspace = true }
+camino   = { workspace = true }
+dirs     = { workspace = true }
+
+# tokio: optional — WASM client must not link tokio full runtime.
+# Pulled in by the `server` feature for desktop / mobile / web-server builds.
+tokio    = { workspace = true, optional = true }
+
+# Only linked for the `web` server target
+axum = { version = "0.8", optional = true }

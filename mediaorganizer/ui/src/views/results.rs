@@ -4,7 +4,7 @@
 //! The graph traversal (union-find over edges) is done in AppState::load_clusters.
 
 use dioxus::prelude::*;
-use vdf_core::db::MatchMethod;
+use core::db::MatchMethod;
 
 use crate::app::Route;
 use crate::state::AppState;

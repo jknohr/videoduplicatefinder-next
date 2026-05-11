@@ -9,7 +9,7 @@
 #[cfg(feature = "web")]
 use dioxus::prelude::*;
 #[cfg(feature = "web")]
-use vdf_core::{config::Settings, scan::ScanProgress};
+use core::{config::Settings, scan::ScanProgress};
 
 /// Trigger a scan on the server. Streams ScanProgress events back to the client.
 ///
@@ -26,8 +26,8 @@ use vdf_core::{config::Settings, scan::ScanProgress};
 #[server(endpoint = "/api/scan")]
 pub async fn trigger_scan(settings: Settings) -> Result<(), ServerFnError> {
     use tokio::sync::mpsc;
-    use vdf_core::db::ScanDatabase;
-    use vdf_core::scan::ScanEngine;
+    use core::db::ScanDatabase;
+    use core::scan::ScanEngine;
 
     let db_path = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -58,10 +58,10 @@ pub async fn trigger_scan(settings: Settings) -> Result<(), ServerFnError> {
 #[cfg(feature = "web")]
 #[server(endpoint = "/api/duplicates")]
 pub async fn load_duplicates() -> Result<
-    (Vec<vdf_core::db::DuplicatePair>, Vec<vdf_core::db::FileRecord>),
+    (Vec<core::db::DuplicatePair>, Vec<core::db::FileRecord>),
     ServerFnError,
 > {
-    use vdf_core::db::ScanDatabase;
+    use core::db::ScanDatabase;
 
     let db_path = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))

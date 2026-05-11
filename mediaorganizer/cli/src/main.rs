@@ -4,14 +4,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
-use vdf_core::{
+use core::{
     ScanDatabase, ScanEngine, Settings,
     db::{Database, MatchMethod},
     scan::ScanProgress,
 };
 
 #[derive(Parser)]
-#[command(name = "vdf-cli", version, about = "Video Duplicate Finder — command-line interface")]
+#[command(name = "mediaorganizer", version, about = "MediaOrganizer — command-line interface")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -212,8 +212,8 @@ fn cmd_stats(args: StatsArgs) -> Result<()> {
 }
 
 fn print_text_results(
-    pairs: &[vdf_core::db::DuplicatePair],
-    file_by_id: &std::collections::HashMap<&str, &vdf_core::db::FileRecord>,
+    pairs: &[core::db::DuplicatePair],
+    file_by_id: &std::collections::HashMap<&str, &core::db::FileRecord>,
 ) {
     if pairs.is_empty() {
         println!("No duplicates found.");

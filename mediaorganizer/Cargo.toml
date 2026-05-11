@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "vdf_core",
-    "vdf_cli",
-    "vdf_ui",
+    "core",
+    "cli",
+    "ui",
 ]
 resolver = "2"
 
@@ -10,7 +10,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0"
-authors = ["VDF Contributors"]
+authors = ["MediaOrganizer Contributors"]
 
 [workspace.dependencies]
 # Async runtime & parallelism

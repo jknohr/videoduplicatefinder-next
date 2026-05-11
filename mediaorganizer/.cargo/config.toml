@@ -1,0 +1,29 @@
+# ── WebAssembly target configuration ──────────────────────────────────────────
+#
+# TODAY (wasm32 — default, no changes needed):
+#   cargo build -p ui --features web
+#   dx serve --web
+#
+# FUTURE (wasm64 — when wasm-bindgen + Dioxus dx CLI gain memory64 support):
+#   1. Uncomment the [build] block below.
+#   2. Switch to nightly: `rustup override set nightly`
+#   3. Build: cargo +nightly build -p ui --features wasm64 -Z build-std=std,panic_abort
+#
+# Prerequisites for wasm64 to become production-ready:
+#   - wasm-bindgen issue #1464 resolved (64-bit pointer JS interop)
+#   - Dioxus dx CLI updated to pass --target wasm64-unknown-unknown
+#   - wasm-pack updated to support memory64 feature
+#   - Safari ships memory64 (expected Q3 2026)
+#
+# Track: https://github.com/rustwasm/wasm-bindgen/issues/1464
+#
+# ── Uncomment this block to build for wasm64 ──────────────────────────────────
+# [build]
+# target = "wasm64-unknown-unknown"
+#
+# [unstable]
+# build-std = ["std", "panic_abort"]
+# build-std-features = ["panic_immediate_abort"]
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Current default: let cargo / dx CLI pick the target (wasm32 for web feature).
