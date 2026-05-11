@@ -15,7 +15,7 @@ use crate::state::app_state::stubs::DuplicatePair;
 
 #[component]
 pub fn ResultsView() -> Element {
-    let mut app_state = use_context::<Signal<AppState>>();
+    let app_state = use_context::<Signal<AppState>>();
     let clusters = app_state.read().clusters.clone();
 
     rsx! {

@@ -5,14 +5,13 @@ use dioxus::prelude::*;
 use app_core::scan::ScanProgress;
 
 use crate::app::Route;
-use crate::settings::UiSettings;
 use crate::state::{AppState, ScanState};
 use crate::state::scan_state::LogLevel;
 
 #[component]
 pub fn ScanView() -> Element {
     let mut scan_state = use_context::<Signal<ScanState>>();
-    let mut app_state  = use_context::<Signal<AppState>>();
+    let app_state  = use_context::<Signal<AppState>>();
 
     let is_scanning = scan_state.read().is_scanning;
 

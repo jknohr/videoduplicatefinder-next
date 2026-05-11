@@ -37,7 +37,7 @@ pub struct ScanState {
 impl Default for ScanState {
     fn default() -> Self {
         Self {
-            settings: UiSettings::default(),
+            settings: load_saved_settings().unwrap_or_default(),
             is_scanning: false,
             progress: 0.0,
             files_found: 0,
@@ -45,6 +45,17 @@ impl Default for ScanState {
             log_entries: Vec::new(),
         }
     }
+}
+
+/// Load persisted settings from `<config_local_dir>/vdf/settings.json`.
+/// Returns `None` if the file is missing or unparseable.
+fn load_saved_settings() -> Option<UiSettings> {
+    let path = dirs::config_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("vdf")
+        .join("settings.json");
+    let text = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 impl ScanState {

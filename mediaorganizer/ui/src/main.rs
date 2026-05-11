@@ -15,6 +15,7 @@ mod views;
 #[cfg(feature = "web")]
 mod server;
 
+#[allow(unused_imports)]
 use app::App;
 
 #[cfg(feature = "desktop")]
@@ -47,6 +48,7 @@ fn main() {
     std::process::exit(1);
 }
 
+#[allow(dead_code)]
 fn init_logging() {
     use tracing_subscriber::{EnvFilter, fmt};
     fmt()
