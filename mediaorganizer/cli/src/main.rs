@@ -70,6 +70,9 @@ enum Commands {
     /// Manage the "not a match" blacklist
     #[command(subcommand)]
     Blacklist(BlacklistCommand),
+
+    /// Re-hash a single file and re-run comparisons against all DB files
+    Rescan(RescanArgs),
 }
 
 // ─── OutputFormat ─────────────────────────────────────────────────────────────
@@ -358,6 +361,35 @@ enum BlacklistCommand {
     },
 }
 
+// ─── Rescan ───────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+struct RescanArgs {
+    /// Path to the file to re-hash and re-compare
+    #[arg(value_name = "FILE")]
+    file: Utf8PathBuf,
+
+    /// Database path
+    #[arg(long)]
+    db: Option<PathBuf>,
+
+    /// Minimum similarity threshold for comparisons (0.0–1.0)
+    #[arg(long, default_value = "0.96")]
+    min_similarity: f32,
+
+    /// Enable I-frame timeline fingerprinting during re-comparison
+    #[arg(long)]
+    iframe_fingerprint: bool,
+
+    /// Enable audio partial-clip detection during re-comparison
+    #[arg(long)]
+    partial_clip: bool,
+
+    /// Enable MPEG-7 signature comparison during re-comparison
+    #[arg(long)]
+    mpeg7: bool,
+}
+
 // ─── JSON output types (for `list --format json`) ────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -398,6 +430,7 @@ fn main() -> Result<()> {
         Commands::Mark(args)     => cmd_mark(args),
         Commands::Relocate(args) => cmd_relocate(args),
         Commands::Blacklist(sub) => cmd_blacklist(sub),
+        Commands::Rescan(args)   => cmd_rescan(args),
     }
 }
 
@@ -880,6 +913,37 @@ fn cmd_relocate(args: RelocateArgs) -> Result<()> {
 
     eprintln!("{moved} file(s) moved, {errors} error(s).");
     if errors > 0 { anyhow::bail!("{errors} file(s) could not be moved"); }
+    Ok(())
+}
+
+// ─── rescan ───────────────────────────────────────────────────────────────────
+
+fn cmd_rescan(args: RescanArgs) -> Result<()> {
+    use app_core::db::ScanDatabase;
+
+    let db_path = args.db.unwrap_or_else(default_db);
+    let db = ScanDatabase::open(&db_path)
+        .with_context(|| format!("opening database at {}", db_path.display()))?;
+
+    let mut settings = Settings::default();
+    settings.min_similarity = args.min_similarity;
+    settings.iframe_fingerprint = args.iframe_fingerprint;
+    settings.partial_clip_detection = args.partial_clip;
+    settings.mpeg7_signature = args.mpeg7;
+
+    let progress: Arc<dyn Fn(ScanProgress) + Send + Sync> = Arc::new(|ev| match ev {
+        ScanProgress::FileHashed { path, phash } => info!("re-hashed {path}  [{phash:#018x}]"),
+        ScanProgress::DuplicateFound { file_a, file_b, similarity } => {
+            info!("MATCH  {:.1}%  {file_a}  ↔  {file_b}", similarity * 100.0)
+        }
+        ScanProgress::Error { path, msg } => tracing::error!("error {path}: {msg}"),
+        _ => {}
+    });
+
+    let mut engine = ScanEngine::new(settings, db).with_progress(progress);
+    engine.rescan_file(&args.file).context("rescan failed")?;
+
+    eprintln!("Rescan complete for: {}", args.file);
     Ok(())
 }
 

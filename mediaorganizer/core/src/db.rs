@@ -15,6 +15,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use surrealdb::engine::local::{Db, RocksDb};
+use surrealdb::types::RecordId as SurrealRecordId;
 use surrealdb::Surreal;
 use tracing::{debug, info, warn};
 
@@ -170,6 +171,8 @@ pub struct PhashSample {
     pub ts: f64,
     /// 64-bit pHash stored as i64 (SurrealDB int is signed).
     pub hash: i64,
+    /// pHash of horizontally-flipped version of this frame (pre-computed if enabled).
+    pub flipped_hash: Option<i64>,
     /// Mean luminance of the 32×32 frame (0.0–1.0).
     pub brightness: f32,
     /// True if this sample was skipped in comparisons.
@@ -525,20 +528,32 @@ pub struct FileRecord {
     pub extension: String,
     pub media_type: MediaType,
     pub size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub modified_at: Option<u64>,
     pub scanned_at: u64,
 
     // ── Sub-schemas ──────────────────────────────────────────────────────────
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<ContainerInfo>,
+    #[serde(default)]
     pub video_streams: Vec<VideoStreamInfo>,
+    #[serde(default)]
     pub audio_streams: Vec<AudioStreamInfo>,
+    #[serde(default)]
     pub subtitle_streams: Vec<SubtitleStreamInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<ContainerTags>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fingerprints: Option<Fingerprints>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub analysis: Option<Analysis>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub flags: Option<FileFlags>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub external_ids: Option<ExternalIds>,
 }
 
@@ -607,14 +622,26 @@ impl FileRecord {
         }
     }
 
-    /// Set standard pHash fingerprint from raw (timestamp_secs → hash) pairs.
+    /// Set standard pHash fingerprint from raw (timestamp_ms → hash) pairs.
     pub fn set_phash_from_map(&mut self, map: &std::collections::HashMap<u64, u64>) {
+        self.set_phash_from_map_with_flipped(map, None);
+    }
+
+    /// Set pHash fingerprint with optional pre-computed flipped hashes.
+    ///
+    /// `flipped` maps the same timestamp_ms keys to flipped-image hashes.
+    pub fn set_phash_from_map_with_flipped(
+        &mut self,
+        map: &std::collections::HashMap<u64, u64>,
+        flipped: Option<&std::collections::HashMap<u64, u64>>,
+    ) {
         let mut samples: Vec<PhashSample> = map
             .iter()
             .map(|(&ts_ms, &hash)| PhashSample {
                 ts: ts_ms as f64 / 1000.0,
                 hash: hash as i64,
-                brightness: 0.5, // placeholder; caller can patch if brightness is known
+                flipped_hash: flipped.and_then(|f| f.get(&ts_ms)).map(|&h| h as i64),
+                brightness: 0.5,
                 skipped: false,
                 skip_reason: None,
             })
@@ -724,6 +751,20 @@ impl FileRecord {
             .as_ref()
             .and_then(|fp| fp.phash.as_ref())
             .map(|p| p.usable_hashes())
+            .unwrap_or_default()
+    }
+
+    /// Flipped pHash values (horizontally mirrored), if pre-computed.
+    pub fn flipped_phash_hashes(&self) -> Vec<u64> {
+        self.fingerprints
+            .as_ref()
+            .and_then(|fp| fp.phash.as_ref())
+            .map(|p| {
+                p.samples.iter()
+                    .filter(|s| !s.skipped)
+                    .filter_map(|s| s.flipped_hash.map(|h| h as u64))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -892,6 +933,7 @@ pub struct LocationRecord {
 pub struct ScanJob {
     pub id: String,
     pub started_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<u64>,
     /// "running" | "complete" | "failed" | "cancelled"
     pub status: String,
@@ -900,6 +942,7 @@ pub struct ScanJob {
     pub files_compared: u64,
     pub duplicates_found: u64,
     pub settings_snapshot: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -962,6 +1005,7 @@ pub trait Database: Send + Sync {
     fn add_duplicate(&mut self, pair: DuplicatePair) -> VdfResult<()>;
     fn all_duplicates(&self) -> VdfResult<Vec<DuplicatePair>>;
     fn duplicates_of(&self, file_id: &str) -> VdfResult<Vec<DuplicatePair>>;
+    fn remove_duplicates_of(&mut self, file_id: &str) -> VdfResult<()>;
     fn clear_duplicates(&mut self) -> VdfResult<()>;
     fn pair_is_blacklisted(&self, id_a: &str, id_b: &str) -> VdfResult<bool>;
 
@@ -1054,12 +1098,6 @@ DEFINE INDEX IF NOT EXISTS file_missing      ON file FIELDS flags.is_missing;
 DEFINE INDEX IF NOT EXISTS file_placeholder  ON file FIELDS flags.is_placeholder;
 DEFINE INDEX IF NOT EXISTS file_fp_complete  ON file FIELDS fingerprints.all_phases_complete;
 DEFINE INDEX IF NOT EXISTS file_kf_density   ON file FIELDS fingerprints.iframe.keyframe_density_per_min;
-DEFINE ANALYZER IF NOT EXISTS media_text
-    TOKENIZERS blank, class
-    FILTERS lowercase, ascii, snowball(english);
-DEFINE INDEX IF NOT EXISTS file_name_fts ON file FIELDS name
-    SEARCH ANALYZER media_text BM25(1.2, 0.75);
-
 -- ── in_folder  (file → location) ─────────────────────────────────────────────
 DEFINE TABLE IF NOT EXISTS in_folder TYPE RELATION IN file OUT location SCHEMALESS;
 
@@ -1159,6 +1197,17 @@ DEFINE TABLE IF NOT EXISTS meta SCHEMALESS;
 DEFINE FIELD IF NOT EXISTS version ON meta TYPE int;
 ";
 
+/// Full-text search DDL — requires the RocksDB backend (kv-rocksdb).
+/// Not run on kv-mem (used in tests) because the Mem engine does not support
+/// SEARCH ANALYZER / BM25 indexes.
+const FTS_DDL: &str = "
+DEFINE ANALYZER IF NOT EXISTS media_text
+    TOKENIZERS blank, class
+    FILTERS lowercase, ascii, snowball(english);
+DEFINE INDEX IF NOT EXISTS file_name_fts ON file FIELDS name
+    SEARCH ANALYZER media_text BM25(1.2, 0.75);
+";
+
 /// Incremental migration SQL for each schema version.
 /// Index = target version - 1.  migrations[0] upgrades v0 → v1, etc.
 ///
@@ -1202,6 +1251,8 @@ impl SurrealDatabase {
                 db.use_ns(NS).use_db(DB_NAME).await?;
                 // Apply full schema DDL (all DEFINE … IF NOT EXISTS — idempotent)
                 db.query(SCHEMA_DDL).await?;
+                // Full-text search indexes (RocksDB only — silently skip failures on other backends)
+                let _ = db.query(FTS_DDL).await;
                 // Read stored schema version
                 let stored: Option<serde_json::Value> = db
                     .select(("meta", "version"))
@@ -1249,16 +1300,14 @@ impl SurrealDatabase {
         let db = &self.db;
         self.rt
             .block_on(async move {
-                db.query(
-                    "UPSERT type::thing('location', $id) \
-                     SET path = $path, name = $name, scanned_at = $now",
-                )
-                .bind(("id", loc_id2))
-                .bind(("path", path_str))
-                .bind(("name", name))
-                .bind(("now", now))
-                .await
-                .map(|_| ())
+                db.upsert::<Option<serde_json::Value>>(("location", loc_id2.as_str()))
+                    .merge(serde_json::json!({
+                        "path": path_str,
+                        "name": name,
+                        "scanned_at": now,
+                    }))
+                    .await
+                    .map(|_| ())
             })
             .map_err(|e| VdfError::Database(e.to_string()))?;
         Ok(loc_id)
@@ -1271,23 +1320,24 @@ impl Database for SurrealDatabase {
         let loc_id = self.ensure_location(&folder)?;
         let file_id_str = record.id.clone();
 
-        let json_val = serde_json::to_value(&record)
+        // Strip the `id` field before CONTENT so SurrealDB doesn't see a conflicting id.
+        let mut json_val = serde_json::to_value(&record)
             .map_err(|e| VdfError::Database(e.to_string()))?;
+        if let Some(obj) = json_val.as_object_mut() {
+            obj.remove("id");
+        }
 
         let db = &self.db;
         self.rt
             .block_on(async move {
-                db.query("UPSERT type::thing('file', $id) CONTENT $data")
-                    .bind(("id", file_id_str.clone()))
-                    .bind(("data", json_val))
+                // Use the SDK upsert() method — avoids SQL id-field conflicts.
+                db.upsert::<Option<serde_json::Value>>(("file", file_id_str.as_str()))
+                    .merge(json_val)
                     .await?;
-                db.query(
-                    "RELATE type::thing('file', $fid) -> in_folder \
-                     -> type::thing('location', $lid)",
-                )
-                .bind(("fid", file_id_str))
-                .bind(("lid", loc_id))
-                .await?;
+                db.query("RELATE $fid -> in_folder -> $lid")
+                    .bind(("fid", rid("file", &file_id_str)))
+                    .bind(("lid", rid("location", &loc_id)))
+                    .await?;
                 Ok::<_, surrealdb::Error>(())
             })
             .map_err(|e| VdfError::Database(e.to_string()))?;
@@ -1303,7 +1353,7 @@ impl Database for SurrealDatabase {
             .rt
             .block_on(async move {
                 let mut res = db
-                    .query("SELECT * FROM type::thing('file', $id)")
+                    .query("SELECT * FROM type::record('file', $id)")
                     .bind(("id", id))
                     .await?;
                 res.take::<Vec<serde_json::Value>>(0)
@@ -1313,7 +1363,12 @@ impl Database for SurrealDatabase {
         Ok(raw
             .into_iter()
             .next()
-            .and_then(|v| serde_json::from_value::<FileRecord>(v).ok()))
+            .map(normalize_file_json)
+            .and_then(|v| {
+                serde_json::from_value::<FileRecord>(v)
+                    .map_err(|e| warn!("failed to deserialize FileRecord: {e}"))
+                    .ok()
+            }))
     }
 
     fn get_file_by_path(&self, path: &Utf8Path) -> VdfResult<Option<FileRecord>> {
@@ -1332,6 +1387,7 @@ impl Database for SurrealDatabase {
 
         let records: Vec<FileRecord> = raw
             .into_iter()
+            .map(normalize_file_json)
             .filter_map(|v| {
                 serde_json::from_value::<FileRecord>(v)
                     .map_err(|e| warn!("failed to deserialize FileRecord: {e}"))
@@ -1346,7 +1402,7 @@ impl Database for SurrealDatabase {
         let db = &self.db;
         self.rt
             .block_on(async move {
-                db.query("DELETE type::thing('file', $id)").bind(("id", id)).await?;
+                db.query("DELETE type::record('file', $id)").bind(("id", id)).await?;
                 Ok::<_, surrealdb::Error>(())
             })
             .map_err(|e| VdfError::Database(e.to_string()))
@@ -1377,16 +1433,18 @@ impl Database for SurrealDatabase {
         let db = &self.db;
         self.rt
             .block_on(async move {
+                let ra = rid("file", &fa);
+                let rb = rid("file", &fb);
                 db.query(
-                    "RELATE type::thing('file', $a) -> duplicate_of -> type::thing('file', $b) \
+                    "RELATE $ra -> duplicate_of -> $rb \
                      SET similarity = $sim, method = $method, \
                          clip_offset_secs = $clip, audio_offset_secs = $audio, \
                          consecutive_frames = $consec, best_offset_idx = $best, \
                          ssim_score = $ssim, is_flipped = $flip, \
                          phash_scores = $scores, discovered_at = $now",
                 )
-                .bind(("a", fa))
-                .bind(("b", fb))
+                .bind(("ra", ra))
+                .bind(("rb", rb))
                 .bind(("sim", pair.similarity))
                 .bind(("method", method))
                 .bind(("clip", pair.clip_offset_secs))
@@ -1444,8 +1502,8 @@ impl Database for SurrealDatabase {
                                  audio_offset_secs, consecutive_frames, best_offset_idx, \
                                  ssim_score, is_flipped, phash_scores \
                          FROM duplicate_of \
-                         WHERE in = type::thing('file', $id) \
-                            OR out = type::thing('file', $id)",
+                         WHERE in = type::record('file', $id) \
+                            OR out = type::record('file', $id)",
                     )
                     .bind(("id", id))
                     .await?;
@@ -1454,6 +1512,24 @@ impl Database for SurrealDatabase {
             .map_err(|e| VdfError::Database(e.to_string()))?;
 
         Ok(rows.into_iter().filter_map(parse_duplicate_row).collect())
+    }
+
+    fn remove_duplicates_of(&mut self, id: &str) -> VdfResult<()> {
+        let id = id.to_string();
+        let db = &self.db;
+        self.rt
+            .block_on(async move {
+                db.query(
+                    "DELETE duplicate_of \
+                     WHERE in = type::record('file', $id) \
+                        OR out = type::record('file', $id)",
+                )
+                .bind(("id", id))
+                .await?;
+                Ok::<_, surrealdb::Error>(())
+            })
+            .map_err(|e| VdfError::Database(e.to_string()))?;
+        Ok(())
     }
 
     fn clear_duplicates(&mut self) -> VdfResult<()> {
@@ -1478,8 +1554,8 @@ impl Database for SurrealDatabase {
                 let mut res = db
                     .query(
                         "SELECT * FROM blacklisted \
-                         WHERE (in = type::thing('file', $a) AND out = type::thing('file', $b)) \
-                            OR (in = type::thing('file', $b) AND out = type::thing('file', $a))",
+                         WHERE (in = type::record('file', $a) AND out = type::record('file', $b)) \
+                            OR (in = type::record('file', $b) AND out = type::record('file', $a))",
                     )
                     .bind(("a", a))
                     .bind(("b", b))
@@ -1498,12 +1574,14 @@ impl Database for SurrealDatabase {
         let db = &self.db;
         self.rt
             .block_on(async move {
+                let ra = rid("file", &fa);
+                let rb = rid("file", &fb);
                 db.query(
-                    "RELATE type::thing('file', $a) -> blacklisted -> type::thing('file', $b) \
+                    "RELATE $ra -> blacklisted -> $rb \
                      SET added_at = $now, reason = $reason",
                 )
-                .bind(("a", fa))
-                .bind(("b", fb))
+                .bind(("ra", ra))
+                .bind(("rb", rb))
                 .bind(("now", now))
                 .bind(("reason", reason))
                 .await?;
@@ -1544,8 +1622,8 @@ impl Database for SurrealDatabase {
             .block_on(async move {
                 db.query(
                     "DELETE blacklisted \
-                     WHERE (in = type::thing('file', $a) AND out = type::thing('file', $b)) \
-                        OR (in = type::thing('file', $b) AND out = type::thing('file', $a))",
+                     WHERE (in = type::record('file', $a) AND out = type::record('file', $b)) \
+                        OR (in = type::record('file', $b) AND out = type::record('file', $a))",
                 )
                 .bind(("a", a))
                 .bind(("b", b))
@@ -1557,14 +1635,14 @@ impl Database for SurrealDatabase {
 
     fn create_scan_job(&mut self, job: ScanJob) -> VdfResult<()> {
         let id = job.id.clone();
-        let val =
+        let mut val =
             serde_json::to_value(&job).map_err(|e| VdfError::Database(e.to_string()))?;
+        if let Some(obj) = val.as_object_mut() { obj.remove("id"); }
         let db = &self.db;
         self.rt
             .block_on(async move {
-                db.query("UPSERT type::thing('scan_job', $id) CONTENT $data")
-                    .bind(("id", id))
-                    .bind(("data", val))
+                db.upsert::<Option<serde_json::Value>>(("scan_job", id.as_str()))
+                    .merge(val)
                     .await?;
                 Ok::<_, surrealdb::Error>(())
             })
@@ -1573,14 +1651,14 @@ impl Database for SurrealDatabase {
 
     fn update_scan_job(&mut self, job: &ScanJob) -> VdfResult<()> {
         let id = job.id.clone();
-        let val =
+        let mut val =
             serde_json::to_value(job).map_err(|e| VdfError::Database(e.to_string()))?;
+        if let Some(obj) = val.as_object_mut() { obj.remove("id"); }
         let db = &self.db;
         self.rt
             .block_on(async move {
-                db.query("UPSERT type::thing('scan_job', $id) CONTENT $data")
-                    .bind(("id", id))
-                    .bind(("data", val))
+                db.upsert::<Option<serde_json::Value>>(("scan_job", id.as_str()))
+                    .merge(val)
                     .await?;
                 Ok::<_, surrealdb::Error>(())
             })
@@ -1594,15 +1672,23 @@ impl Database for SurrealDatabase {
         let db = &self.db;
         self.rt
             .block_on(async move {
-                db.query(
-                    "UPDATE type::thing('scan_job', $id) \
-                     SET status = $status, finished_at = $now, error = $error",
-                )
-                .bind(("id", id))
-                .bind(("status", status))
-                .bind(("now", now))
-                .bind(("error", error))
-                .await?;
+                // Only include the error field when there is an error string — binding None
+                // serializes to JSON null which SurrealDB rejects for option<string> fields.
+                let sql = if error.is_some() {
+                    "UPDATE type::record('scan_job', $id) \
+                     SET status = $status, finished_at = $now, error = $error"
+                } else {
+                    "UPDATE type::record('scan_job', $id) \
+                     SET status = $status, finished_at = $now"
+                };
+                let mut q = db.query(sql)
+                    .bind(("id", id))
+                    .bind(("status", status))
+                    .bind(("now", now));
+                if let Some(err) = error {
+                    q = q.bind(("error", err));
+                }
+                q.await?;
                 Ok::<_, surrealdb::Error>(())
             })
             .map_err(|e| VdfError::Database(e.to_string()))
@@ -1630,14 +1716,14 @@ impl Database for SurrealDatabase {
 
     fn create_tag(&mut self, tag: UserTag) -> VdfResult<()> {
         let id = tag.id.clone();
-        let val =
+        let mut val =
             serde_json::to_value(&tag).map_err(|e| VdfError::Database(e.to_string()))?;
+        if let Some(obj) = val.as_object_mut() { obj.remove("id"); }
         let db = &self.db;
         self.rt
             .block_on(async move {
-                db.query("UPSERT type::thing('user_tag', $id) CONTENT $data")
-                    .bind(("id", id))
-                    .bind(("data", val))
+                db.upsert::<Option<serde_json::Value>>(("user_tag", id.as_str()))
+                    .merge(val)
                     .await?;
                 Ok::<_, surrealdb::Error>(())
             })
@@ -1668,12 +1754,11 @@ impl Database for SurrealDatabase {
         let db = &self.db;
         self.rt
             .block_on(async move {
-                db.query(
-                    "RELATE type::thing('file', $fid) -> tagged_with \
-                     -> type::thing('user_tag', $tid) SET added_at = $now",
-                )
-                .bind(("fid", fid))
-                .bind(("tid", tid))
+                let rf = rid("file", &fid);
+                let rt = rid("user_tag", &tid);
+                db.query("RELATE $rf -> tagged_with -> $rt SET added_at = $now")
+                    .bind(("rf", rf))
+                    .bind(("rt", rt))
                 .bind(("now", now))
                 .await?;
                 Ok::<_, surrealdb::Error>(())
@@ -1689,8 +1774,8 @@ impl Database for SurrealDatabase {
             .block_on(async move {
                 db.query(
                     "DELETE tagged_with \
-                     WHERE in = type::thing('file', $fid) \
-                       AND out = type::thing('user_tag', $tid)",
+                     WHERE in = type::record('file', $fid) \
+                       AND out = type::record('user_tag', $tid)",
                 )
                 .bind(("fid", fid))
                 .bind(("tid", tid))
@@ -1709,7 +1794,7 @@ impl Database for SurrealDatabase {
                 let mut res = db
                     .query(
                         "SELECT <-in_folder<-(file.*) AS f \
-                         FROM type::thing('location', $lid)",
+                         FROM type::record('location', $lid)",
                     )
                     .bind(("lid", loc_id))
                     .await?;
@@ -1778,9 +1863,9 @@ impl Database for SurrealDatabase {
             .block_on(async move {
                 // Delete all duplicate_of edges involving this file, then the file node.
                 db.query(
-                    "DELETE duplicate_of WHERE in = type::thing('file', $id) \
-                        OR out = type::thing('file', $id); \
-                     DELETE type::thing('file', $id);",
+                    "DELETE duplicate_of WHERE in = type::record('file', $id) \
+                        OR out = type::record('file', $id); \
+                     DELETE type::record('file', $id);",
                 )
                 .bind(("id", id))
                 .await?;
@@ -1842,19 +1927,51 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn extract_record_id(v: &serde_json::Value) -> FileId {
+fn rid(table: &'static str, key: &str) -> SurrealRecordId {
+    SurrealRecordId::new(table, key)
+}
+
+/// Normalize a raw SurrealDB JSON row into a form `serde_json::from_value::<FileRecord>` can
+/// handle. SurrealDB 3.0 returns the `id` field as a RecordId object `{"tb":"file","id":"..."}`;
+/// we flatten it to just the key string so the `FileRecord.id: String` field deserializes cleanly.
+fn normalize_file_json(mut v: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = v.as_object_mut() {
+        if let Some(id_val) = obj.get("id").cloned() {
+            let flat_id = extract_record_id_val(&id_val);
+            if !flat_id.is_empty() {
+                obj.insert("id".to_string(), serde_json::Value::String(flat_id));
+            }
+        }
+        // path comes back as a string — Utf8PathBuf deserializes from string fine.
+    }
+    v
+}
+
+fn extract_record_id_val(v: &serde_json::Value) -> FileId {
     match v {
         serde_json::Value::String(s) => {
-            s.split(':').nth(1).unwrap_or(s.as_str()).to_string()
+            // may be "file:abc123" or just "abc123"
+            if let Some(idx) = s.find(':') { s[idx + 1..].to_string() } else { s.clone() }
         }
-        serde_json::Value::Object(o) => o
-            .get("id")
-            .and_then(|id| id.as_str())
-            .and_then(|s| s.split(':').nth(1))
-            .unwrap_or_default()
-            .to_string(),
+        serde_json::Value::Object(o) => {
+            // SurrealDB 3.0 RecordId as {"tb":"file","id":"abc123"} or {"tb":"file","id":{"String":"abc123"}}
+            let key = o.get("id").unwrap_or(&serde_json::Value::Null);
+            match key {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Object(inner) => inner
+                    .get("String")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                _ => String::new(),
+            }
+        }
         _ => String::new(),
     }
+}
+
+fn extract_record_id(v: &serde_json::Value) -> FileId {
+    extract_record_id_val(v)
 }
 
 fn parse_duplicate_row(row: serde_json::Value) -> Option<DuplicatePair> {
@@ -2005,6 +2122,7 @@ mod tests {
             PhashSample {
                 ts: 10.0,
                 hash: 0xDEAD_BEEF_i64,
+                flipped_hash: None,
                 brightness: 0.5,
                 skipped: false,
                 skip_reason: None,
@@ -2012,6 +2130,7 @@ mod tests {
             PhashSample {
                 ts: 20.0,
                 hash: 0x1234_5678_i64,
+                flipped_hash: None,
                 brightness: 0.01,
                 skipped: true,
                 skip_reason: Some("too_dark".into()),
@@ -2019,6 +2138,7 @@ mod tests {
             PhashSample {
                 ts: 30.0,
                 hash: 0xCAFE_BABE_i64,
+                flipped_hash: None,
                 brightness: 0.6,
                 skipped: false,
                 skip_reason: None,

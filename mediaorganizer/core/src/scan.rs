@@ -147,6 +147,191 @@ impl<D: Database> ScanEngine<D> {
         Ok(())
     }
 
+    /// Re-hash a single file, update its DB record, remove its old duplicate
+    /// edges, and re-run all comparison phases against every other file already
+    /// in the database.
+    ///
+    /// This is equivalent to removing the file from the DB, re-running
+    /// `hash_files([path])`, and then running all comparison phases restricted
+    /// to pairs that involve this file — but without touching any other file's
+    /// fingerprints.
+    ///
+    /// Mirrors the "quick rescan" path in C# VDF.Core.ScanEngine (GatherInfos +
+    /// ScanForDuplicates with a single-file filter).
+    pub fn rescan_file(&mut self, path: &Utf8Path) -> VdfResult<()> {
+        info!("rescan_file: re-hashing {path}");
+
+        // 1. Hash the file and upsert into DB
+        let record = match hash_one_file(path, &self.settings) {
+            Ok(r) => r,
+            Err(e) => {
+                self.emit(ScanProgress::Error { path: path.to_owned(), msg: e.to_string() });
+                return Err(e);
+            }
+        };
+        let file_id = record.id.clone();
+        self.db.upsert_file(record)?;
+        self.emit(ScanProgress::FileHashed {
+            path: path.to_owned(),
+            phash: self.db.get_file(&file_id)?.and_then(|r| r.first_phash()).unwrap_or(0),
+        });
+
+        // 2. Remove all existing duplicate edges for this file
+        self.db.remove_duplicates_of(&file_id)?;
+
+        // 3. Load the updated record + all other files to compare against
+        let target = match self.db.get_file(&file_id)? {
+            Some(r) => r,
+            None => return Ok(()), // shouldn't happen — just inserted it
+        };
+        let all_files = self.db.all_files()?;
+
+        // 4. Compare target against every other file (same logic as compare_all,
+        //    restricted to pairs involving `target`).
+        let settings = &self.settings;
+        let mut new_pairs: Vec<DuplicatePair> = Vec::new();
+
+        for other in &all_files {
+            if other.id == target.id {
+                continue;
+            }
+            // Respect folder match mode
+            if !folder_filter_passes(&target, other, settings) {
+                continue;
+            }
+            // Duration filter
+            if !duration_filter_passes(&target, other, settings) {
+                continue;
+            }
+
+            // pHash comparison
+            if settings.use_phashing {
+                let a_hashes = target.phash_hashes();
+                let b_hashes = other.phash_hashes();
+                let (shorter, longer) = if a_hashes.len() <= b_hashes.len() {
+                    (&a_hashes, &b_hashes)
+                } else {
+                    (&b_hashes, &a_hashes)
+                };
+                if let Some(m) = crate::comparison::arrays_match(
+                    shorter,
+                    longer,
+                    settings.min_similarity,
+                    1,
+                    settings.min_similarity,
+                    0,
+                ) {
+                    let (id_a, id_b) = if a_hashes.len() <= b_hashes.len() {
+                        (target.id.clone(), other.id.clone())
+                    } else {
+                        (other.id.clone(), target.id.clone())
+                    };
+                    new_pairs.push(DuplicatePair::new(
+                        id_a,
+                        id_b,
+                        m.similarity,
+                        MatchMethod::FrameSimilarity,
+                    ));
+                    continue;
+                }
+            }
+
+            // I-frame timeline comparison
+            if settings.iframe_fingerprint {
+                let a_hashes = target.iframe_hashes();
+                let b_hashes = other.iframe_hashes();
+                if !a_hashes.is_empty() && !b_hashes.is_empty() {
+                    let (shorter, longer) = if a_hashes.len() <= b_hashes.len() {
+                        (&a_hashes, &b_hashes)
+                    } else {
+                        (&b_hashes, &a_hashes)
+                    };
+                    if let Some(m) = crate::comparison::arrays_match(
+                        shorter,
+                        longer,
+                        settings.iframe_match_percent,
+                        settings.iframe_min_consecutive,
+                        settings.iframe_hash_threshold,
+                        settings.iframe_max_gap,
+                    ) {
+                        let dur_a = target.duration_secs();
+                        let dur_b = other.duration_secs();
+                        let ts_a = target.iframe_timestamps();
+                        let ts_b = other.iframe_timestamps();
+                        let clip_offset = if a_hashes.len() <= b_hashes.len() {
+                            ts_b.get(m.offset).copied()
+                        } else {
+                            ts_a.get(m.offset).copied()
+                        };
+                        let (id_a, id_b) = if dur_a >= dur_b {
+                            (target.id.clone(), other.id.clone())
+                        } else {
+                            (other.id.clone(), target.id.clone())
+                        };
+                        let mut p = DuplicatePair::new(id_a, id_b, m.similarity, MatchMethod::IframeTimeline);
+                        p.clip_offset_secs = clip_offset;
+                        p.consecutive_frames = Some(m.consecutive_run as u32);
+                        p.best_offset_idx = Some(m.offset as u32);
+                        new_pairs.push(p);
+                        continue;
+                    }
+                }
+            }
+
+            // Audio fingerprint comparison
+            if settings.partial_clip_detection {
+                let a_fp = target.audio_fingerprint();
+                let b_fp = other.audio_fingerprint();
+                if !a_fp.is_empty() && !b_fp.is_empty() {
+                    let a_u64: Vec<u64> = a_fp.iter().map(|&x| x as u64).collect();
+                    let b_u64: Vec<u64> = b_fp.iter().map(|&x| x as u64).collect();
+                    let (shorter, longer) = if a_u64.len() <= b_u64.len() {
+                        (&a_u64, &b_u64)
+                    } else {
+                        (&b_u64, &a_u64)
+                    };
+                    let dur_ratio = shorter.len() as f32 / longer.len().max(1) as f32;
+                    if dur_ratio >= settings.partial_clip_min_ratio {
+                        if let Some(m) = crate::comparison::arrays_match(
+                            shorter,
+                            longer,
+                            settings.partial_clip_min_similarity,
+                            1,
+                            settings.partial_clip_min_similarity,
+                            2,
+                        ) {
+                            let (id_a, id_b) = if a_u64.len() <= b_u64.len() {
+                                (target.id.clone(), other.id.clone())
+                            } else {
+                                (other.id.clone(), target.id.clone())
+                            };
+                            new_pairs.push(DuplicatePair::new(
+                                id_a,
+                                id_b,
+                                m.similarity,
+                                MatchMethod::AudioFingerprint,
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Store all new pairs
+        for pair in new_pairs {
+            self.emit(ScanProgress::DuplicateFound {
+                file_a: pair.file_a.clone(),
+                file_b: pair.file_b.clone(),
+                similarity: pair.similarity,
+            });
+            self.db.add_duplicate(pair)?;
+        }
+
+        self.db.flush()?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Phase 1: file discovery
     // ------------------------------------------------------------------
