@@ -201,6 +201,10 @@ namespace VDF.Core {
 				await Task.Run(ScanForDuplicates, cancelationTokenSource.Token);
 			if (!cancelationTokenSource.IsCancellationRequested && Settings.EnablePartialClipDetection)
 				await Task.Run(ScanForPartialDuplicates, cancelationTokenSource.Token);
+			if (!cancelationTokenSource.IsCancellationRequested && Settings.EnableIFrameFingerprint)
+				await Task.Run(ScanForTimelineDuplicates, cancelationTokenSource.Token);
+			if (!cancelationTokenSource.IsCancellationRequested && Settings.EnableMpeg7Signature)
+				await Task.Run(ScanForMpeg7Duplicates, cancelationTokenSource.Token);
 			SearchTimer.Stop();
 			ElapsedTimer.Stop();
 			Logger.Instance.Info(T("Log.FinishedScanForDuplicates", SearchTimer.Elapsed));
@@ -245,7 +249,9 @@ namespace VDF.Core {
 		}
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
 		double GetGrayBytesIndex(FileEntry entry, float position) =>
-			entry.GetGrayBytesIndex(position, Settings.MaxSamplingDurationSeconds);
+			entry.GetGrayBytesIndex(position, Settings.MaxSamplingDurationSeconds,
+				Settings.SkipStartSeconds, Settings.SkipStartPercent,
+				Settings.SkipEndSeconds,   Settings.SkipEndPercent);
 
 		void PrepareCompare() {
 			if (Settings.ThumbnailCount != positionList.Count) {
@@ -580,6 +586,49 @@ namespace VDF.Core {
 								onProgress: p => ReportStage(audioPath, audioLabel, (int)(p * 100), 100));
 						}
 
+						// I-frame timeline fingerprint
+						if (Settings.EnableIFrameFingerprint && !entry.IsImage &&
+							entry.IFrameTimestamps == null) {
+							double skipStart = ComputeEffectiveSkipStart(entry);
+							double skipEnd   = ComputeEffectiveSkipEnd(entry);
+							ReportStage(entry.Path, T("Scan.Stage.IFrameFingerprint"));
+							FfmpegEngine.ExtractIFrameTimeline(entry, skipStart, skipEnd,
+								Settings.MaxIFrameSamples);
+						}
+
+						// Temporal average hash (tblend)
+						if (Settings.EnableTemporalAverageHash && !entry.IsImage &&
+							entry.TemporalAverageGrayBytes == null) {
+							ReportStage(entry.Path, T("Scan.Stage.TemporalAvgHash"));
+							FfmpegEngine.ExtractTemporalAverageHash(entry,
+								Settings.TemporalAverageHashStartSec,
+								Settings.TemporalAverageHashWindowSec,
+								Settings.ExtendedFFToolsLogging);
+						}
+
+						// Scene-change timestamp cache (used by scene-aware skip)
+						if (Settings.SceneAwareSkip && !entry.IsImage &&
+							entry.SceneChangeTimestamps == null) {
+							ReportStage(entry.Path, T("Scan.Stage.SceneDetection"));
+							var scTimestamps = FfmpegEngine.GetSceneChangeTimestamps(
+								entry.Path,
+								Settings.SceneDetectionThreshold,
+								Settings.SceneSkipCount + 2,
+								Settings.ExtendedFFToolsLogging);
+							entry.SceneChangeTimestamps = scTimestamps
+								.Select(t => (float)t).ToArray();
+						}
+
+						// MPEG-7 signature
+						if (Settings.EnableMpeg7Signature && !entry.IsImage &&
+							entry.Mpeg7SignaturePath == null) {
+							ReportStage(entry.Path, T("Scan.Stage.Mpeg7Signature"));
+							if (Mpeg7SignatureEngine.ExtractSignature(entry.Path,
+								out string outSigPath,
+								Settings.ExtendedFFToolsLogging))
+								entry.Mpeg7SignaturePath = outSigPath;
+						}
+
 						IncrementProgress(entry.Path);
 						return ValueTask.CompletedTask;
 					}
@@ -866,6 +915,20 @@ namespace VDF.Core {
 						difference = flippedDifference;
 					}
 				}
+
+				// SSIM second-pass: for borderline matches in the gray zone, confirm or reject
+				if (isDuplicate && Settings.EnableSsimVerification &&
+					difference >= Settings.SsimVerificationMinSim &&
+					difference <= Settings.SsimVerificationMaxSim) {
+					double offsetA = GetGrayBytesIndex(entry, positionList.Count > 0 ? positionList[positionList.Count / 2] : 0.5f);
+					double offsetB = GetGrayBytesIndex(compItem, positionList.Count > 0 ? positionList[positionList.Count / 2] : 0.5f);
+					float ssim = FfmpegEngine.ComputeSsimAtOffset(
+						entry.Path, offsetA, compItem.Path, offsetB,
+						Settings.SsimWindowSeconds, Settings.ExtendedFFToolsLogging);
+					if (ssim >= 0 && ssim < Settings.SsimRejectThreshold)
+						isDuplicate = false;
+				}
+
 				return isDuplicate;
 			}
 
@@ -1401,6 +1464,133 @@ namespace VDF.Core {
 			}
 
 			return totalBits;
+		}
+
+		// ── Skip helpers ────────────────────────────────────────────────────────
+
+		double ComputeEffectiveSkipStart(FileEntry entry) {
+			if (Settings.SceneAwareSkip &&
+				entry.SceneChangeTimestamps != null &&
+				entry.SceneChangeTimestamps.Length > 0) {
+				int idx = Math.Min(Settings.SceneSkipCount - 1, entry.SceneChangeTimestamps.Length - 1);
+				return entry.SceneChangeTimestamps[Math.Max(0, idx)];
+			}
+			double dur = entry.mediaInfo?.Duration.TotalSeconds ?? 0;
+			return Math.Max(Settings.SkipStartSeconds, dur * Settings.SkipStartPercent / 100.0);
+		}
+
+		double ComputeEffectiveSkipEnd(FileEntry entry) {
+			double dur = entry.mediaInfo?.Duration.TotalSeconds ?? 0;
+			return Math.Max(Settings.SkipEndSeconds, dur * Settings.SkipEndPercent / 100.0);
+		}
+
+		// ── I-Frame timeline duplicate scan ─────────────────────────────────────
+
+		void ScanForTimelineDuplicates() {
+			var candidates = DatabaseUtils.Database
+				.Where(e => !e.IsImage &&
+					e.IFramePHashes != null && e.IFramePHashes.Length >= 2 &&
+					e.IFrameTimestamps != null && e.IFrameTimestamps.Length >= 2)
+				.ToList();
+
+			if (candidates.Count < 2) return;
+			Logger.Instance.Info($"I-frame timeline scan: {candidates.Count} videos with timeline fingerprints.");
+
+			float matchPercent     = Settings.IFrameMatchPercent;
+			int   minConsecutive   = Settings.IFrameMinConsecutive;
+			float hashThreshold    = Settings.IFrameHashThreshold;
+
+			for (int i = 0; i < candidates.Count; i++) {
+				if (cancelationTokenSource.IsCancellationRequested) break;
+				FileEntry a = candidates[i];
+				for (int j = i + 1; j < candidates.Count; j++) {
+					FileEntry b = candidates[j];
+
+					ulong[] hashesA = a.IFramePHashes!;
+					ulong[] hashesB = b.IFramePHashes!;
+					ulong[] shorter, longer;
+					FileEntry shorterEntry, longerEntry;
+					if (hashesA.Length <= hashesB.Length) {
+						shorter = hashesA; shorterEntry = a; longer = hashesB; longerEntry = b;
+					}
+					else {
+						shorter = hashesB; shorterEntry = b; longer = hashesA; longerEntry = a;
+					}
+
+					var (sim, offsetIdx, consecutiveRun) =
+						Utils.TemporalHashUtils.SlidingWindowTimelineCompare(shorter, longer, hashThreshold);
+
+					if (sim < matchPercent || consecutiveRun < minConsecutive) continue;
+
+					// Calculate actual time offset in the longer video
+					double offsetSec = longerEntry.IFrameTimestamps![Math.Min(offsetIdx, longerEntry.IFrameTimestamps.Length - 1)];
+					Logger.Instance.Info($"[Timeline] {System.IO.Path.GetFileName(shorterEntry.Path)} in {System.IO.Path.GetFileName(longerEntry.Path)}: sim={sim:P1}, run={consecutiveRun}, offset={offsetSec:F1}s");
+
+					lock (Duplicates) {
+						MergeDuplicateTimeline(shorterEntry, longerEntry, sim, offsetSec);
+					}
+				}
+			}
+		}
+
+		void MergeDuplicateTimeline(FileEntry clip, FileEntry source, float similarity, double offsetSec) {
+			var clipOffset = TimeSpan.FromSeconds(offsetSec);
+			DuplicateItem? clipDup   = Duplicates.FirstOrDefault(d => d.Path == clip.Path);
+			DuplicateItem? sourceDup = Duplicates.FirstOrDefault(d => d.Path == source.Path);
+			Guid group = sourceDup?.GroupId ?? clipDup?.GroupId ?? Guid.NewGuid();
+
+			if (sourceDup == null)
+				Duplicates.Add(new DuplicateItem(source, similarity, group, DuplicateFlags.None));
+			if (clipDup == null)
+				Duplicates.Add(new DuplicateItem(clip, similarity, group, DuplicateFlags.PartialClip | DuplicateFlags.TimelineMatch) {
+					PartialClipOffset = clipOffset
+				});
+		}
+
+		// ── MPEG-7 signature duplicate scan ─────────────────────────────────────
+
+		void ScanForMpeg7Duplicates() {
+			var candidates = DatabaseUtils.Database
+				.Where(e => !e.IsImage &&
+					!string.IsNullOrEmpty(e.Mpeg7SignaturePath) &&
+					File.Exists(e.Mpeg7SignaturePath))
+				.ToList();
+
+			if (candidates.Count < 2) return;
+			Logger.Instance.Info($"MPEG-7 signature scan: {candidates.Count} videos with signatures.");
+
+			double durationTolerance = Settings.PercentDurationDifference / 100.0;
+
+			for (int i = 0; i < candidates.Count; i++) {
+				if (cancelationTokenSource.IsCancellationRequested) break;
+				FileEntry a = candidates[i];
+				double durA = a.mediaInfo?.Duration.TotalSeconds ?? 0;
+
+				for (int j = i + 1; j < candidates.Count; j++) {
+					FileEntry b = candidates[j];
+					double durB = b.mediaInfo?.Duration.TotalSeconds ?? 0;
+
+					// Pre-filter by duration tolerance to avoid O(n²) FFmpeg comparisons
+					double shorter = Math.Min(durA, durB);
+					double longer  = Math.Max(durA, durB);
+					if (durationTolerance > 0 && shorter > 0 &&
+						(longer - shorter) / longer > durationTolerance * 2)
+						continue;
+
+					var (isMatch, offsetSec, _) = Mpeg7SignatureEngine.CompareSignatures(
+						a.Mpeg7SignaturePath!, b.Mpeg7SignaturePath!,
+						Settings.ExtendedFFToolsLogging);
+					if (!isMatch) continue;
+
+					Logger.Instance.Info($"[MPEG-7] {System.IO.Path.GetFileName(a.Path)} ↔ {System.IO.Path.GetFileName(b.Path)}: offset={offsetSec:F1}s");
+					lock (Duplicates) {
+						MergeDuplicateTimeline(
+							durA <= durB ? a : b,
+							durA <= durB ? b : a,
+							1.0f, offsetSec);
+					}
+				}
+			}
 		}
 
 		/// <summary>

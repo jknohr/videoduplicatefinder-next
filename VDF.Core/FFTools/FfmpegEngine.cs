@@ -27,7 +27,7 @@ using VDF.Core.FFTools.FFmpegNative;
 using VDF.Core.Utils;
 
 namespace VDF.Core.FFTools {
-	internal static class FfmpegEngine {
+	internal static partial class FfmpegEngine {
 		public static readonly string FFmpegPath;
 		const int TimeoutDuration = 15_000; //15 seconds
 		public static FFHardwareAccelerationMode HardwareAccelerationMode;
@@ -167,6 +167,89 @@ namespace VDF.Core.FFTools {
 			}
 			catch (Exception e) {
 				Logger.Instance.Info($"Native batch graybytes failed on '{videoFile.Path}', falling back to per-sample path. Exception: {e}");
+				return false;
+			}
+		}
+
+		/// <summary>
+		/// Extracts I-frame pHashes from <paramref name="videoFile"/> within the window
+		/// [<paramref name="skipStartSec"/> .. duration-<paramref name="skipEndSec"/>].
+		/// On success, <see cref="FileEntry.IFrameTimestamps"/> and
+		/// <see cref="FileEntry.IFramePHashes"/> are populated.
+		/// Returns <c>false</c> only on hard errors (missing file, no video stream).
+		/// Empty keyframe list is not an error — it stores empty arrays.
+		/// </summary>
+		internal static unsafe bool ExtractIFrameTimeline(
+			FileEntry videoFile,
+			double skipStartSec,
+			double skipEndSec,
+			int maxFrames = 100) {
+			const int N = 32;
+			try {
+				double dur = videoFile.mediaInfo?.Duration.TotalSeconds ?? 0;
+				if (dur <= 0) {
+					videoFile.IFrameTimestamps = Array.Empty<double>();
+					videoFile.IFramePHashes    = Array.Empty<ulong>();
+					return true;
+				}
+				double endSec = Math.Max(skipStartSec, dur - skipEndSec);
+				if (endSec <= skipStartSec) endSec = dur;
+
+				List<double> rawPts = IFrameExtractor.GetKeyframePts(
+					videoFile.Path, skipStartSec, endSec, maxFrames * 4);
+
+				if (rawPts.Count == 0) {
+					videoFile.IFrameTimestamps = Array.Empty<double>();
+					videoFile.IFramePHashes    = Array.Empty<ulong>();
+					return true;
+				}
+
+				List<double> selectedPts = IFrameExtractor.EvenlySubsample(rawPts, maxFrames);
+
+				var timestamps = new List<double>(selectedPts.Count);
+				var hashes     = new List<ulong>(selectedPts.Count);
+
+				using var vsd = new VideoStreamDecoder(videoFile.Path, GetConfiguredHardwareDeviceType());
+				VideoFrameConverter? converter = null;
+				Size converterSrcSize = default;
+				AVPixelFormat converterSrcFmt = AVPixelFormat.AV_PIX_FMT_NONE;
+				try {
+					foreach (double pts in selectedPts) {
+						if (!vsd.TryDecodeFrame(out var srcFrame, TimeSpan.FromSeconds(pts)))
+							continue;
+
+						Size srcSize = new(
+							srcFrame.width  > 0 ? srcFrame.width  : vsd.FrameSize.Width,
+							srcFrame.height > 0 ? srcFrame.height : vsd.FrameSize.Height);
+						AVPixelFormat srcFmt = vsd.IsHardwareDecode
+							? (AVPixelFormat)srcFrame.format : vsd.PixelFormat;
+
+						if (converter == null || srcSize != converterSrcSize || srcFmt != converterSrcFmt) {
+							converter?.Dispose();
+							converter = new VideoFrameConverter(srcSize, srcFmt,
+								new Size(N, N), AVPixelFormat.AV_PIX_FMT_GRAY8);
+							converterSrcSize = srcSize;
+							converterSrcFmt  = srcFmt;
+						}
+
+						var converted = converter.Convert(srcFrame);
+						byte[] data = ExtractGray32FromFrame(converted);
+
+						timestamps.Add(pts);
+						hashes.Add(pHash.PerceptualHash.ComputePHashFromGray32x32(data));
+					}
+				}
+				finally {
+					converter?.Dispose();
+				}
+
+				videoFile.IFrameTimestamps = timestamps.ToArray();
+				videoFile.IFramePHashes    = hashes.ToArray();
+				return true;
+			}
+			catch (Exception e) {
+				Logger.Instance.Info($"ExtractIFrameTimeline failed on '{videoFile.Path}': {e.Message}");
+				// Leave null so it will be retried on next scan
 				return false;
 			}
 		}
@@ -544,5 +627,180 @@ namespace VDF.Core.FFTools {
 		public byte Fullsize;
 		public string File;
 		public TimeSpan Position;
+	}
+
+	// ── Temporal average hash (tblend) ────────────────────────────────────────
+	internal static partial class FfmpegEngine {
+		/// <summary>
+		/// Collapses a <paramref name="windowSec"/>-second segment starting at
+		/// <paramref name="startSec"/> into a single 32×32 grayscale "average frame" by
+		/// applying FFmpeg's <c>tblend=all_mode=average</c> filter.  The resulting 1024-byte
+		/// buffer is stored in <see cref="FileEntry.TemporalAverageGrayBytes"/>.
+		/// </summary>
+		internal static void ExtractTemporalAverageHash(
+			FileEntry videoFile, double startSec, double windowSec,
+			bool extendedLogging) {
+			const int N = 32;
+			const int ExpectedBytes = N * N;
+
+			if (string.IsNullOrEmpty(FFmpegPath)) return;
+			if (videoFile.mediaInfo == null) return;
+			double dur = videoFile.mediaInfo.Duration.TotalSeconds;
+			if (dur <= startSec) return;
+			double actualWindow = Math.Min(windowSec, dur - startSec);
+			if (actualWindow <= 0) return;
+
+			try {
+				string args = $"-hide_banner -loglevel quiet -nostdin " +
+					$"-ss {startSec.ToString(System.Globalization.CultureInfo.InvariantCulture)} " +
+					$"-t {actualWindow.ToString(System.Globalization.CultureInfo.InvariantCulture)} " +
+					$"-i \"{videoFile.Path}\" " +
+					$"-vf \"tblend=all_mode=average,framestep=32767,scale={N}:{N}:flags=bicubic,format=gray\" " +
+					$"-frames:v 1 -f rawvideo pipe:1";
+
+				using var proc = new Process {
+					StartInfo = new ProcessStartInfo {
+						FileName = FFmpegPath,
+						Arguments = args,
+						UseShellExecute = false,
+						RedirectStandardOutput = true,
+						RedirectStandardError = !extendedLogging,
+						CreateNoWindow = true
+					}
+				};
+				proc.Start();
+				byte[] buf = new byte[ExpectedBytes];
+				int read = 0;
+				using (var stdout = proc.StandardOutput.BaseStream) {
+					while (read < ExpectedBytes) {
+						int n = stdout.Read(buf, read, ExpectedBytes - read);
+						if (n == 0) break;
+						read += n;
+					}
+				}
+				proc.WaitForExit(10_000);
+				if (read == ExpectedBytes)
+					videoFile.TemporalAverageGrayBytes = buf;
+			}
+			catch (Exception e) {
+				Logger.Instance.Info($"ExtractTemporalAverageHash failed on '{videoFile.Path}': {e.Message}");
+			}
+		}
+	}
+
+	// ── Scene-change detection (scdet) ────────────────────────────────────────
+	internal static partial class FfmpegEngine {
+		/// <summary>
+		/// Runs the FFmpeg <c>select</c>+<c>showinfo</c> filter chain to detect the first
+		/// <paramref name="maxCount"/> scene transitions whose scene score exceeds
+		/// <paramref name="threshold"/>.  Returns timestamps in seconds.
+		/// Sequential decode — no seek required, terminates early after finding enough scenes.
+		/// </summary>
+		internal static List<double> GetSceneChangeTimestamps(
+			string videoPath, float threshold, int maxCount,
+			bool extendedLogging) {
+			var result = new List<double>(maxCount);
+			if (string.IsNullOrEmpty(FFmpegPath)) return result;
+
+			string threshStr = threshold.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+			// Use showinfo to emit pts_time for every selected frame
+			string args = $"-hide_banner -loglevel info -nostdin -i \"{videoPath}\" " +
+				$"-vf \"select='gt(scene,{threshStr})',showinfo\" " +
+				$"-vsync vfr -frames:v {maxCount} -f null -";
+			try {
+				using var proc = new Process {
+					StartInfo = new ProcessStartInfo {
+						FileName = FFmpegPath,
+						Arguments = args,
+						UseShellExecute = false,
+						RedirectStandardOutput = false,
+						RedirectStandardError = true,
+						CreateNoWindow = true
+					}
+				};
+				proc.Start();
+				// showinfo writes to stderr; parse "pts_time:NNN.NNN" tokens
+				while (!proc.StandardError.EndOfStream) {
+					string? line = proc.StandardError.ReadLine();
+					if (line == null) break;
+					int idx = line.IndexOf("pts_time:", StringComparison.Ordinal);
+					if (idx < 0) continue;
+					int start = idx + 9;
+					int end = line.IndexOf(' ', start);
+					string timeStr = end < 0 ? line[start..] : line[start..end];
+					if (double.TryParse(timeStr,
+						System.Globalization.NumberStyles.Float,
+						System.Globalization.CultureInfo.InvariantCulture,
+						out double t)) {
+						result.Add(t);
+						if (result.Count >= maxCount) break;
+					}
+				}
+				proc.WaitForExit(30_000);
+			}
+			catch (Exception e) {
+				Logger.Instance.Info($"GetSceneChangeTimestamps failed on '{videoPath}': {e.Message}");
+			}
+			return result;
+		}
+	}
+
+	// ── SSIM second-pass verification ─────────────────────────────────────────
+	internal static partial class FfmpegEngine {
+		/// <summary>
+		/// Computes the SSIM score between two video segments at given offsets.
+		/// Uses <c>ffmpeg -lavfi [0][1]ssim</c>. Returns a score in [0, 1], or -1 on error.
+		/// </summary>
+		internal static float ComputeSsimAtOffset(
+			string pathA, double offsetA,
+			string pathB, double offsetB,
+			double windowSec,
+			bool extendedLogging) {
+			if (string.IsNullOrEmpty(FFmpegPath)) return -1f;
+			string ic = System.Globalization.CultureInfo.InvariantCulture.ToString();
+			string oa = offsetA.ToString("F3", System.Globalization.CultureInfo.InvariantCulture);
+			string ob = offsetB.ToString("F3", System.Globalization.CultureInfo.InvariantCulture);
+			string ws = windowSec.ToString("F3", System.Globalization.CultureInfo.InvariantCulture);
+			string args = $"-hide_banner -loglevel info -nostdin " +
+				$"-ss {oa} -t {ws} -i \"{pathA}\" " +
+				$"-ss {ob} -t {ws} -i \"{pathB}\" " +
+				$"-lavfi \"[0][1]ssim=stats_file=-\" -f null -";
+			try {
+				using var proc = new Process {
+					StartInfo = new ProcessStartInfo {
+						FileName = FFmpegPath,
+						Arguments = args,
+						UseShellExecute = false,
+						RedirectStandardOutput = false,
+						RedirectStandardError = true,
+						CreateNoWindow = true
+					}
+				};
+				proc.Start();
+				float ssim = -1f;
+				while (!proc.StandardError.EndOfStream) {
+					string? line = proc.StandardError.ReadLine();
+					if (line == null) break;
+					// Look for "All:X.XXXXXX" in stats output
+					int idx = line.IndexOf("All:", StringComparison.Ordinal);
+					if (idx < 0) continue;
+					int start = idx + 4;
+					int end = line.IndexOf(' ', start);
+					string val = end < 0 ? line[start..] : line[start..end];
+					if (float.TryParse(val,
+						System.Globalization.NumberStyles.Float,
+						System.Globalization.CultureInfo.InvariantCulture,
+						out float v)) {
+						ssim = v;
+					}
+				}
+				proc.WaitForExit(60_000);
+				return ssim;
+			}
+			catch (Exception e) {
+				Logger.Instance.Info($"ComputeSsimAtOffset failed: {e.Message}");
+				return -1f;
+			}
+		}
 	}
 }

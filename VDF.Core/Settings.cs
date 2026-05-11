@@ -55,6 +55,24 @@ namespace VDF.Core {
 		public double DurationDifferenceMaxSeconds;
 		public double MaxSamplingDurationSeconds;
 
+		// ── Intro / outro skip ──────────────────────────────────────────────────
+		/// <summary>
+		/// Seconds to skip at the start of each video before sampling begins.
+		/// Combined with <see cref="SkipStartPercent"/>: the effective skip is
+		/// <c>Max(SkipStartSeconds, duration * SkipStartPercent / 100)</c>.
+		/// Default 0 (disabled).
+		/// </summary>
+		public double SkipStartSeconds;
+		/// <summary>
+		/// Percentage of effective video duration to skip at the start (0–50).
+		/// Combined with <see cref="SkipStartSeconds"/>: the larger of the two wins.
+		/// </summary>
+		public float SkipStartPercent;
+		/// <summary>Seconds to skip at the end of each video before the sampling window closes.</summary>
+		public double SkipEndSeconds;
+		/// <summary>Percentage of effective video duration to skip at the end (0–50).</summary>
+		public float SkipEndPercent;
+
 		public int ThumbnailCount = 1;
 		/// <summary>Maximum width in pixels for display thumbnails (0 = original resolution).</summary>
 		public int ThumbnailMaxWidth = 100;
@@ -97,6 +115,56 @@ namespace VDF.Core {
 		/// 32×32 grayscale percentage difference.
 		/// </summary>
 		public double PartialClipVisualThreshold = 0.85;
+
+		// ── I-Frame timeline fingerprint ────────────────────────────────────
+		/// <summary>Enable I-frame-based timeline fingerprinting and sliding-window comparison.</summary>
+		public bool EnableIFrameFingerprint;
+		/// <summary>Maximum number of I-frames to sample per video (after applying skip). Default 100.</summary>
+		public int MaxIFrameSamples = 100;
+		/// <summary>
+		/// Minimum fraction of the shorter video's I-frames that must match for a timeline duplicate.
+		/// Intentionally low (0.40) because a 20%-length clip can match at most 20% of the source.
+		/// </summary>
+		public float IFrameMatchPercent = 0.40f;
+		/// <summary>Minimum number of consecutive matching I-frames required for a timeline match.</summary>
+		public int IFrameMinConsecutive = 5;
+		/// <summary>
+		/// Minimum per-frame Hamming similarity (0–1) to count an I-frame as matching.
+		/// Default 0.85 (~10 differing bits out of 64).
+		/// </summary>
+		public float IFrameHashThreshold = 0.85f;
+
+		// ── Temporal average hash (tblend) ──────────────────────────────────
+		/// <summary>Enable the temporal average hash (tblend collapse) fingerprint.</summary>
+		public bool EnableTemporalAverageHash;
+		/// <summary>Start of the tblend window in seconds from the beginning of the video.</summary>
+		public double TemporalAverageHashStartSec = 120.0;
+		/// <summary>Duration (seconds) of the tblend averaging window.</summary>
+		public double TemporalAverageHashWindowSec = 60.0;
+
+		// ── Scene-aware skip ────────────────────────────────────────────────
+		/// <summary>Automatically detect the first scene transition and use it as the skip-start offset.</summary>
+		public bool SceneAwareSkip;
+		/// <summary>scdet sensitivity (0–100). Higher values = less sensitive. Default 14.</summary>
+		public float SceneDetectionThreshold = 14f;
+		/// <summary>Number of scene transitions to skip at the start. Default 1.</summary>
+		public int SceneSkipCount = 1;
+
+		// ── MPEG-7 signature ────────────────────────────────────────────────
+		/// <summary>Enable MPEG-7 Video Signature extraction and comparison.</summary>
+		public bool EnableMpeg7Signature;
+
+		// ── SSIM second-pass verification ───────────────────────────────────
+		/// <summary>Enable SSIM second-pass verification for borderline matches.</summary>
+		public bool EnableSsimVerification;
+		/// <summary>Minimum initial similarity for SSIM to be run (lower bound of gray zone). Default 0.80.</summary>
+		public float SsimVerificationMinSim = 0.80f;
+		/// <summary>Maximum initial similarity for SSIM to be run (upper bound of gray zone). Default 0.95.</summary>
+		public float SsimVerificationMaxSim = 0.95f;
+		/// <summary>SSIM score below which a borderline match is rejected. Default 0.90.</summary>
+		public float SsimRejectThreshold = 0.90f;
+		/// <summary>Duration (seconds) of the video segment compared by SSIM. Default 10.</summary>
+		public double SsimWindowSeconds = 10.0;
 
 		// ── Database checkpoints ────────────────────────────────────────────
 		/// <summary>

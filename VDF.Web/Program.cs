@@ -31,6 +31,7 @@ builder.Services.AddSingleton<WebSettingsService>();
 // ScanService is a singleton — one scan at a time, shared across all connections.
 builder.Services.AddSingleton<ScanService>();
 builder.Services.AddSingleton<FFmpegSetupService>();
+builder.Services.AddSingleton<LogService>();
 
 var app = builder.Build();
 
@@ -193,6 +194,19 @@ app.MapGet("/thumbnail/full", async (HttpContext ctx, ScanService scan) => {
 	ctx.Response.ContentType = "image/jpeg";
 	ctx.Response.Headers.CacheControl = "public, max-age=3600";
 	await ctx.Response.Body.WriteAsync(jpeg);
+});
+
+// ── Video streaming endpoint (B2) ───────────────────────────────────────────
+app.MapGet("/video", (HttpContext ctx, string path, ScanService scan) => {
+	if (string.IsNullOrEmpty(path)) return Results.BadRequest();
+	string resolved = Path.GetFullPath(path);
+	// Security: path must fall within one of the configured include directories
+	bool allowed = scan.Settings.IncludeList.Any(dir =>
+		resolved.StartsWith(Path.GetFullPath(dir), StringComparison.OrdinalIgnoreCase));
+	if (!allowed) return Results.Forbid();
+	if (!File.Exists(resolved)) return Results.NotFound();
+	string mime = VDF.Web.Utils.MimeTypeHelper.GetVideoMimeType(Path.GetExtension(resolved));
+	return Results.File(resolved, mime, enableRangeProcessing: true);
 });
 
 app.MapRazorComponents<VDF.Web.Components.App>()

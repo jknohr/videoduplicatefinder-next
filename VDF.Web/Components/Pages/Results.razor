@@ -343,9 +343,11 @@ else {
 @if (_menuVisible && _menuItem != null) {
     <div class="ctx-overlay" @onclick="HideContextMenu"></div>
     <div class="ctx-menu" style="left:@(_menuX.ToString("F0"))px;top:@(_menuY.ToString("F0"))px">
+        <button @onclick="() => { PlayVideo(_menuItem); HideContextMenu(); }">&#x25B6; Play video</button>
         <button @onclick="() => OpenFile(_menuItem)">Open file</button>
         <button @onclick="() => OpenFolder(_menuItem)">Open folder</button>
         <button @onclick="() => CopyPath(_menuItem)">Copy path</button>
+        <button @onclick="() => OpenRename(_menuItem!)">Rename&#x2026;</button>
         <hr />
         <button @onclick="() => { ToggleItem(_menuItem); HideContextMenu(); }">
             @(_selected.Contains(_menuItem) ? "Deselect" : "Select")
@@ -359,6 +361,49 @@ else {
         <hr />
         <button @onclick="() => { HideItem(_menuItem.Path); HideContextMenu(); }">Hide card</button>
         <button @onclick="() => RemoveSingle(_menuItem)">Remove from list</button>
+    </div>
+}
+
+@* Video player modal (B2) *@
+@if (_videoItem != null) {
+    <div class="video-modal-overlay" @onclick="CloseVideo">
+        <div class="video-modal-box" @onclick:stopPropagation>
+            <div class="video-modal-header">
+                <span class="video-modal-title" title="@_videoItem.Path">
+                    @System.IO.Path.GetFileName(_videoItem.Path)
+                </span>
+                <button class="video-modal-close" @onclick="CloseVideo">&#x2715;</button>
+            </div>
+            <video class="video-modal-player" controls autoplay>
+                <source src="/video?path=@Uri.EscapeDataString(_videoItem.Path)"
+                        type="@VDF.Web.Utils.MimeTypeHelper.GetVideoMimeType(System.IO.Path.GetExtension(_videoItem.Path))" />
+                Your browser does not support HTML5 video.
+            </video>
+            <div class="video-modal-meta">
+                @_videoItem.FrameSize &nbsp;|&nbsp; @FormatSize(_videoItem.SizeLong)
+                &nbsp;|&nbsp; @_videoItem.BitRateKbs kbps
+                &nbsp;|&nbsp; @_videoItem.Duration.ToString(@"hh\:mm\:ss")
+            </div>
+        </div>
+    </div>
+}
+
+@* Rename modal (B4) *@
+@if (_renameItem != null) {
+    <div class="rename-overlay" @onclick="CancelRename">
+        <div class="rename-box" @onclick:stopPropagation>
+            <h3>Rename file</h3>
+            <p class="rename-path" title="@_renameItem.Path">@System.IO.Path.GetDirectoryName(_renameItem.Path)</p>
+            <input class="rename-input" @bind="_renameValue" @bind:event="oninput"
+                   @onkeydown="async e => { if (e.Key == \"Enter\") await SubmitRename(); else if (e.Key == \"Escape\") CancelRename(); }" />
+            <div class="rename-actions">
+                <button class="primary" @onclick="SubmitRename"
+                        disabled="@(string.IsNullOrWhiteSpace(_renameValue) || _renameValue.Trim() == System.IO.Path.GetFileName(_renameItem.Path))">
+                    Rename
+                </button>
+                <button @onclick="CancelRename">Cancel</button>
+            </div>
+        </div>
     </div>
 }
 
@@ -377,6 +422,28 @@ else {
     double _menuX, _menuY;
     DuplicateItem? _menuItem;
     List<DuplicateItem>? _menuGroup;
+
+    // Video player modal (B2)
+    DuplicateItem? _videoItem;
+    void PlayVideo(DuplicateItem item) => _videoItem = item;
+    void CloseVideo() => _videoItem = null;
+
+    // Rename modal (B4)
+    DuplicateItem? _renameItem;
+    string _renameValue = string.Empty;
+    void OpenRename(DuplicateItem item) {
+        HideContextMenu();
+        _renameItem = item;
+        _renameValue = System.IO.Path.GetFileName(item.Path);
+    }
+    async Task SubmitRename() {
+        if (_renameItem == null || string.IsNullOrWhiteSpace(_renameValue)) return;
+        var (ok, err) = Scan.RenameItem(_renameItem, _renameValue.Trim());
+        _renameItem = null;
+        ShowMsg(ok ? $"Renamed to '{_renameValue.Trim()}'." : $"Rename failed: {err}", !ok);
+        await Task.CompletedTask;
+    }
+    void CancelRename() => _renameItem = null;
 
     // Auto-select dropdown
     bool _autoSelectOpen;

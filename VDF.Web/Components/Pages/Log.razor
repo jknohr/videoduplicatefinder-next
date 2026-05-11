@@ -1,0 +1,61 @@
+@page "/log"
+@rendermode InteractiveServer
+@inject LogService LogSvc
+@inject IJSRuntime JS
+@implements IDisposable
+
+<PageTitle>Logs — VDF</PageTitle>
+
+<div class="log-page">
+    <div class="log-toolbar">
+        <span class="log-count">@_entries.Count entries</span>
+        <label class="log-autoscroll">
+            <input type="checkbox" @bind="_autoScroll" /> Auto-scroll
+        </label>
+        <button class="btn btn-sm" @onclick="Clear">Clear</button>
+    </div>
+    <div class="log-body" @ref="_logBody">
+        @foreach (var line in _entries)
+        {
+            <div class="log-line @GetLevelClass(line)">@line</div>
+        }
+    </div>
+</div>
+
+@code {
+    IReadOnlyList<string> _entries = Array.Empty<string>();
+    bool _autoScroll = true;
+    ElementReference _logBody;
+
+    protected override void OnInitialized() {
+        _entries = LogSvc.Entries;
+        LogSvc.StateChanged += OnLogChanged;
+    }
+
+    void OnLogChanged() {
+        _entries = LogSvc.Entries;
+        InvokeAsync(async () => {
+            StateHasChanged();
+            if (_autoScroll)
+                await JS.InvokeVoidAsync("scrollToBottom", _logBody);
+        });
+    }
+
+    void Clear() {
+        LogSvc.Clear();
+        _entries = LogSvc.Entries;
+    }
+
+    static string GetLevelClass(string line) {
+        if (line.Contains("error", StringComparison.OrdinalIgnoreCase) ||
+            line.Contains("fail",  StringComparison.OrdinalIgnoreCase))
+            return "log-error";
+        if (line.Contains("warn", StringComparison.OrdinalIgnoreCase))
+            return "log-warn";
+        return "log-info";
+    }
+
+    public void Dispose() {
+        LogSvc.StateChanged -= OnLogChanged;
+    }
+}
