@@ -21,81 +21,102 @@ using System.Runtime.CompilerServices;
 namespace VDF.Core.Utils {
 	/// <summary>
 	/// Sliding-window comparison over sequences of perceptual hashes extracted from I-frames.
-	/// Used to detect when the hash sequence of a shorter video appears as a contiguous
-	/// sub-sequence inside a longer video, regardless of where in the longer video it starts.
+	/// Detects when the hash sequence of a shorter video appears as a contiguous sub-sequence
+	/// inside a longer video, with optional gap tolerance for re-edit / alternate-cut detection.
 	/// </summary>
 	internal static class TemporalHashUtils {
+
 		/// <summary>
-		/// Slides <paramref name="shorter"/> over <paramref name="longer"/>, computing
-		/// per-position Hamming similarity at each offset.
+		/// Slides <paramref name="shorter"/> over <paramref name="longer"/> and finds the best
+		/// alignment. Returns the fraction of clip frames that matched, the start index in
+		/// <paramref name="longer"/>, and the longest gap-tolerant consecutive run.
 		/// </summary>
-		/// <param name="shorter">I-frame pHashes for the candidate clip / shorter video.</param>
+		/// <param name="shorter">I-frame pHashes for the clip / shorter video.</param>
 		/// <param name="longer">I-frame pHashes for the source / longer video.</param>
 		/// <param name="hashSimilarityThreshold">
 		/// Minimum per-frame Hamming similarity (0–1) to count a frame as "matching".
 		/// Default 0.85 (≈ 10 differing bits out of 64).
 		/// </param>
+		/// <param name="maxGap">
+		/// Maximum non-matching frames allowed within a single matching segment before the
+		/// run resets.  0 = strict consecutive (identical edit).  Higher values bridge across
+		/// alternate shots or brief inserts — useful for detecting re-edits and alternate cuts
+		/// of the same source material without requiring frame-perfect order.
+		/// A gap of N means up to N consecutive non-matching frames can appear inside a
+		/// matching segment without breaking it.
+		/// </param>
 		/// <returns>
-		/// (bestSimilarity, bestOffsetIndex, longestConsecutiveRun) where:
+		/// (bestSimilarity, bestOffsetIndex, longestConsecutiveRun):
 		/// <list type="bullet">
-		///   <item>bestSimilarity — fraction of shorter's frames that matched at bestOffsetIndex</item>
-		///   <item>bestOffsetIndex — start index in <paramref name="longer"/> of the best alignment</item>
-		///   <item>longestConsecutiveRun — the longest run of consecutive matching frames seen</item>
+		///   <item>bestSimilarity — fraction of clip frames that matched at the best offset</item>
+		///   <item>bestOffsetIndex — start position in <paramref name="longer"/> of best alignment</item>
+		///   <item>longestConsecutiveRun — longest gap-bridged matching segment (in frame count)</item>
 		/// </list>
 		/// </returns>
 		internal static (float bestSimilarity, int bestOffsetIndex, int longestConsecutiveRun)
 			SlidingWindowTimelineCompare(
 				ulong[] shorter, ulong[] longer,
-				float hashSimilarityThreshold = 0.85f) {
+				float hashSimilarityThreshold = 0.85f,
+				int   maxGap                  = 0) {
 
 			if (shorter.Length == 0 || longer.Length == 0)
 				return (0f, 0, 0);
 			if (shorter.Length > longer.Length)
 				return (0f, 0, 0);
 
-			// Pre-compute the Hamming bit threshold: frames with <= maxBits differing bits count as matching
 			int maxBits = (int)Math.Floor((1.0 - hashSimilarityThreshold) * 64.0);
 
-			float bestSim = 0f;
-			int bestOffset = 0;
-			int bestRun = 0;
+			float bestSim    = 0f;
+			int   bestOffset = 0;
+			int   bestRun    = 0;
 
 			int windowCount = longer.Length - shorter.Length + 1;
-			// Budget for early-exit: allow up to (1 - minAcceptable) fraction of misses
-			// before giving up on an offset. We use 0.70 as the floor — if we couldn't
-			// achieve 70% match we skip the rest of this offset.
+
+			// Early-exit: if we accumulate enough misses that even a perfect remaining run
+			// couldn't reach earlyExitFloor, skip the rest of this offset.
 			const float earlyExitFloor = 0.70f;
 
 			for (int o = 0; o < windowCount; o++) {
-				int matchCount = 0;
-				int currentRun = 0;
-				int maxRun = 0;
+				int matchCount   = 0;
+				int currentRun   = 0;  // matching frames in the current gap-tolerant segment
+				int gapCount     = 0;  // consecutive non-matching frames since last match
+				int maxRun       = 0;
 				int missesAllowed = (int)Math.Ceiling(shorter.Length * (1.0 - earlyExitFloor));
-				int missCount = 0;
+				int hardMissCount = 0; // total non-matching frames (for early exit)
 
 				for (int i = 0; i < shorter.Length; i++) {
 					int bits = HammingDistance(shorter[i], longer[o + i]);
+
 					if (bits <= maxBits) {
+						// Matching frame — extend (or continue) the current segment.
 						matchCount++;
 						currentRun++;
+						gapCount = 0;
 						if (currentRun > maxRun) maxRun = currentRun;
 					}
 					else {
-						currentRun = 0;
-						missCount++;
-						if (missCount > missesAllowed) break;
+						hardMissCount++;
+						if (gapCount < maxGap) {
+							// Non-matching frame within gap budget — bridge it.
+							// The segment continues but this frame doesn't count as a match.
+							gapCount++;
+							currentRun++;    // segment grows in span but not in match count
+						}
+						else {
+							// Gap budget exhausted — reset the segment.
+							// Subtract any gap frames that were included in currentRun.
+							currentRun = 0;
+							gapCount   = 0;
+						}
+						if (hardMissCount > missesAllowed) break;
 					}
 				}
 
 				float sim = (float)matchCount / shorter.Length;
-				if (sim > bestSim) {
-					bestSim = sim;
+				if (sim > bestSim || (sim == bestSim && maxRun > bestRun)) {
+					bestSim    = sim;
 					bestOffset = o;
-					bestRun = maxRun;
-				}
-				else if (sim == bestSim && maxRun > bestRun) {
-					bestRun = maxRun;
-					bestOffset = o;
+					bestRun    = maxRun;
 				}
 			}
 
