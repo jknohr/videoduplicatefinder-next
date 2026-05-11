@@ -1,6 +1,31 @@
 # MediaOrganizer — Full Project Plan
 
-## What We Are Building
+---
+
+## Vision
+
+**MediaOrganizer is a complete media management platform** — not just a duplicate finder.
+
+The end goal covers every operation you would ever want to perform on a media library:
+
+| Domain | Capabilities |
+|--------|-------------|
+| **Duplicate detection** | Video, audio, image — perceptual hash, I-frame timeline, audio fingerprint, MPEG-7 |
+| **Re-encoding & compression** | All formats, GPU-accelerated, HandBrake-equivalent quality presets |
+| **Cropping & trimming** | Non-destructive cuts, chapter-aware trim, batch operations |
+| **Metadata enrichment** | Read/write container tags; auto-enrich from MusicBrainz, TMDB, TVDB, MusicBrainz Picard-style matching |
+| **Format conversion** | Video → any codec/container, audio → any format, image → any format |
+| **Library organisation** | Rename by template, move by rule, folder structure enforcement |
+| **Analysis & insight** | Graph-based cluster analysis, codec health, bitrate distribution, storage savings estimates |
+
+**Right now:** port the existing C# VDF to Rust with full feature parity.
+**The architecture is being built to support everything above from day one** — the SurrealDB graph
+schema, the `file` node structure, and the `core` library are all designed to handle video,
+audio, and images uniformly, not retrofitted later.
+
+---
+
+## Current Phase: Rust Port
 
 A **complete Rust replacement** for the C# Video Duplicate Finder (VDF) codebase. The goal is
 feature parity across every C# project — not a subset, not a prototype. Every feature listed
@@ -14,6 +39,27 @@ The new binary is called **MediaOrganizer**. It ships as:
 - A headless CLI for scripting and automation
 
 All four outputs come from **one Rust workspace** — no code duplication.
+
+---
+
+## Architectural decisions that serve the vision
+
+These are locked-in now precisely because of where the app is going:
+
+**SurrealDB graph schema is media-type agnostic.** The `file` node stores `is_image: bool` today.
+It will gain `is_audio: bool`, `media_type: string` (video/audio/image/document), and codec/format
+metadata as the platform expands. Every graph traversal pattern works identically across types.
+
+**`core/` is a library, not a CLI wrapper.** Re-encoding, trimming, and enrichment will be
+additional modules in `core/` — same crate, same error types, same DB access pattern.
+
+**`ui/` has no hardcoded media type assumptions.** Views are parameterised over the data they
+receive from server functions, not wired to video-specific types.
+
+**FFmpeg is the universal engine.** Every media operation (decode, encode, filter, remux,
+metadata) goes through FFmpeg. The `ffmpeg-the-third` binding and the `std::process::Command`
+fallback both remain — the former for hot paths (hashing, decoding), the latter for complex
+filter graphs (SSIM, MPEG-7, re-encode with quality presets).
 
 ---
 
@@ -459,6 +505,98 @@ tree. Feature flags select the platform runtime — not the components.
 | CLI | clap 4 (derive) | Declarative, auto-generates --help |
 | Errors | thiserror (core) + anyhow (binaries) | Structured in lib, ergonomic in binaries |
 | WASM target | wasm32 now → wasm64 when ecosystem ready | No 4 GB limit by design; .cargo/config.toml prepared |
+
+---
+
+---
+
+## Future Phases (after port is complete)
+
+These phases are planned but not started. Architecture decisions made during the port are
+chosen specifically to avoid blocking any of these.
+
+### Phase 6 — Audio duplicate detection
+
+Extend the scan engine and UI to treat audio files as first-class citizens, not just
+an optional scan target alongside video.
+
+- [ ] Audio-specific pHash: spectral fingerprint for music (not Chromaprint — Chromaprint is
+  for clip matching; this is for perceptually similar music with different mastering/encoding)
+- [ ] BPM / key detection as additional comparison dimension
+- [ ] Waveform visualisation in compare view
+- [ ] Audio-specific result card: duration bar shows waveform amplitude envelope
+- [ ] Support all common audio formats: MP3, FLAC, AAC, OGG, WAV, AIFF, M4A, OPUS
+
+### Phase 7 — Image duplicate detection
+
+Extend to standalone image files (beyond thumbnails extracted from video).
+
+- [ ] Full image pHash pipeline (already partially there via `is_image` flag)
+- [ ] EXIF / XMP metadata read and write
+- [ ] GPS location clustering — find images from the same location
+- [ ] Face detection grouping (optional, requires ML model — TBD)
+- [ ] RAW format support (CR2, NEF, ARW, DNG) via FFmpeg or rawler crate
+- [ ] Image-specific compare view: side-by-side with zoom, pixel diff overlay
+
+### Phase 8 — Re-encoding and compression
+
+HandBrake-equivalent functionality for all media types, GPU-accelerated.
+
+**Video:**
+- [ ] Codec presets: H.264, H.265/HEVC, AV1, VP9 — with quality (CRF) and bitrate modes
+- [ ] Hardware encode: VA-API (Intel/AMD), NVENC (NVIDIA), VideoToolbox (macOS)
+- [ ] Resolution downscale with aspect ratio preservation
+- [ ] Deinterlace, denoise, deblock filters
+- [ ] Chapter-aware batch encode: re-encode only selected chapters
+- [ ] Quality preview: encode 30-second sample before committing to full encode
+
+**Audio:**
+- [ ] Codec presets: AAC, MP3, FLAC, OPUS, AC3 — with quality and bitrate modes
+- [ ] Sample rate and channel conversion (stereo downmix, surround upmix)
+- [ ] Normalisation: EBU R128 loudness normalisation, peak normalisation
+- [ ] Batch re-encode: apply preset to entire library or selected files
+
+**Image:**
+- [ ] Format conversion with quality control: JPEG, WebP, AVIF, PNG, HEIC
+- [ ] Batch resize with aspect ratio preservation and multiple output sizes
+- [ ] Lossless optimisation: oxipng / mozjpeg equivalent via FFmpeg or dedicated crates
+
+**Shared:**
+- [ ] Encode queue with Rayon-parallel execution (N simultaneous encodes, configurable)
+- [ ] Storage savings estimate before encode: show projected size reduction
+- [ ] Encode history in SurrealDB: input path, output path, settings, duration, saved bytes
+- [ ] Non-destructive: always write to new file, never overwrite original unless explicitly confirmed
+
+### Phase 9 — Cropping and trimming
+
+Non-destructive edit operations stored as instructions in SurrealDB, applied on export.
+
+- [ ] Video trim: set in/out points, export as new file via `ffmpeg -ss -to -c copy`
+- [ ] Chapter split: split a long video at chapter boundaries into separate files
+- [ ] Image crop: define crop rectangle, export via FFmpeg `crop` filter
+- [ ] Batch trim: apply same trim rule to all files matching a pattern
+- [ ] Preview trim without encoding: seek to in/out points in the browser player
+
+### Phase 10 — Metadata enrichment
+
+Auto-identify media and populate container tags from online databases.
+
+**Video:**
+- [ ] TMDB integration — match movie/TV episode by title + year, populate title/description/genre/poster
+- [ ] TVDB integration — TV series episode matching by show name + season + episode number
+- [ ] NFO file generation (Kodi/Jellyfin/Plex compatible)
+- [ ] Artwork download and embedding (cover art, episode thumbnails)
+
+**Audio:**
+- [ ] MusicBrainz AcoustID matching — identify songs by audio fingerprint, no filename required
+- [ ] MusicBrainz Picard-style tag population: artist, album, track, year, genre, ISRC
+- [ ] Album art embedding and scaling
+- [ ] ReplayGain calculation and embedding
+
+**Shared:**
+- [ ] Enrichment queue: scan library → match candidates → show confirmation UI → write on approve
+- [ ] Confidence scoring: show match confidence, let user confirm or reject each suggestion
+- [ ] Bulk approve/reject for high-confidence matches
 
 ---
 
