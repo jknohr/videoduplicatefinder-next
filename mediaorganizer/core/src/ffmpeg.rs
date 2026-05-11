@@ -794,6 +794,24 @@ pub fn write_metadata_tags(
     }
 }
 
+// ─── Windows long-path fix ────────────────────────────────────────────────────
+
+/// Prefix a path with `\\?\` (or `\\?\UNC\` for UNC paths) on Windows to bypass
+/// the 260-character MAX_PATH limit.  No-op on other platforms.
+///
+/// Mirrors `FFToolsUtils.LongPathFix` from C#.
+pub fn long_path_fix(path: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        if path.starts_with('\\') {
+            return format!("\\\\?\\UNC\\{}", path.trim_start_matches('\\'));
+        }
+        return format!("\\\\?\\{}", path);
+    }
+    #[cfg(not(target_os = "windows"))]
+    path.to_string()
+}
+
 // ─── Shell-split helper ───────────────────────────────────────────────────────
 
 /// Naïve shell argument split for the simple single-quoted / space-separated
@@ -828,16 +846,38 @@ fn shell_split(args: &str) -> Vec<String> {
     result
 }
 
-/// Find the `ffmpeg` binary on PATH. Returns None if not found.
+/// Find the `ffmpeg` binary. Checks:
+/// 1. `bin/` subfolder next to the executable (portable installs)
+/// 2. Same folder as the executable
+/// 3. PATH
 pub fn which_ffmpeg() -> Option<std::path::PathBuf> {
+    find_tool("ffmpeg")
+}
+
+/// Find the `ffprobe` binary using the same search order as `which_ffmpeg`.
+pub fn which_ffprobe() -> Option<std::path::PathBuf> {
+    find_tool("ffprobe")
+}
+
+fn find_tool(name: &str) -> Option<std::path::PathBuf> {
+    let exe_name = if cfg!(windows) { format!("{}.exe", name) } else { name.to_string() };
+
+    // 1. bin/ next to the current executable
+    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        let candidate = exe_dir.join("bin").join(&exe_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        // 2. Same directory as the executable
+        let candidate = exe_dir.join(&exe_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    // 3. PATH
     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .flat_map(|dir| {
-            let mut candidates = vec![dir.join("ffmpeg")];
-            if cfg!(windows) {
-                candidates.push(dir.join("ffmpeg.exe"));
-            }
-            candidates
-        })
+        .map(|dir| dir.join(&exe_name))
         .find(|p| p.is_file())
 }
 

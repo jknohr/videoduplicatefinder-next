@@ -75,6 +75,7 @@ enum Commands {
 enum OutputFormat {
     Text,
     Json,
+    Csv,
 }
 
 // ─── Shared DB path default ───────────────────────────────────────────────────
@@ -771,6 +772,7 @@ fn emit_output(
     let text = match format {
         OutputFormat::Text => format_text(pairs, by_id),
         OutputFormat::Json => format_json(pairs, by_id)?,
+        OutputFormat::Csv  => format_csv(pairs, by_id),
     };
 
     if let Some(path) = output_path {
@@ -819,6 +821,53 @@ fn format_json(pairs: &[DuplicatePair], by_id: &HashMap<&str, &FileRecord>) -> R
         })
         .collect();
     serde_json::to_string_pretty(&records).context("serialising JSON output")
+}
+
+fn format_csv(pairs: &[DuplicatePair], by_id: &HashMap<&str, &FileRecord>) -> String {
+    let mut out = String::from(
+        "Similarity,Method,ClipOffsetSecs,PathA,SizeA,DurationA,WidthA,HeightA,\
+         PathB,SizeB,DurationB,WidthB,HeightB\n",
+    );
+    for p in pairs {
+        let fa = by_id.get(p.file_a.as_str());
+        let fb = by_id.get(p.file_b.as_str());
+        let path_a = fa.map(|f| f.path.as_str()).unwrap_or("");
+        let path_b = fb.map(|f| f.path.as_str()).unwrap_or("");
+        let size_a = fa.map(|f| f.size_bytes).unwrap_or(0);
+        let size_b = fb.map(|f| f.size_bytes).unwrap_or(0);
+        let dur_a  = fa.map(|f| f.duration_secs()).unwrap_or(0.0);
+        let dur_b  = fb.map(|f| f.duration_secs()).unwrap_or(0.0);
+        let w_a    = fa.and_then(|f| f.width()).unwrap_or(0);
+        let w_b    = fb.and_then(|f| f.width()).unwrap_or(0);
+        let h_a    = fa.and_then(|f| f.height()).unwrap_or(0);
+        let h_b    = fb.and_then(|f| f.height()).unwrap_or(0);
+        let offset = p.clip_offset_secs.map(|s| format!("{s:.3}")).unwrap_or_default();
+        out.push_str(&format!(
+            "{:.4},{},{},{},{},{:.3},{},{},{},{},{:.3},{},{}\n",
+            p.similarity,
+            method_label(p.method),
+            offset,
+            csv_escape(path_a),
+            size_a,
+            dur_a,
+            w_a,
+            h_a,
+            csv_escape(path_b),
+            size_b,
+            dur_b,
+            w_b,
+            h_b,
+        ));
+    }
+    out
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
 }
 
 fn to_json_file(r: &FileRecord) -> JsonFile {
