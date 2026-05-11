@@ -521,6 +521,326 @@ pub fn flip_gray_horizontal(gray: &[u8; 1024]) -> Box<[u8; 1024]> {
     flipped
 }
 
+// ─── Temporal average hash (tblend) ──────────────────────────────────────────
+
+/// Collapses a `window_secs`-second segment starting at `start_secs` into a
+/// single 32×32 grayscale "average frame" by applying FFmpeg's
+/// `tblend=all_mode=average` filter.
+///
+/// Mirrors `FfmpegEngine.ExtractTemporalAverageHash` from C#.
+pub fn extract_temporal_average_hash(
+    video_path: &Utf8Path,
+    start_secs: f64,
+    window_secs: f64,
+    duration_secs: f64,
+) -> Option<Box<[u8; GRAY_SIZE]>> {
+    const N: usize = 32;
+
+    if start_secs >= duration_secs {
+        return None;
+    }
+    let actual_window = (window_secs).min(duration_secs - start_secs);
+    if actual_window <= 0.0 {
+        return None;
+    }
+
+    let ffmpeg = which_ffmpeg()?;
+
+    let args = format!(
+        "-hide_banner -loglevel quiet -nostdin \
+         -ss {start:.6} -t {win:.6} -i \"{path}\" \
+         -vf \"tblend=all_mode=average,framestep=32767,scale={N}:{N}:flags=bicubic,format=gray\" \
+         -frames:v 1 -f rawvideo pipe:1",
+        start = start_secs,
+        win = actual_window,
+        path = video_path,
+        N = N,
+    );
+
+    let output = std::process::Command::new(&ffmpeg)
+        .args(shell_split(&args))
+        .output()
+        .ok()?;
+
+    if output.stdout.len() == GRAY_SIZE {
+        let mut buf = Box::new([0u8; GRAY_SIZE]);
+        buf.copy_from_slice(&output.stdout);
+        Some(buf)
+    } else {
+        warn!(
+            "temporal_average_hash: expected {} bytes, got {} for {:?}",
+            GRAY_SIZE,
+            output.stdout.len(),
+            video_path
+        );
+        None
+    }
+}
+
+// ─── Thumbnail JPEG extraction ────────────────────────────────────────────────
+
+/// Extract a single JPEG thumbnail from `video_path` at `position_secs`.
+/// If `max_width > 0`, the image is resized to at most that width.
+///
+/// Mirrors `FfmpegEngine.ExtractThumbnailJpeg` from C#.
+pub fn extract_thumbnail_jpeg(
+    video_path: &Utf8Path,
+    position_secs: f64,
+    max_width: u32,
+) -> Option<Vec<u8>> {
+    let ffmpeg = which_ffmpeg()?;
+
+    let scale_filter = if max_width > 0 {
+        format!("-vf \"scale={}:-1:flags=bicubic\" ", max_width)
+    } else {
+        String::new()
+    };
+
+    let args = format!(
+        "-hide_banner -loglevel quiet -nostdin \
+         -ss {pos:.6} -i \"{path}\" \
+         {scale}-frames:v 1 -f image2pipe -vcodec mjpeg -q:v 2 pipe:1",
+        pos = position_secs,
+        path = video_path,
+        scale = scale_filter,
+    );
+
+    let output = std::process::Command::new(&ffmpeg)
+        .args(shell_split(&args))
+        .output()
+        .ok()?;
+
+    if output.stdout.is_empty() {
+        warn!("extract_thumbnail_jpeg: empty output for {:?}", video_path);
+        None
+    } else {
+        Some(output.stdout)
+    }
+}
+
+// ─── SSIM second-pass verification ───────────────────────────────────────────
+
+/// Compute SSIM score between two video segments at given offsets using
+/// `ffmpeg -lavfi [0][1]ssim=stats_file=-`.
+/// Returns a value in `[0.0, 1.0]`, or `-1.0` on failure.
+///
+/// Mirrors `FfmpegEngine.ComputeSsimAtOffset` from C#.
+pub fn compute_ssim_at_offset(
+    path_a: &Utf8Path,
+    offset_a: f64,
+    path_b: &Utf8Path,
+    offset_b: f64,
+    window_secs: f64,
+) -> f32 {
+    let ffmpeg = match which_ffmpeg() {
+        Some(f) => f,
+        None => return -1.0,
+    };
+
+    let args = format!(
+        "-hide_banner -loglevel info -nostdin \
+         -ss {oa:.3} -t {ws:.3} -i \"{pa}\" \
+         -ss {ob:.3} -t {ws:.3} -i \"{pb}\" \
+         -lavfi \"[0][1]ssim=stats_file=-\" -f null -",
+        oa = offset_a,
+        ob = offset_b,
+        ws = window_secs,
+        pa = path_a,
+        pb = path_b,
+    );
+
+    let output = match std::process::Command::new(&ffmpeg)
+        .args(shell_split(&args))
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("compute_ssim_at_offset failed: {}", e);
+            return -1.0;
+        }
+    };
+
+    // SSIM stats are written to stdout (stats_file=-); "All:X.XXXXXX" appears in each line.
+    let combined = String::from_utf8_lossy(&output.stderr);
+    let mut ssim = -1.0f32;
+    for line in combined.lines() {
+        if let Some(idx) = line.find("All:") {
+            let start = idx + 4;
+            let val_str = &line[start..];
+            let end = val_str.find(' ').unwrap_or(val_str.len());
+            if let Ok(v) = val_str[..end].parse::<f32>() {
+                ssim = v;
+            }
+        }
+    }
+    ssim
+}
+
+// ─── Scene-change detection ───────────────────────────────────────────────────
+
+/// Detect the first `max_count` scene transitions whose score exceeds `threshold`.
+/// Returns timestamps in seconds.
+///
+/// Mirrors `FfmpegEngine.GetSceneChangeTimestamps` from C#.
+pub fn get_scene_change_timestamps(
+    video_path: &Utf8Path,
+    threshold: f32,
+    max_count: usize,
+) -> Vec<f64> {
+    let ffmpeg = match which_ffmpeg() {
+        Some(f) => f,
+        None => return vec![],
+    };
+
+    let args = format!(
+        "-hide_banner -loglevel info -nostdin -i \"{path}\" \
+         -vf \"select='gt(scene,{thresh:.2})',showinfo\" \
+         -vsync vfr -frames:v {max} -f null -",
+        path = video_path,
+        thresh = threshold,
+        max = max_count,
+    );
+
+    let output = match std::process::Command::new(&ffmpeg)
+        .args(shell_split(&args))
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("get_scene_change_timestamps failed: {}", e);
+            return vec![];
+        }
+    };
+
+    let mut result = Vec::with_capacity(max_count);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stderr.lines() {
+        if let Some(idx) = line.find("pts_time:") {
+            let start = idx + 9;
+            let rest = &line[start..];
+            let end = rest.find(' ').unwrap_or(rest.len());
+            if let Ok(t) = rest[..end].parse::<f64>() {
+                result.push(t);
+                if result.len() >= max_count {
+                    break;
+                }
+            }
+        }
+    }
+    result
+}
+
+// ─── Metadata tag writing ─────────────────────────────────────────────────────
+
+/// Write metadata tags to a video file by remuxing with `-c copy`.
+/// Uses a temp file + rename to avoid data loss on error.
+///
+/// Returns `(true, None)` on success, `(false, Some(reason))` on failure.
+///
+/// Mirrors `FfmpegEngine.WriteMetadataTags` from C#.
+pub fn write_metadata_tags(
+    path: &Utf8Path,
+    tags: &std::collections::HashMap<String, String>,
+) -> (bool, Option<String>) {
+    let ffmpeg = match which_ffmpeg() {
+        Some(f) => f,
+        None => return (false, Some("ffmpeg not found".to_string())),
+    };
+
+    if !path.exists() {
+        return (false, Some(format!("file not found: {}", path)));
+    }
+
+    let ext = path.extension().unwrap_or("");
+    let tmp = path.with_extension(format!("vdf_meta_tmp.{}", ext));
+
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(), "quiet".into(),
+        "-y".into(),
+        "-i".into(), path.to_string(),
+        "-c".into(), "copy".into(),
+        "-map_metadata".into(), "0".into(),
+    ];
+    for (k, v) in tags {
+        args.push("-metadata".into());
+        args.push(format!("{}={}", k, v));
+    }
+    args.push(tmp.to_string());
+
+    match std::process::Command::new(&ffmpeg).args(&args).output() {
+        Ok(out) if out.status.success() => {
+            match std::fs::rename(tmp.as_std_path(), path.as_std_path()) {
+                Ok(_) => (true, None),
+                Err(e) => {
+                    let _ = std::fs::remove_file(tmp.as_std_path());
+                    (false, Some(e.to_string()))
+                }
+            }
+        }
+        Ok(out) => {
+            let _ = std::fs::remove_file(tmp.as_std_path());
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            (false, Some(if stderr.is_empty() {
+                format!("ffmpeg exited with code {:?}", out.status.code())
+            } else {
+                stderr
+            }))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(tmp.as_std_path());
+            (false, Some(e.to_string()))
+        }
+    }
+}
+
+// ─── Shell-split helper ───────────────────────────────────────────────────────
+
+/// Naïve shell argument split for the simple single-quoted / space-separated
+/// argument strings we build for FFmpeg subprocesses.
+fn shell_split(args: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut quote_char = ' ';
+
+    for c in args.chars() {
+        match c {
+            '"' | '\'' if !in_quotes => {
+                in_quotes = true;
+                quote_char = c;
+            }
+            c if in_quotes && c == quote_char => {
+                in_quotes = false;
+            }
+            ' ' if !in_quotes => {
+                if !current.is_empty() {
+                    result.push(current.clone());
+                    current.clear();
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    result
+}
+
+/// Find the `ffmpeg` binary on PATH. Returns None if not found.
+pub fn which_ffmpeg() -> Option<std::path::PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .flat_map(|dir| {
+            let mut candidates = vec![dir.join("ffmpeg")];
+            if cfg!(windows) {
+                candidates.push(dir.join("ffmpeg.exe"));
+            }
+            candidates
+        })
+        .find(|p| p.is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,5 +859,11 @@ mod tests {
         let flipped = flip_gray_horizontal(&src);
         let restored = flip_gray_horizontal(&flipped);
         assert_eq!(&*restored, &*src);
+    }
+
+    #[test]
+    fn shell_split_basic() {
+        let parts = shell_split("-i \"my file.mp4\" -f null -");
+        assert_eq!(parts, ["-i", "my file.mp4", "-f", "null", "-"]);
     }
 }

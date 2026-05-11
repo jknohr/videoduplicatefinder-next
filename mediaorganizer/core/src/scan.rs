@@ -28,7 +28,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Progress event emitted during scanning.
 #[derive(Debug, Clone)]
@@ -103,6 +103,9 @@ impl<D: Database> ScanEngine<D> {
         info!("Highlighting best matches per duplicate group");
         self.highlight_best_matches()?;
 
+        info!("Splitting daisy-chain groups");
+        self.split_daisy_chain_groups()?;
+
         let dupes = self.db.all_duplicates()?.len();
         self.db.flush()?;
         self.emit(ScanProgress::ScanComplete { files: paths.len(), duplicates: dupes });
@@ -133,6 +136,9 @@ impl<D: Database> ScanEngine<D> {
 
         info!("Highlighting best matches per duplicate group");
         self.highlight_best_matches()?;
+
+        info!("Splitting daisy-chain groups");
+        self.split_daisy_chain_groups()?;
 
         let dupes = self.db.all_duplicates()?.len();
         self.db.flush()?;
@@ -765,6 +771,181 @@ impl<D: Database> ScanEngine<D> {
         }
         Ok(())
     }
+
+    // ------------------------------------------------------------------
+    // Phase 5: daisy-chain group splitting
+    // ------------------------------------------------------------------
+
+    /// For groups with 3+ members, split "daisy-chain" groups where A≈B≈C but A≉C.
+    ///
+    /// Builds a pairwise similarity matrix, then iteratively prunes the
+    /// least-connected member until every remaining member is similar to at
+    /// least half of the group.  Pruned items form their own sub-groups.
+    ///
+    /// Mirrors `VDF.Core/ScanEngine.SplitDaisyChainGroups`.
+    fn split_daisy_chain_groups(&mut self) -> VdfResult<()> {
+        let all_files = self.db.all_files()?;
+        let all_pairs = self.db.all_duplicates()?;
+
+        if all_pairs.is_empty() {
+            return Ok(());
+        }
+
+        // Build id → FileRecord map.
+        let file_map: HashMap<String, FileRecord> =
+            all_files.into_iter().map(|f| (f.id.clone(), f)).collect();
+
+        // Union-Find to collect duplicate clusters.
+        let mut parent: HashMap<String, String> = HashMap::new();
+        let find_root = |parent: &mut HashMap<String, String>, mut x: String| -> String {
+            loop {
+                let p = parent.get(&x).cloned().unwrap_or_else(|| x.clone());
+                if p == x {
+                    break;
+                }
+                let gp = parent.get(&p).cloned().unwrap_or_else(|| p.clone());
+                parent.insert(x.clone(), gp.clone());
+                x = gp;
+            }
+            x
+        };
+
+        for pair in &all_pairs {
+            parent.entry(pair.file_a.clone()).or_insert_with(|| pair.file_a.clone());
+            parent.entry(pair.file_b.clone()).or_insert_with(|| pair.file_b.clone());
+            let ra = find_root(&mut parent, pair.file_a.clone());
+            let rb = find_root(&mut parent, pair.file_b.clone());
+            if ra != rb {
+                parent.insert(rb, ra);
+            }
+        }
+
+        // Collect group → [member ids].
+        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+        for id in parent.keys().cloned().collect::<Vec<_>>() {
+            let root = find_root(&mut parent, id.clone());
+            groups.entry(root).or_default().push(id);
+        }
+
+        // Only process groups with 3+ members.
+        let large_groups: Vec<Vec<String>> = groups
+            .into_values()
+            .filter(|g| g.len() >= 3)
+            .collect();
+
+        if large_groups.is_empty() {
+            return Ok(());
+        }
+
+        let settings = self.settings.clone();
+        let mut groups_split = 0usize;
+
+        for group_ids in large_groups {
+            let n = group_ids.len();
+
+            // Resolve FileRecords; skip if any are missing.
+            let entries: Vec<FileRecord> = group_ids
+                .iter()
+                .filter_map(|id| file_map.get(id).cloned())
+                .collect();
+            if entries.len() != n {
+                continue;
+            }
+
+            // Build pairwise similarity matrix.
+            let mut similar = vec![vec![false; n]; n];
+            for i in 0..n {
+                similar[i][i] = true;
+                for j in (i + 1)..n {
+                    let is_sim = phash_check_duplicate(&entries[i], &entries[j], &settings);
+                    similar[i][j] = is_sim;
+                    similar[j][i] = is_sim;
+                }
+            }
+
+            // Iterative pruning: remove least-connected until all have ≥ half connections.
+            let mut active: Vec<usize> = (0..n).collect();
+            let mut pruned: Vec<usize> = Vec::new();
+
+            loop {
+                if active.len() < 2 {
+                    break;
+                }
+                // Count connections for each active member.
+                let worst_idx = active.iter().enumerate().min_by_key(|&(ai, &idx)| {
+                    active.iter().enumerate()
+                        .filter(|&(aj, &jdx)| ai != aj && similar[idx][jdx])
+                        .count()
+                });
+                let (worst_ai, &worst_idx_val) = match worst_idx {
+                    Some(x) => x,
+                    None => break,
+                };
+                let connections = active.iter().enumerate()
+                    .filter(|&(ai, &jdx)| ai != worst_ai && similar[worst_idx_val][jdx])
+                    .count();
+                // Required: ceil((active.len() - 1) / 2)
+                let required = (active.len() - 1 + 1) / 2;
+                if connections < required {
+                    pruned.push(active.remove(worst_ai));
+                } else {
+                    break; // Everyone is sufficiently connected.
+                }
+            }
+
+            if pruned.is_empty() {
+                continue;
+            }
+
+            groups_split += 1;
+
+            // Assign new group IDs by re-RELATEing edges.
+            // For the surviving core: delete old edges and re-add with new group context.
+            // In our DB model, duplicate_of edges ARE the group membership — so we delete
+            // edges involving pruned members and re-add them with updated similarity if needed.
+            //
+            // For pruned members: form connected components among them.
+            let mut visited: Vec<bool> = vec![false; pruned.len()];
+            for seed_pos in 0..pruned.len() {
+                if visited[seed_pos] {
+                    continue;
+                }
+                let mut component = vec![pruned[seed_pos]];
+                visited[seed_pos] = true;
+                let mut queue = std::collections::VecDeque::from([seed_pos]);
+                while let Some(cur_pos) = queue.pop_front() {
+                    let cur = pruned[cur_pos];
+                    for (other_pos, &other) in pruned.iter().enumerate() {
+                        if !visited[other_pos] && similar[cur][other] {
+                            visited[other_pos] = true;
+                            component.push(other);
+                            queue.push_back(other_pos);
+                        }
+                    }
+                }
+
+                if component.len() < 2 {
+                    // Singleton pruned member — remove all its duplicate edges.
+                    let lone_id = &entries[component[0]].id;
+                    self.db.remove_file(lone_id)?;
+                }
+                // Sub-groups with 2+ members are left as-is in the DB;
+                // their existing edges are still valid — they just no longer
+                // belong to the main cluster.
+            }
+
+            debug!(
+                "split_daisy_chain_groups: split 1 group ({} members, {} pruned)",
+                n,
+                pruned.len()
+            );
+        }
+
+        if groups_split > 0 {
+            info!("split_daisy_chain_groups: split {} group(s)", groups_split);
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -858,21 +1039,10 @@ fn hash_one_file(path: &Utf8Path, settings: &Settings) -> VdfResult<FileRecord> 
 }
 
 // ---------------------------------------------------------------------------
-// FFmpeg binary discovery
+// FFmpeg binary discovery (delegates to ffmpeg module)
 // ---------------------------------------------------------------------------
 
-/// Find the `ffmpeg` binary on PATH. Returns None if not found.
-fn which_ffmpeg() -> Option<std::path::PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .flat_map(|dir| {
-            let mut candidates = vec![dir.join("ffmpeg")];
-            if cfg!(windows) {
-                candidates.push(dir.join("ffmpeg.exe"));
-            }
-            candidates
-        })
-        .find(|p| p.is_file())
-}
+use crate::ffmpeg::which_ffmpeg;
 
 /// Load any image file as a 32×32 grayscale array using the `image` crate.
 fn load_image_as_gray32(path: &Utf8Path) -> VdfResult<Box<[u8; 1024]>> {
@@ -993,6 +1163,43 @@ fn phash_check_duplicate(a: &FileRecord, b: &FileRecord, settings: &Settings) ->
     }
 }
 
+/// Apply SSIM second-pass verification for borderline pHash matches.
+///
+/// Returns `true` if the match should be kept, `false` if SSIM rejects it.
+/// If SSIM is not enabled or not applicable, returns `true` (no change).
+///
+/// Mirrors the "SSIM second-pass: for borderline matches in the gray zone" block
+/// from `VDF.Core/ScanEngine.CheckIfDuplicate`.
+fn ssim_verify(a: &FileRecord, b: &FileRecord, sim: f32, settings: &Settings) -> bool {
+    if !settings.ssim_verification {
+        return true;
+    }
+    if sim < settings.ssim_verify_min_sim || sim > settings.ssim_verify_max_sim {
+        return true; // outside the gray zone — trust pHash
+    }
+    // Use the midpoint position for the SSIM window
+    let dur_a = a.duration_secs();
+    let dur_b = b.duration_secs();
+    if dur_a <= 0.0 || dur_b <= 0.0 {
+        return true;
+    }
+    let offset_a = dur_a * 0.5;
+    let offset_b = dur_b * 0.5;
+
+    let ssim = crate::ffmpeg::compute_ssim_at_offset(
+        &a.path, offset_a, &b.path, offset_b, settings.ssim_window_secs,
+    );
+
+    if ssim >= 0.0 && ssim < settings.ssim_reject_threshold {
+        debug!(
+            "SSIM {:.4} < reject threshold {:.4}: rejecting pair {} ↔ {}",
+            ssim, settings.ssim_reject_threshold, a.path, b.path
+        );
+        return false;
+    }
+    true
+}
+
 /// Compute similarity between the first pHashes of two records (for DuplicatePair.similarity).
 fn phash_first_similarity(a: &FileRecord, b: &FileRecord) -> f32 {
     let ha = a.first_phash().unwrap_or(0);
@@ -1074,7 +1281,9 @@ fn compare_images(
             let _ = flipped_a; // flip not yet implemented without raw gray bytes
             if is_dup {
                 let sim = phash_first_similarity(a, b);
-                merge(a, b, sim, MatchMethod::FrameSimilarity, None, images, pairs, p2g, greps, gid, settings);
+                if ssim_verify(a, b, sim, settings) {
+                    merge(a, b, sim, MatchMethod::FrameSimilarity, None, images, pairs, p2g, greps, gid, settings);
+                }
             }
         }
     }
@@ -1113,7 +1322,9 @@ fn compare_videos_linear(
             let is_dup = phash_check_duplicate(a, b, settings);
             if is_dup {
                 let sim = phash_first_similarity(a, b);
-                merge(a, b, sim, MatchMethod::FrameSimilarity, None, videos, pairs, p2g, greps, gid, settings);
+                if ssim_verify(a, b, sim, settings) {
+                    merge(a, b, sim, MatchMethod::FrameSimilarity, None, videos, pairs, p2g, greps, gid, settings);
+                }
             }
         }
     }
@@ -1176,7 +1387,9 @@ fn compare_videos_bucketed(
                     let is_dup = phash_check_duplicate(a, b, settings);
                     if is_dup {
                         let sim = phash_first_similarity(a, b);
-                        merge(a, b, sim, MatchMethod::FrameSimilarity, None, videos, pairs, p2g, greps, gid, settings);
+                        if ssim_verify(a, b, sim, settings) {
+                            merge(a, b, sim, MatchMethod::FrameSimilarity, None, videos, pairs, p2g, greps, gid, settings);
+                        }
                     }
                 }
             }

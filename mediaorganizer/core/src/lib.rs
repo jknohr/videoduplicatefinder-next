@@ -10,6 +10,8 @@ pub mod mpeg7;
 pub mod phash;
 pub mod ranker;
 pub mod scan;
+pub mod thumbnail;
+pub mod utils;
 
 pub use config::{FolderMatchMode, HardwareAccel, Settings};
 pub use db::{
