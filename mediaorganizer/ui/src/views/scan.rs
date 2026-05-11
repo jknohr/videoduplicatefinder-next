@@ -5,6 +5,7 @@ use dioxus::prelude::*;
 use app_core::scan::ScanProgress;
 
 use crate::app::Route;
+use crate::settings::UiSettings;
 use crate::state::{AppState, ScanState};
 use crate::state::scan_state::LogLevel;
 

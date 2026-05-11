@@ -7,6 +7,8 @@ use dioxus::prelude::*;
 use crate::app::Route;
 use crate::state::AppState;
 use crate::state::app_state::{DuplicateCluster, ResultSort};
+#[cfg(feature = "server")]
+use dirs;
 
 #[cfg(feature = "server")]
 use app_core::db::DuplicatePair;
@@ -128,9 +130,10 @@ fn cluster_card(cluster: &DuplicateCluster, mut app_state: Signal<AppState>) -> 
     let fa = cluster.files.first().map(|f| f.id.clone()).unwrap_or_default();
     let fb = cluster.files.get(1).map(|f| f.id.clone()).unwrap_or_default();
 
-    // File rows: pre-build display tuples
-    let file_rows: Vec<(String, String, f64, u32, u32, u64)> = cluster.files.iter().map(|f| {
+    // File rows: pre-build display tuples (id, name, path, dur, w, h, size)
+    let file_rows: Vec<(String, String, String, f64, u32, u32, u64)> = cluster.files.iter().map(|f| {
         (
+            f.id.clone(),
             f.name.clone(),
             f.path.to_string(),
             f.duration_secs(),
@@ -139,6 +142,9 @@ fn cluster_card(cluster: &DuplicateCluster, mut app_state: Signal<AppState>) -> 
             f.size_bytes,
         )
     }).collect();
+
+    // IDs for cluster-level actions
+    let cluster_file_ids: Vec<String> = cluster.files.iter().map(|f| f.id.clone()).collect();
 
     rsx! {
         div { class: "cluster-card",
@@ -149,19 +155,59 @@ fn cluster_card(cluster: &DuplicateCluster, mut app_state: Signal<AppState>) -> 
             }
 
             div { class: "cluster-files",
-                for (name, path, dur, w, h, size) in file_rows {
+                for (fid, name, path, dur, w, h, size) in file_rows {
                     div { class: "file-row",
-                        div { class: "file-name", "{name}" }
-                        div { class: "file-meta",
-                            if dur > 0.0 {
-                                span { class: "tag", "{format_duration(dur)}" }
+                        div { class: "file-info",
+                            div { class: "file-name", "{name}" }
+                            div { class: "file-meta",
+                                if dur > 0.0 {
+                                    span { class: "tag", "{format_duration(dur)}" }
+                                }
+                                if w > 0 {
+                                    span { class: "tag", "{w}×{h}" }
+                                }
+                                span { class: "tag", "{format_bytes(size)}" }
                             }
-                            if w > 0 {
-                                span { class: "tag", "{w}×{h}" }
-                            }
-                            span { class: "tag", "{format_bytes(size)}" }
+                            div { class: "file-path text-muted", "{path}" }
                         }
-                        div { class: "file-path text-muted", "{path}" }
+                        div { class: "file-actions",
+                            button {
+                                class: "btn btn-xs btn-outline",
+                                title: "Send to trash",
+                                onclick: {
+                                    let id = fid.clone();
+                                    let mut state = app_state;
+                                    move |_| {
+                                        let id2 = id.clone();
+                                        #[cfg(feature = "server")]
+                                        spawn(async move {
+                                            if delete_file_action(id2.clone(), true).await.is_ok() {
+                                                state.write().remove_file(&id2);
+                                            }
+                                        });
+                                    }
+                                },
+                                "🗑"
+                            }
+                            button {
+                                class: "btn btn-xs btn-danger",
+                                title: "Delete permanently",
+                                onclick: {
+                                    let id = fid.clone();
+                                    let mut state = app_state;
+                                    move |_| {
+                                        let id2 = id.clone();
+                                        #[cfg(feature = "server")]
+                                        spawn(async move {
+                                            if delete_file_action(id2.clone(), false).await.is_ok() {
+                                                state.write().remove_file(&id2);
+                                            }
+                                        });
+                                    }
+                                },
+                                "✕"
+                            }
+                        }
                     }
                 }
             }
@@ -184,9 +230,27 @@ fn cluster_card(cluster: &DuplicateCluster, mut app_state: Signal<AppState>) -> 
                         },
                         Link {
                             to: Route::CompareView { file_a: fa.clone(), file_b: fb.clone() },
-                            "Compare side-by-side →"
+                            "Compare →"
                         }
                     }
+                }
+                button {
+                    class: "btn btn-sm btn-secondary",
+                    title: "Mark as not-a-match — hides this group on future scans",
+                    onclick: {
+                        let ids = cluster_file_ids.clone();
+                        let mut state = app_state;
+                        move |_| {
+                            let ids2 = ids.clone();
+                            #[cfg(feature = "server")]
+                            spawn(async move {
+                                if blacklist_group_action(ids2.clone()).await.is_ok() {
+                                    state.write().remove_cluster_containing(&ids2);
+                                }
+                            });
+                        }
+                    },
+                    "Blacklist group"
                 }
             }
         }
@@ -254,4 +318,64 @@ fn format_bytes(bytes: u64) -> String {
     if bytes >= GB { format!("{:.1} GB", bytes as f64 / GB as f64) }
     else if bytes >= MB { format!("{:.0} MB", bytes as f64 / MB as f64) }
     else { format!("{} KB", bytes / 1024) }
+}
+
+// ── File action helpers (server / desktop only) ───────────────────────────────
+
+/// Delete or trash a file from disk and remove it from the database.
+#[cfg(feature = "server")]
+pub(crate) async fn delete_file_action(file_id: String, to_trash: bool) -> Result<(), String> {
+    use app_core::db::{Database, ScanDatabase};
+    use app_core::utils::move_to_trash;
+
+    let db_path = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("vdf")
+        .join("db");
+
+    let mut db = ScanDatabase::open(&db_path)
+        .map_err(|e| e.to_string())?;
+
+    if let Some(rec) = db.get_file(&file_id).map_err(|e| e.to_string())? {
+        let path = std::path::Path::new(rec.path.as_str());
+        if path.exists() {
+            if to_trash {
+                if !move_to_trash(path) {
+                    return Err(format!("Failed to move {} to trash", rec.path));
+                }
+            } else {
+                std::fs::remove_file(path).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    db.remove_file(&file_id).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Add blacklist edges for every pair in the group so future scans ignore them.
+#[cfg(feature = "server")]
+pub(crate) async fn blacklist_group_action(file_ids: Vec<String>) -> Result<(), String> {
+    use app_core::db::{BlacklistEntry, Database, ScanDatabase};
+
+    let db_path = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("vdf")
+        .join("db");
+
+    let mut db = ScanDatabase::open(&db_path)
+        .map_err(|e| e.to_string())?;
+
+    for i in 0..file_ids.len() {
+        for j in (i + 1)..file_ids.len() {
+            let entry = BlacklistEntry::new(
+                file_ids[i].clone(),
+                file_ids[j].clone(),
+                Some("user_marked".to_string()),
+            );
+            db.add_blacklist(entry).map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(())
 }

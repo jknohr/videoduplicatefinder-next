@@ -122,4 +122,30 @@ impl AppState {
             b.max_similarity.partial_cmp(&a.max_similarity).unwrap_or(std::cmp::Ordering::Equal)
         });
     }
+
+    /// Remove a single file from whichever cluster contains it.
+    /// If the cluster drops below 2 files it is removed entirely.
+    pub fn remove_file(&mut self, file_id: &str) {
+        self.clusters.retain_mut(|cluster| {
+            cluster.files.retain(|f| f.id != file_id);
+            cluster.edges.retain(|e| e.file_a != file_id && e.file_b != file_id);
+            if cluster.files.len() >= 2 {
+                cluster.max_similarity = cluster
+                    .edges
+                    .iter()
+                    .map(|e| e.similarity)
+                    .fold(0f32, f32::max);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Remove the cluster that contains the given set of file IDs.
+    pub fn remove_cluster_containing(&mut self, file_ids: &[String]) {
+        self.clusters.retain(|cluster| {
+            !cluster.files.iter().any(|f| file_ids.contains(&f.id))
+        });
+    }
 }
