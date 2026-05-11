@@ -1,0 +1,71 @@
+[workspace]
+members = [
+    "vdf_core",
+    "vdf_cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+authors = ["VDF Contributors"]
+
+[workspace.dependencies]
+# Async runtime & parallelism
+tokio = { version = "1.40", features = ["full"] }
+rayon = "1.10"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+
+# Image processing
+fast_image_resize = { version = "5", features = ["rayon"] }
+
+# Audio fingerprinting
+realfft = "3"
+
+# File system
+ignore = "0.4"
+notify = "7"
+camino = { version = "1", features = ["serde1"] }
+
+# Hashing
+sha2 = "0.10"
+
+# Platform dirs
+dirs = "5"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# FFmpeg
+ffmpeg-the-third = "3"
+ffmpeg-sys-the-third = "3"
+
+# C bindings (POSIX errno constants)
+libc = "0.2"
+
+# Database — SurrealDB embedded with RocksDB storage (required, not optional)
+surrealdb = { version = "3", features = ["kv-rocksdb"] }
+
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 1
+
+[profile.release-slim]
+inherits = "release"
+opt-level = "z"

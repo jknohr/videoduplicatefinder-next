@@ -115,7 +115,7 @@ Frequent inserts and alternate angles are tolerated. Same-scene frames from a di
 The user controls this distinction explicitly through three parameters:
 
 | Parameter | What it controls |
-|-----------|-----------------|
+|-----------|------------------|
 | `IFrameMinConsecutive` | Minimum run length before declaring a match. Low = more sensitive to short shared segments; high = only flag substantial overlaps. |
 | `IFrameMaxGap` | Non-matching frames allowed within a run before the run resets. 0 = identical cut required; 2 = re-edit/alternate shots tolerated; 5+ = shared source material with heavy re-assembly. |
 | `IFrameHashThreshold` | Per-frame similarity required to count as a match. 0.85 = same encode (identical or near-identical content); 0.70 = same scene, different camera or mild color grade. |
@@ -410,7 +410,7 @@ vdf-cli scan-and-compare \
 #### Common options
 
 | Flag | Description | Default |
-|------|-------------|---------|
+|------|-------------|----------|
 | `--include <path>` | Directory to scan (repeatable) | required |
 | `--exclude <path>` | Directory to exclude (repeatable) | — |
 | `--threshold <n>` | Hash difference threshold | 5 |
@@ -632,10 +632,60 @@ docker exec vdf-web nvidia-smi            # NVIDIA
 ### Volume reference
 
 | Volume | Purpose |
-|--------|---------|
+|--------|----------|
 | `/root/.config/VDF` | Settings (`web-settings.json`) and login credentials |
 | `/root/.local/state/VDF` | Scan database (`ScannedFiles.db`) — mount a named volume here so hashed data persists across container updates |
 | Your media paths | Mount each media directory you want to scan. Read-only (`:ro`) is recommended. |
+
+### Folder permissions and SELinux
+
+Before VDF can read or write your media files, the host directories must be accessible by the container.
+
+#### Quick checklist
+
+```bash
+# 1. Check that the directories are readable
+ls -la /path/to/your/videos
+
+# 2. Grant read access to everyone (scan-only / :ro mounts)
+chmod -R a+rX /path/to/your/videos
+
+# 3. Grant write access to the group (needed for delete / move / rename — :rw mounts)
+chmod -R g+rwX /path/to/your/videos
+chown -R $USER:$USER /path/to/your/videos   # or replace $USER:$USER with user:video
+```
+
+#### Fedora / RHEL / CentOS / Rocky Linux — SELinux `:Z` label required
+
+On SELinux-enforcing systems, Docker bind-mounts are **denied by default**, even when the host permissions look correct. You must append a relabel suffix to every volume path:
+
+| Suffix | Meaning |
+|--------|----------|
+| `:Z` | Relabel for this container only (private). Use for single-container setups. |
+| `:z` | Relabel as shared (multiple containers may access the same directory). |
+
+Without `:Z`, SELinux blocks the container from reading the directory and VDF will report "no files found" or permission errors with no other explanation.
+
+```yaml
+# Fedora / RHEL — always add :Z (or :z) to every bind-mount:
+volumes:
+  - /home/user/Videos/movies:/movies:rw,Z
+  - /home/user/Videos/series:/series:ro,Z
+  - vdf-db:/root/.config/VDF          # named volumes do NOT need :Z
+  - vdf-state:/root/.local/state/VDF
+```
+
+Ubuntu, Debian, Arch, and other non-SELinux systems: `:Z` is silently ignored, so it is safe to include it in a shared `docker-compose.yml` that runs on mixed hosts.
+
+#### Verify access from inside the container
+
+```bash
+# Can the container read your media?
+docker exec vdf-web ls /your/mounted/path
+
+# Check SELinux context if on Fedora/RHEL
+ls -Z /path/to/your/videos
+```
 
 ### Notes
 
