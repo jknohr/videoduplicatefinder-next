@@ -15,5 +15,9 @@
   "Log.DatabaseCheckpoint": "Database checkpoint ({0:N0} files saved to disk).",
   "Scan.Stage.Probing": "probing metadata",
   "Scan.Stage.SamplingFrames": "sampling frames",
-  "Scan.Stage.AudioFingerprint": "audio fingerprint"
+  "Scan.Stage.AudioFingerprint": "audio fingerprint",
+  "Scan.Stage.IFrameFingerprint": "i-frame fingerprint",
+  "Scan.Stage.TemporalAvgHash": "temporal avg hash",
+  "Scan.Stage.SceneDetection": "scene detection",
+  "Scan.Stage.Mpeg7Signature": "mpeg-7 signature"
 }

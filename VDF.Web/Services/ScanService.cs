@@ -190,6 +190,26 @@ namespace VDF.Web.Services {
 		}
 
 		/// <summary>Moves files to a destination folder.</summary>
+		public (bool Success, string? Error) RenameItem(DuplicateItem item, string newName) {
+			try {
+				string? dir = Path.GetDirectoryName(item.Path);
+				if (string.IsNullOrEmpty(dir)) return (false, "Cannot determine file directory.");
+				string newPath = Path.Combine(dir, newName);
+				if (File.Exists(newPath)) return (false, $"A file named '{newName}' already exists.");
+				File.Move(item.Path, newPath);
+				string oldPath = item.Path;
+				item.Path = newPath;
+				if (VDF.Core.Utils.DatabaseUtils.Database.TryGetValue(
+						new VDF.Core.FileEntry(oldPath), out var dbEntry))
+					VDF.Core.Utils.DatabaseUtils.UpdateFilePath(newPath, dbEntry);
+				Notify();
+				return (true, null);
+			}
+			catch (Exception ex) {
+				return (false, ex.Message);
+			}
+		}
+
 		public (int Moved, int Failed, List<string> Errors) MoveItems(IEnumerable<DuplicateItem> items, string destinationFolder) {
 			int moved = 0, failed = 0;
 			var errors = new List<string>();

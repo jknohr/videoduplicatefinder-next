@@ -15,6 +15,7 @@
 //
 
 using System.Diagnostics;
+using System.Text.Json;
 using VDF.Core.Utils;
 
 namespace VDF.Core.FFTools {
@@ -90,6 +91,53 @@ namespace VDF.Core.FFTools {
 				Logger.Instance.Info($"{message}{errOut}");
 			}
 			return mediaInfo;
+		}
+
+		static readonly HashSet<string> _excludedTagKeys = new(StringComparer.OrdinalIgnoreCase) {
+			"encoder", "handler_name", "vendor_id"
+		};
+
+		public static Dictionary<string, string> GetMetadataTags(string file) {
+			var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+			if (string.IsNullOrEmpty(FFprobePath) || !File.Exists(file))
+				return result;
+
+			var psi = new ProcessStartInfo {
+				FileName = FFprobePath,
+				CreateNoWindow = true,
+				RedirectStandardOutput = true,
+				RedirectStandardError = false,
+				WindowStyle = ProcessWindowStyle.Hidden,
+				WorkingDirectory = Path.GetDirectoryName(FFprobePath)!
+			};
+			psi.ArgumentList.Add("-v"); psi.ArgumentList.Add("quiet");
+			psi.ArgumentList.Add("-print_format"); psi.ArgumentList.Add("json");
+			psi.ArgumentList.Add("-show_entries"); psi.ArgumentList.Add("format_tags");
+			psi.ArgumentList.Add(FFToolsUtils.LongPathFix(file));
+
+			try {
+				using var process = new Process { StartInfo = psi };
+				process.Start();
+				using var ms = new MemoryStream();
+				process.StandardOutput.BaseStream.CopyTo(ms);
+				if (!process.WaitForExit(TimeoutDuration))
+					process.Kill();
+
+				if (ms.Length == 0) return result;
+				ms.Position = 0;
+
+				using var doc = JsonDocument.Parse(ms);
+				if (doc.RootElement.TryGetProperty("format", out var fmt) &&
+					fmt.TryGetProperty("tags", out var tags)) {
+					foreach (var prop in tags.EnumerateObject()) {
+						string key = prop.Name.ToLowerInvariant();
+						if (_excludedTagKeys.Contains(key)) continue;
+						result[key] = prop.Value.GetString() ?? string.Empty;
+					}
+				}
+			}
+			catch { }
+			return result;
 		}
 	}
 }

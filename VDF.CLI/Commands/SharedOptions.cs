@@ -105,7 +105,100 @@ namespace VDF.CLI.Commands {
 			DefaultValueFactory = _ => 0.85
 		};
 
-		internal static readonly Option<int> CheckpointInterval = new("--checkpoint-interval") {
+		// ── Intro / outro skip ───────────────────────────────────────────────────
+	internal static readonly Option<double> SkipStartSeconds = new("--skip-start-seconds") {
+		Description = "Seconds to skip at the start of each video before sampling. Combined with --skip-start-percent: the larger value wins. Default: 0."
+	};
+	internal static readonly Option<float> SkipStartPercent = new("--skip-start-percent") {
+		Description = "Percentage of video duration to skip at the start (0–50). Default: 0."
+	};
+	internal static readonly Option<double> SkipEndSeconds = new("--skip-end-seconds") {
+		Description = "Seconds to skip at the end of each video. Default: 0."
+	};
+	internal static readonly Option<float> SkipEndPercent = new("--skip-end-percent") {
+		Description = "Percentage of video duration to skip at the end (0–50). Default: 0."
+	};
+
+	// ── I-frame timeline fingerprint ─────────────────────────────────────────
+	internal static readonly Option<bool> IFrameFingerprint = new("--iframe-fingerprint") {
+		Description = "Enable I-frame timeline fingerprinting and sliding-window clip detection."
+	};
+	internal static readonly Option<int> MaxIFrameSamples = new("--max-iframe-samples") {
+		Description = "Hard ceiling on I-frames sampled per video. Default: 300.",
+		DefaultValueFactory = _ => 300
+	};
+	internal static readonly Option<double> IFrameSampleInterval = new("--iframe-sample-interval") {
+		Description = "Seconds between I-frame samples (0 = divide duration into --max-iframe-samples equal slots). " +
+		              "Use a fixed interval so clips and sources share the same temporal density — required for " +
+		              "correct sliding-window detection. Default: 30.",
+		DefaultValueFactory = _ => 30.0
+	};
+	internal static readonly Option<float> IFrameMatchPercent = new("--iframe-match-percent") {
+		Description = "Minimum % of shorter video's frames that must match (0–100). Default: 40.",
+		DefaultValueFactory = _ => 40f
+	};
+	internal static readonly Option<int> IFrameMinConsecutive = new("--iframe-min-consecutive") {
+		Description = "Minimum consecutive matching I-frames. At 30 s/sample, 3 = 90 s of matching content. Default: 3.",
+		DefaultValueFactory = _ => 3
+	};
+	internal static readonly Option<float> IFrameHashThreshold = new("--iframe-hash-threshold") {
+		Description = "Per-frame Hamming similarity threshold (0–1) to count as matching. Default: 0.85.",
+		DefaultValueFactory = _ => 0.85f
+	};
+
+	// ── Temporal average hash ─────────────────────────────────────────────────
+	internal static readonly Option<bool> TemporalAvgHash = new("--temporal-avg-hash") {
+		Description = "Enable temporal average (tblend) hash fingerprint."
+	};
+	internal static readonly Option<double> TemporalAvgStartSec = new("--temporal-avg-start-sec") {
+		Description = "Start of tblend window in seconds. Default: 120.",
+		DefaultValueFactory = _ => 120.0
+	};
+	internal static readonly Option<double> TemporalAvgWindowSec = new("--temporal-avg-window-sec") {
+		Description = "Duration of tblend averaging window in seconds. Default: 60.",
+		DefaultValueFactory = _ => 60.0
+	};
+
+	// ── Scene-aware skip ──────────────────────────────────────────────────────
+	internal static readonly Option<bool> SceneAwareSkip = new("--scene-aware-skip") {
+		Description = "Auto-detect first scene transition and use it as skip-start offset."
+	};
+	internal static readonly Option<float> SceneDetectionThreshold = new("--scene-detection-threshold") {
+		Description = "scdet sensitivity (0–100). Higher = less sensitive. Default: 14.",
+		DefaultValueFactory = _ => 14f
+	};
+	internal static readonly Option<int> SceneSkipCount = new("--scene-skip-count") {
+		Description = "Number of scene transitions to skip at the start. Default: 1.",
+		DefaultValueFactory = _ => 1
+	};
+
+	// ── MPEG-7 signature ──────────────────────────────────────────────────────
+	internal static readonly Option<bool> Mpeg7Signature = new("--mpeg7-signature") {
+		Description = "Enable MPEG-7 Video Signature extraction and comparison."
+	};
+
+	// ── SSIM second-pass verification ─────────────────────────────────────────
+	internal static readonly Option<bool> SsimVerification = new("--ssim-verification") {
+		Description = "Enable SSIM second-pass verification for borderline matches."
+	};
+	internal static readonly Option<float> SsimVerifyMinSim = new("--ssim-verify-min-sim") {
+		Description = "Lower bound of similarity gray zone for SSIM. Default: 0.80.",
+		DefaultValueFactory = _ => 0.80f
+	};
+	internal static readonly Option<float> SsimVerifyMaxSim = new("--ssim-verify-max-sim") {
+		Description = "Upper bound of similarity gray zone for SSIM. Default: 0.95.",
+		DefaultValueFactory = _ => 0.95f
+	};
+	internal static readonly Option<float> SsimRejectThreshold = new("--ssim-reject-threshold") {
+		Description = "SSIM score below which a borderline match is rejected. Default: 0.90.",
+		DefaultValueFactory = _ => 0.90f
+	};
+	internal static readonly Option<double> SsimWindowSeconds = new("--ssim-window-seconds") {
+		Description = "Duration (seconds) of video segment compared by SSIM. Default: 10.",
+		DefaultValueFactory = _ => 10.0
+	};
+
+	internal static readonly Option<int> CheckpointInterval = new("--checkpoint-interval") {
 			Description = "Database checkpoint interval in minutes during scanning. 0 = disabled. Default: 5.",
 			DefaultValueFactory = _ => 5
 		};
@@ -147,6 +240,46 @@ namespace VDF.CLI.Commands {
 			var ffArgs = r.GetValue(CustomFfArgs);
 			if (ffArgs != null) s.CustomFFArguments = ffArgs;
 
+			s.SkipStartSeconds = r.GetValue(SkipStartSeconds);
+			s.SkipStartPercent = r.GetValue(SkipStartPercent);
+			s.SkipEndSeconds   = r.GetValue(SkipEndSeconds);
+			s.SkipEndPercent   = r.GetValue(SkipEndPercent);
+
+			// I-frame timeline fingerprint
+			if (r.GetValue(IFrameFingerprint)) {
+				s.EnableIFrameFingerprint  = true;
+				s.MaxIFrameSamples         = r.GetValue(MaxIFrameSamples);
+				s.IFrameSampleIntervalSec  = r.GetValue(IFrameSampleInterval);
+				s.IFrameMatchPercent       = r.GetValue(IFrameMatchPercent) / 100f;
+				s.IFrameMinConsecutive     = r.GetValue(IFrameMinConsecutive);
+				s.IFrameHashThreshold      = r.GetValue(IFrameHashThreshold);
+			}
+
+			// Temporal average hash
+			if (r.GetValue(TemporalAvgHash)) {
+				s.EnableTemporalAverageHash    = true;
+				s.TemporalAverageHashStartSec  = r.GetValue(TemporalAvgStartSec);
+				s.TemporalAverageHashWindowSec = r.GetValue(TemporalAvgWindowSec);
+			}
+
+			// Scene-aware skip
+			if (r.GetValue(SceneAwareSkip)) {
+				s.SceneAwareSkip          = true;
+				s.SceneDetectionThreshold = r.GetValue(SceneDetectionThreshold);
+				s.SceneSkipCount          = r.GetValue(SceneSkipCount);
+			}
+
+			s.EnableMpeg7Signature = r.GetValue(Mpeg7Signature);
+
+			// SSIM verification
+			if (r.GetValue(SsimVerification)) {
+				s.EnableSsimVerification  = true;
+				s.SsimVerificationMinSim  = r.GetValue(SsimVerifyMinSim);
+				s.SsimVerificationMaxSim  = r.GetValue(SsimVerifyMaxSim);
+				s.SsimRejectThreshold     = r.GetValue(SsimRejectThreshold);
+				s.SsimWindowSeconds       = r.GetValue(SsimWindowSeconds);
+			}
+
 			s.DatabaseCheckpointIntervalMinutes = r.GetValue(CheckpointInterval);
 			s.IncludeNonExistingFiles = r.GetValue(IncludeNonExistingFiles);
 			s.EnablePartialClipDetection = r.GetValue(EnablePartialClipDetection);
@@ -171,7 +304,29 @@ namespace VDF.CLI.Commands {
 			cmd.Options.Add(CustomFfArgs);
 			cmd.Options.Add(CheckpointInterval);
 			cmd.Options.Add(IncludeNonExistingFiles);
-			cmd.Options.Add(EnablePartialClipDetection);
+			cmd.Options.Add(SkipStartSeconds);
+		cmd.Options.Add(SkipStartPercent);
+		cmd.Options.Add(SkipEndSeconds);
+		cmd.Options.Add(SkipEndPercent);
+		cmd.Options.Add(IFrameFingerprint);
+		cmd.Options.Add(MaxIFrameSamples);
+		cmd.Options.Add(IFrameSampleInterval);
+		cmd.Options.Add(IFrameMatchPercent);
+		cmd.Options.Add(IFrameMinConsecutive);
+		cmd.Options.Add(IFrameHashThreshold);
+		cmd.Options.Add(TemporalAvgHash);
+		cmd.Options.Add(TemporalAvgStartSec);
+		cmd.Options.Add(TemporalAvgWindowSec);
+		cmd.Options.Add(SceneAwareSkip);
+		cmd.Options.Add(SceneDetectionThreshold);
+		cmd.Options.Add(SceneSkipCount);
+		cmd.Options.Add(Mpeg7Signature);
+		cmd.Options.Add(SsimVerification);
+		cmd.Options.Add(SsimVerifyMinSim);
+		cmd.Options.Add(SsimVerifyMaxSim);
+		cmd.Options.Add(SsimRejectThreshold);
+		cmd.Options.Add(SsimWindowSeconds);
+		cmd.Options.Add(EnablePartialClipDetection);
 			cmd.Options.Add(PartialClipMinRatio);
 			cmd.Options.Add(PartialClipSimilarityThreshold);
 			cmd.Options.Add(PartialClipRequireVisualMatch);

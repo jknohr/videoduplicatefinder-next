@@ -30,9 +30,11 @@ namespace VDF.Core.Utils {
 				? CoreUtils.CurrentFolder
 				: CoreUtils.GetDefaultStateFolder(), "log.txt"));
 		public void Info(string text) {
-			LogItemAdded?.Invoke($"{DateTime.Now:HH:mm:ss} => {text}");
+			string msg = $"{DateTime.Now:HH:mm:ss} => {text}";
+			Console.WriteLine(msg);  // visible in docker logs
+			LogItemAdded?.Invoke(msg);
 			lock (lockObject) {
-				File.AppendAllText(_logFilePath.Value, $"{DateTime.Now:HH:mm:ss} => {text}{Environment.NewLine}");
+				File.AppendAllText(_logFilePath.Value, msg + Environment.NewLine);
 			}
 		}
 		public void InsertSeparator(char separatorChar) {

@@ -74,6 +74,40 @@ namespace VDF.Core {
 		[ProtoMember(10)]
 		public uint[]? AudioFingerprint;
 
+		/// <summary>
+		/// Timestamps (seconds from start) of the I-frames sampled for the timeline fingerprint.
+		/// Parallel array with <see cref="IFramePHashes"/>.
+		/// <c>null</c> = not yet extracted; empty array = extraction ran but found no keyframes.
+		/// </summary>
+		[ProtoMember(11)]
+		public double[]? IFrameTimestamps;
+
+		/// <summary>
+		/// Perceptual hash (pHash) for each I-frame listed in <see cref="IFrameTimestamps"/>.
+		/// </summary>
+		[ProtoMember(12)]
+		public ulong[]? IFramePHashes;
+
+		/// <summary>
+		/// Scene-change timestamps (seconds) detected by the FFmpeg scdet filter.
+		/// <c>null</c> = not yet extracted; empty array = no scene changes detected.
+		/// </summary>
+		[ProtoMember(13)]
+		public float[]? SceneChangeTimestamps;
+
+		/// <summary>
+		/// Path to the on-disk MPEG-7 binary signature file, or <c>null</c> if not yet generated.
+		/// </summary>
+		[ProtoMember(14)]
+		public string? Mpeg7SignaturePath;
+
+		/// <summary>
+		/// 32×32 = 1024-byte temporal average (tblend) grayscale image used as an additional
+		/// duplicate signal. <c>null</c> = not yet extracted.
+		/// </summary>
+		[ProtoMember(15)]
+		public byte[]? TemporalAverageGrayBytes;
+
 		[ProtoIgnore]
 		internal bool invalid = true;
 
@@ -116,6 +150,23 @@ namespace VDF.Core {
 			if (maxSamplingDurationSeconds.HasValue && maxSamplingDurationSeconds.Value > 0d && durationSeconds > maxSamplingDurationSeconds.Value)
 				durationSeconds = maxSamplingDurationSeconds.Value;
 			return durationSeconds * position;
+		}
+		/// <summary>
+		/// Maps a fractional position (0–1) to a timestamp within the skip-adjusted sampling window
+		/// <c>[skipStart .. effectiveDuration-skipEnd]</c>.  When both skip values are zero this is
+		/// identical to the standard two-argument overload.
+		/// </summary>
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		public double GetGrayBytesIndex(float position, double? maxSamplingDurationSeconds,
+			double skipStartSec, float skipStartPct,
+			double skipEndSec,   float skipEndPct) {
+			double dur = mediaInfo!.Duration.TotalSeconds;
+			double effective = (maxSamplingDurationSeconds.HasValue && maxSamplingDurationSeconds.Value > 0d && dur > maxSamplingDurationSeconds.Value)
+				? maxSamplingDurationSeconds.Value : dur;
+			double startOff = Math.Max(skipStartSec, effective * skipStartPct / 100.0);
+			double endOff   = Math.Max(skipEndSec,   effective * skipEndPct   / 100.0);
+			double window   = Math.Max(0.0, effective - startOff - endOff);
+			return startOff + window * position;
 		}
 		public override bool Equals(object? obj) =>
 			obj is FileEntry entry &&

@@ -1,18 +1,87 @@
+# VDF (Video Duplicate Finder) — docker-compose with hardware acceleration support
+#
+# ─── Quick-start ────────────────────────────────────────────────────────────────
+#   1. Add your media paths under volumes (see examples below).
+#   2. Choose a GPU mode (see "Hardware Acceleration" section below).
+#   3. Run: docker compose up -d
+#   4. Open http://localhost:8099
+#
+# ─── Hardware Acceleration ──────────────────────────────────────────────────────
+#   VA-API (Intel / AMD on Linux):
+#     • Uncomment the "devices" and "group_add" sections below.
+#     • Set LIBVA_DRIVER_NAME to match your GPU:
+#         Intel Gen 8+:  iHD
+#         Intel Gen ≤7:  i965
+#         AMD (Mesa):    radeonsi
+#     • Verify inside the container: docker exec <id> vainfo
+#     • In the VDF Settings UI, select "vaapi" as the hardware acceleration mode.
+#
+#   NVIDIA (requires nvidia-container-toolkit on the host):
+#     • Install: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#     • Uncomment the "deploy" block below.
+#     • In the VDF Settings UI, select "cuda" as the hardware acceleration mode.
+#     • Verify: docker exec <id> nvidia-smi
+#
+#   No GPU / software only:
+#     • Leave all hardware sections commented out.
+#     • In VDF Settings, keep hardware acceleration set to "none" (default).
+#
+#   Check what FFmpeg sees:
+#     docker exec <id> ffmpeg -hwaccels
+
 services:
   vdf-web:
     image: ghcr.io/0x90d/vdf-web:latest
     ports:
-      - "8080:8080"
-    # environment:
-    #   - VDF_WEB_PASSWORD=changeme   # set a password (otherwise auto-generated — check docker logs)
-    #   - VDF_WEB_AUTH=false          # set to disable authentication entirely
+      - "8099:8080"
+    environment:
+      - VDF_WEB_AUTH=false
+      # Uncomment and set a password when re-enabling authentication:
+      # - VDF_WEB_PASSWORD=changeme
+
+      # ── VA-API (Intel / AMD) ──────────────────────────────────────────────────
+      # Uncomment the two lines below when using vaapi hardware acceleration.
+      # - LIBVA_DRIVER_NAME=iHD           # iHD = Intel Gen 8+; i965 = older Intel; radeonsi = AMD
+      # - LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
+
+    # ── Device access for VA-API (Intel / AMD) ────────────────────────────────
+    # Exposes /dev/dri to the container so FFmpeg can use GPU-accelerated decode.
+    # devices:
+    #   - /dev/dri:/dev/dri
+
+    # ── Group membership for /dev/dri ─────────────────────────────────────────
+    # Needed on some hosts where /dev/dri is owned by the "video" group.
+    # group_add:
+    #   - video
+
+    # ── NVIDIA GPU ────────────────────────────────────────────────────────────
+    # Requires nvidia-container-toolkit installed on the host.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu, video, compute]
+
     volumes:
-      # Add your media directories below (host_path:container_path:ro)
-      # Example:
+      # ── Media directories ─────────────────────────────────────────────────────
+      # Mount your video folders here.  Use :rw for write access (needed if VDF
+      # will delete or move files), :ro for read-only scanning.
+      # Paths with spaces or special characters must be quoted.
+      #
+      # Examples:
       #   - /mnt/nas/movies:/mnt/nas/movies:ro
-      #   - "/mnt/path with spaces:/mnt/media:ro"
-      - vdf-db:/root/.config/VDF         # web-settings.json, web-credentials.json
-      - vdf-state:/root/.local/state/VDF # ScannedFiles.db
+      #   - "/path/with spaces:/media/movies:rw,Z"
+      #
+      # Your current paths:
+      - /home/subtomic/Videos/xxxcompressed:/xxxcompressed:rw,Z
+      - "/home/subtomic/Videos/\U0001F61C:/\U0001F61C:rw,Z"
+      - "/home/subtomic/Videos/\U0001F600:/\U0001F600:rw,Z"
+
+      # ── Persistent VDF state ──────────────────────────────────────────────────
+      - vdf-db:/root/.config/VDF          # web-settings.json, credentials
+      - vdf-state:/root/.local/state/VDF  # ScannedFiles.db, log.txt, mpeg7sigs/
 
 volumes:
   vdf-db:

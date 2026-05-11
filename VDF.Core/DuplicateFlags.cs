@@ -18,8 +18,10 @@ namespace VDF.Core {
 	[Flags]
 	public enum DuplicateFlags : short
 	{
-		None = 0,
-		Flipped = 1,
-		PartialClip = 2,  // This item is an audio-matched partial clip of another item in the same group
+		None        = 0,
+		Flipped     = 1,
+		PartialClip = 2,   // audio-matched partial clip of another item in the same group
+		TimelineMatch = 4, // matched via I-frame timeline sliding window
+		Mpeg7Match  = 8,   // matched via MPEG-7 Video Signature
 	};
 }

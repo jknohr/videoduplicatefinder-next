@@ -34,6 +34,8 @@ namespace VDF.Core.Utils {
 
 		static string CurrentDatabasePath => FileUtils.SafePathCombine(DatabaseFolder, "ScannedFiles.db");
 		static string TempDatabasePath => FileUtils.SafePathCombine(DatabaseFolder, "ScannedFiles_new.db");
+		/// <summary>Returns the folder where MPEG-7 signature files are stored.</summary>
+		internal static string GetSignatureFolder() => FileUtils.SafePathCombine(DatabaseFolder, "mpeg7sigs");
 
 		internal static bool LoadDatabase() {
 			FileInfo databaseFile = new(TempDatabasePath);

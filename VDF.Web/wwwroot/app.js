@@ -121,3 +121,8 @@ window.vdf = {
 
 // Apply theme immediately to prevent flash of wrong theme
 vdf.initTheme();
+
+// Log page auto-scroll helper
+function scrollToBottom(el) {
+    if (el) el.scrollTop = el.scrollHeight;
+}
