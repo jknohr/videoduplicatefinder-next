@@ -183,7 +183,8 @@ namespace VDF.Core.FFTools {
 			FileEntry videoFile,
 			double skipStartSec,
 			double skipEndSec,
-			int maxFrames = 100) {
+			int    maxFrames = 100,
+			double sampleIntervalSec = 0) {
 			const int N = 32;
 			try {
 				double dur = videoFile.mediaInfo?.Duration.TotalSeconds ?? 0;
@@ -195,16 +196,18 @@ namespace VDF.Core.FFTools {
 				double endSec = Math.Max(skipStartSec, dur - skipEndSec);
 				if (endSec <= skipStartSec) endSec = dur;
 
-				List<double> rawPts = IFrameExtractor.GetKeyframePts(
-					videoFile.Path, skipStartSec, endSec, maxFrames * 4);
+				// Seek-based sampling: evenly distributed across the FULL window.
+				// intervalSec > 0 → fixed time between samples (same density regardless of
+				// video length), capped at maxFrames.
+				// intervalSec == 0 → evenly divide the window into exactly maxFrames slots.
+				List<double> selectedPts = IFrameExtractor.GetKeyframePtsByInterval(
+					videoFile.Path, skipStartSec, endSec, maxFrames, sampleIntervalSec);
 
-				if (rawPts.Count == 0) {
+				if (selectedPts.Count == 0) {
 					videoFile.IFrameTimestamps = Array.Empty<double>();
 					videoFile.IFramePHashes    = Array.Empty<ulong>();
 					return true;
 				}
-
-				List<double> selectedPts = IFrameExtractor.EvenlySubsample(rawPts, maxFrames);
 
 				var timestamps = new List<double>(selectedPts.Count);
 				var hashes     = new List<ulong>(selectedPts.Count);

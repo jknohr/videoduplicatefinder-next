@@ -124,16 +124,22 @@ namespace VDF.CLI.Commands {
 		Description = "Enable I-frame timeline fingerprinting and sliding-window clip detection."
 	};
 	internal static readonly Option<int> MaxIFrameSamples = new("--max-iframe-samples") {
-		Description = "Maximum I-frames to sample per video. Default: 100.",
-		DefaultValueFactory = _ => 100
+		Description = "Hard ceiling on I-frames sampled per video. Default: 300.",
+		DefaultValueFactory = _ => 300
+	};
+	internal static readonly Option<double> IFrameSampleInterval = new("--iframe-sample-interval") {
+		Description = "Seconds between I-frame samples (0 = divide duration into --max-iframe-samples equal slots). " +
+		              "Use a fixed interval so clips and sources share the same temporal density — required for " +
+		              "correct sliding-window detection. Default: 30.",
+		DefaultValueFactory = _ => 30.0
 	};
 	internal static readonly Option<float> IFrameMatchPercent = new("--iframe-match-percent") {
 		Description = "Minimum % of shorter video's frames that must match (0–100). Default: 40.",
 		DefaultValueFactory = _ => 40f
 	};
 	internal static readonly Option<int> IFrameMinConsecutive = new("--iframe-min-consecutive") {
-		Description = "Minimum consecutive matching I-frames required. Default: 5.",
-		DefaultValueFactory = _ => 5
+		Description = "Minimum consecutive matching I-frames. At 30 s/sample, 3 = 90 s of matching content. Default: 3.",
+		DefaultValueFactory = _ => 3
 	};
 	internal static readonly Option<float> IFrameHashThreshold = new("--iframe-hash-threshold") {
 		Description = "Per-frame Hamming similarity threshold (0–1) to count as matching. Default: 0.85.",
@@ -241,11 +247,12 @@ namespace VDF.CLI.Commands {
 
 			// I-frame timeline fingerprint
 			if (r.GetValue(IFrameFingerprint)) {
-				s.EnableIFrameFingerprint = true;
-				s.MaxIFrameSamples        = r.GetValue(MaxIFrameSamples);
-				s.IFrameMatchPercent      = r.GetValue(IFrameMatchPercent) / 100f;
-				s.IFrameMinConsecutive    = r.GetValue(IFrameMinConsecutive);
-				s.IFrameHashThreshold     = r.GetValue(IFrameHashThreshold);
+				s.EnableIFrameFingerprint  = true;
+				s.MaxIFrameSamples         = r.GetValue(MaxIFrameSamples);
+				s.IFrameSampleIntervalSec  = r.GetValue(IFrameSampleInterval);
+				s.IFrameMatchPercent       = r.GetValue(IFrameMatchPercent) / 100f;
+				s.IFrameMinConsecutive     = r.GetValue(IFrameMinConsecutive);
+				s.IFrameHashThreshold      = r.GetValue(IFrameHashThreshold);
 			}
 
 			// Temporal average hash
@@ -303,6 +310,7 @@ namespace VDF.CLI.Commands {
 		cmd.Options.Add(SkipEndPercent);
 		cmd.Options.Add(IFrameFingerprint);
 		cmd.Options.Add(MaxIFrameSamples);
+		cmd.Options.Add(IFrameSampleInterval);
 		cmd.Options.Add(IFrameMatchPercent);
 		cmd.Options.Add(IFrameMinConsecutive);
 		cmd.Options.Add(IFrameHashThreshold);

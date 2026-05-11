@@ -593,7 +593,7 @@ namespace VDF.Core {
 							double skipEnd   = ComputeEffectiveSkipEnd(entry);
 							ReportStage(entry.Path, T("Scan.Stage.IFrameFingerprint"));
 							FfmpegEngine.ExtractIFrameTimeline(entry, skipStart, skipEnd,
-								Settings.MaxIFrameSamples);
+								Settings.MaxIFrameSamples, Settings.IFrameSampleIntervalSec);
 						}
 
 						// Temporal average hash (tblend)

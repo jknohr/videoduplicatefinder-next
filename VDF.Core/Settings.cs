@@ -119,15 +119,33 @@ namespace VDF.Core {
 		// ── I-Frame timeline fingerprint ────────────────────────────────────
 		/// <summary>Enable I-frame-based timeline fingerprinting and sliding-window comparison.</summary>
 		public bool EnableIFrameFingerprint;
-		/// <summary>Maximum number of I-frames to sample per video (after applying skip). Default 100.</summary>
-		public int MaxIFrameSamples = 100;
+		/// <summary>
+		/// Hard ceiling on the number of I-frames sampled per video. Default 300.
+		/// When <see cref="IFrameSampleIntervalSec"/> &gt; 0 the actual count is
+		/// <c>Min(MaxIFrameSamples, ceil(duration / IFrameSampleIntervalSec))</c>.
+		/// </summary>
+		public int MaxIFrameSamples = 300;
+		/// <summary>
+		/// Seconds between I-frame samples. Default 30.
+		/// This is the key parameter for correct clip-in-movie detection: both the clip
+		/// and the source are sampled at the same temporal density, so array indices
+		/// correspond to the same time intervals and the sliding-window comparison works.
+		/// A 9-minute clip at 30 s/sample → 18 samples.
+		/// A 4-hour source at 30 s/sample → 480 samples, capped at MaxIFrameSamples.
+		/// Set to 0 to divide the window into exactly MaxIFrameSamples equal slots.
+		/// </summary>
+		public double IFrameSampleIntervalSec = 30.0;
 		/// <summary>
 		/// Minimum fraction of the shorter video's I-frames that must match for a timeline duplicate.
-		/// Intentionally low (0.40) because a 20%-length clip can match at most 20% of the source.
+		/// With interval-based sampling a 9-minute clip in a 4-hour source can match 100% of
+		/// the clip's 18 frames, so even 0.30 (30%) is conservative. Default 0.40.
 		/// </summary>
 		public float IFrameMatchPercent = 0.40f;
-		/// <summary>Minimum number of consecutive matching I-frames required for a timeline match.</summary>
-		public int IFrameMinConsecutive = 5;
+		/// <summary>
+		/// Minimum consecutive matching I-frames required. With 30-second intervals each
+		/// consecutive frame represents 30 seconds of matching content. Default 3 (= 90 s).
+		/// </summary>
+		public int IFrameMinConsecutive = 3;
 		/// <summary>
 		/// Minimum per-frame Hamming similarity (0–1) to count an I-frame as matching.
 		/// Default 0.85 (~10 differing bits out of 64).

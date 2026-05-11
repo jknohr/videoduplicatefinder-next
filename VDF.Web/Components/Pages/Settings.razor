@@ -197,8 +197,19 @@
     </label>
     @if (Scan.Settings.EnableIFrameFingerprint) {
         <label>
-            Max I-frame samples per video
-            <input type="number" min="10" max="500" step="10"
+            Sample interval (seconds between samples)
+            <input type="number" min="5" max="300" step="5"
+                   value="@Scan.Settings.IFrameSampleIntervalSec.ToString(CultureInfo.InvariantCulture)"
+                   @onchange="e => Scan.Settings.IFrameSampleIntervalSec = ParseDouble(e.Value)" />
+        </label>
+        <small style="color:var(--text-muted)">
+            Both clips and sources are sampled at this density regardless of duration.
+            A 9-min clip at 30 s → 18 samples. A 4-hour source at 30 s → 480 samples (capped).
+            This is what makes sliding-window detection work across different video lengths.
+        </small>
+        <label>
+            Max samples per video (hard ceiling)
+            <input type="number" min="10" max="2000" step="50"
                    value="@Scan.Settings.MaxIFrameSamples.ToString(CultureInfo.InvariantCulture)"
                    @onchange="e => Scan.Settings.MaxIFrameSamples = (int)ParseDouble(e.Value)" />
         </label>
@@ -209,7 +220,7 @@
                    @onchange="e => Scan.Settings.IFrameMatchPercent = (float)(ParseDouble(e.Value) / 100.0)" />
         </label>
         <label>
-            Min consecutive matching frames
+            Min consecutive matching frames (× interval = min matching duration)
             <input type="number" min="1" max="50" step="1"
                    value="@Scan.Settings.IFrameMinConsecutive.ToString(CultureInfo.InvariantCulture)"
                    @onchange="e => Scan.Settings.IFrameMinConsecutive = (int)ParseDouble(e.Value)" />
