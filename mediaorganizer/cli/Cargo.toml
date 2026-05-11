@@ -9,7 +9,10 @@ name = "mediaorganizer"
 path = "src/main.rs"
 
 [dependencies]
-core = { path = "../core" }
+# Import our "core" library as "mediaorganizer" to avoid shadowing Rust's
+# built-in `core` crate, which clap's proc-macro needs to compile.
+# The directory stays "core/" and the package is still named "core".
+mediaorganizer = { path = "../core", package = "core" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

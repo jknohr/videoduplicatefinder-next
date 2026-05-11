@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
-use core::{
+use mediaorganizer::{
     ScanDatabase, ScanEngine, Settings,
     db::{Database, MatchMethod},
     scan::ScanProgress,
@@ -212,8 +212,8 @@ fn cmd_stats(args: StatsArgs) -> Result<()> {
 }
 
 fn print_text_results(
-    pairs: &[core::db::DuplicatePair],
-    file_by_id: &std::collections::HashMap<&str, &core::db::FileRecord>,
+    pairs: &[mediaorganizer::db::DuplicatePair],
+    file_by_id: &std::collections::HashMap<&str, &mediaorganizer::db::FileRecord>,
 ) {
     if pairs.is_empty() {
         println!("No duplicates found.");

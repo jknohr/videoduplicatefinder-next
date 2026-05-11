@@ -146,7 +146,7 @@ impl Default for Settings {
             skip_end_secs: 0.0,
             skip_end_percent: 0.0,
             max_sampling_duration_secs: 0.0,
-            thumbnail_count: 1,
+            thumbnail_count: 5,
             use_phashing: true,
             compare_horizontally_flipped: false,
             ignore_black_pixels: false,
