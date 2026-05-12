@@ -884,9 +884,26 @@ fn cluster_card(cluster: &DuplicateCluster, mut app_state: Signal<AppState>) -> 
     // Precompute all owned values before entering rsx! (closures must be 'static)
     let max_similarity = cluster.max_similarity;
     let file_count = cluster.files.len();
-    let clip_offset = edge.clip_offset_secs;
     let fa = cluster.files.first().map(|f| f.id.clone()).unwrap_or_default();
     let fb = cluster.files.get(1).map(|f| f.id.clone()).unwrap_or_default();
+
+    // Collect unique methods across all edges for badge display
+    let mut seen_methods = std::collections::HashSet::new();
+    let all_method_badges: Vec<String> = cluster.edges.iter()
+        .map(|e| method_label(e))
+        .filter(|m| seen_methods.insert(m.clone()))
+        .collect();
+
+    // Any edge is_flipped → show flipped badge
+    let any_flipped = cluster.edges.iter().any(|e| {
+        #[cfg(feature = "server")] { e.is_flipped }
+        #[cfg(not(feature = "server"))] { false }
+    });
+
+    // Build match explanation lines from all edges
+    let explanations: Vec<String> = cluster.edges.iter()
+        .map(|e| build_explanation(e))
+        .collect();
 
     // File rows: pre-build display tuples (id, name, path, dur, w, h, size, is_image)
     let file_rows: Vec<(String, String, String, f64, u32, u32, u64, bool)> = cluster.files.iter().map(|f| {
@@ -912,7 +929,13 @@ fn cluster_card(cluster: &DuplicateCluster, mut app_state: Signal<AppState>) -> 
         div { class: "cluster-card",
             div { class: "cluster-header",
                 SimilarityBadge { value: max_similarity }
-                MethodBadge { method: method_str.clone() }
+                // One badge per distinct detection method found across all edges
+                for method in all_method_badges {
+                    MethodBadge { method }
+                }
+                if any_flipped {
+                    span { class: "badge badge-red", "Flipped" }
+                }
                 span { class: "file-count", "{file_count} files" }
             }
 
@@ -1023,10 +1046,15 @@ fn cluster_card(cluster: &DuplicateCluster, mut app_state: Signal<AppState>) -> 
                 }
             }
 
-            if let Some(offset) = clip_offset {
-                div { class: "evidence-row",
-                    span { class: "evidence-label", "Clip offset:" }
-                    span { "{offset:.1}s into the longer file" }
+            // Match explanation lines — one per edge, showing method + evidence details
+            if !explanations.is_empty() {
+                div { class: "evidence-rows",
+                    for explanation in explanations {
+                        div { class: "evidence-row",
+                            span { class: "evidence-label", "↳" }
+                            span { class: "evidence-text", "{explanation}" }
+                        }
+                    }
                 }
             }
 
@@ -1114,6 +1142,48 @@ fn method_label(pair: &DuplicatePair) -> String {
     { format!("{:?}", pair.method) }
     #[cfg(not(feature = "server"))]
     { pair.method_str.clone() }
+}
+
+/// Build a human-readable explanation line for a single duplicate edge.
+///
+/// Mirrors the evidence text shown in VDF.GUI's DuplicateItemVM tooltip and
+/// VDF.Web's match row detail column.
+fn build_explanation(edge: &DuplicatePair) -> String {
+    let method = method_label(edge);
+    let sim_pct = (edge.similarity * 100.0).round() as u32;
+
+    let method_display = match method.as_str() {
+        "FrameSimilarity"     => "Frame similarity",
+        "IframeTimeline"      => "I-frame timeline",
+        "AudioFingerprint"    => "Audio fingerprint",
+        "Mpeg7Signature"      => "MPEG-7 signature",
+        "SsimVerified"        => "SSIM verified",
+        "TemporalAverageHash" => "Temporal avg hash",
+        other                 => other,
+    };
+
+    let mut parts: Vec<String> = vec![method_display.to_string()];
+    parts.push(format!("{sim_pct}% match"));
+
+    #[cfg(feature = "server")]
+    {
+        if let Some(offset) = edge.clip_offset_secs {
+            parts.push(format!("clip at {}", format_duration(offset)));
+        }
+        if let Some(audio_offset) = edge.audio_offset_secs {
+            parts.push(format!("audio offset {audio_offset:.1}s"));
+        }
+        if let Some(frames) = edge.consecutive_frames {
+            if frames > 0 {
+                parts.push(format!("{frames} consecutive frames"));
+            }
+        }
+        if edge.is_flipped {
+            parts.push("horizontally mirrored".to_string());
+        }
+    }
+
+    parts.join(" · ")
 }
 
 fn format_duration(secs: f64) -> String {

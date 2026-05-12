@@ -48,6 +48,9 @@ sha2 = "0.10"
 # Platform dirs
 dirs = "5"
 
+# Date/time (for XDG trash info timestamps)
+chrono = { version = "0.4", features = ["clock"] }
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 

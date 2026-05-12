@@ -433,6 +433,31 @@ pub async fn thumbnail_handler(
     }
 }
 
+/// Returns a brief FFmpeg status string for the UI banner.
+///
+/// "ready" means both ffmpeg and ffprobe are on PATH.
+/// Any other string describes what's missing.
+#[cfg(feature = "web")]
+#[server(endpoint = "/api/ffmpeg_status")]
+pub async fn get_ffmpeg_status() -> Result<String, ServerFnError> {
+    #[cfg(feature = "server")]
+    {
+        use crate::server::ffmpeg_setup::{ffmpeg_status, FfmpegStatus, install_instructions};
+        let status = ffmpeg_status().map(|s| match s {
+            FfmpegStatus::Ready => "ready".to_string(),
+            FfmpegStatus::MissingFfprobe { ffmpeg_path } =>
+                format!("missing_ffprobe|ffmpeg at {}|{}", ffmpeg_path.display(), install_instructions()),
+            FfmpegStatus::MissingFfmpeg { ffprobe_path } =>
+                format!("missing_ffmpeg|ffprobe at {}|{}", ffprobe_path.display(), install_instructions()),
+            FfmpegStatus::Missing =>
+                format!("missing||{}", install_instructions()),
+        }).unwrap_or_else(|| "unknown".to_string());
+        Ok(status)
+    }
+    #[cfg(not(feature = "server"))]
+    { Ok("ready".to_string()) }
+}
+
 /// Return a MIME content-type string for the given file path.
 #[cfg(feature = "web")]
 fn mime_for_ext(path: &std::path::Path) -> &'static str {

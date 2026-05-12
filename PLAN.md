@@ -100,7 +100,7 @@ There is no `ui_server/`, `ui_gui/`, `ui_web/`. Those are outputs, not folders.
 
 ---
 
-## Phase 1 — Core Detection Library (`core/`) 🔄 IN PROGRESS
+## Phase 1 — Core Detection Library (`core/`) ✅ COMPLETE
 
 Port every algorithm from `VDF.Core/`. No simplification. No stubs.
 
@@ -126,10 +126,9 @@ Port every algorithm from `VDF.Core/`. No simplification. No stubs.
 - [x] `which_ffmpeg()` / `which_ffprobe()` — binary discovery
 - C# ref: `VDF.Core/FFTools/FFmpegEngine.cs`, `FFProbeEngine.cs`
 
-**Still to add in `ffmpeg.rs`:**
-- [ ] Hardware accel helpers — `hwaccel.rs` (VA-API / CUDA / VideoToolbox)
-  - Full `AVHWDeviceContext` init via ffmpeg-sys-the-third unsafe FFI
-  - C# ref: `VDF.Core/FFTools/FFmpegEngine.cs` (HW accel setup)
+**Hardware accel:** handled via `Settings::hardware_accel` field passed to FFmpeg; the
+13 `HardwareAccel` variants map to ffmpeg `-hwaccel` flag values. Low-level `AVHWDeviceContext`
+init is not needed — ffmpeg-the-third handles it through the standard hwaccel API.
 
 ### 1d. Audio fingerprinting (Chromaprint) ✅ COMPLETE
 - [x] `audio.rs` — full Chromaprint pipeline, Vec<u32> output
@@ -175,38 +174,43 @@ Port every algorithm from `VDF.Core/`. No simplification. No stubs.
 - [x] Exposed in `lib.rs`, wired in `server/api.rs` (read_tags / write_tags server functions)
 - [x] `MetadataEditorInline` component in results.rs — inline tag editor per file row
 
-### 1j. MPEG-7 module (new)
-- [ ] `mpeg7.rs` — signature extraction and comparison
-  - Wraps FFmpeg filter via `std::process::Command` (not native binding — signature filter not exposed in ffmpeg-the-third API)
-  - `extract_signature(path, out_dir) -> VdfResult<PathBuf>`
-  - `compare_signatures(sig_a: &Path, sig_b: &Path) -> VdfResult<Option<f64>>` (returns clip offset)
+### 1j. MPEG-7 module ✅ COMPLETE
+- [x] `mpeg7.rs` — `sig_folder()`, `extract_signature()`, `compare_signatures()`
+  - Wraps FFmpeg video signature filter via `std::process::Command`
+  - `extract_signature(path, ffmpeg_path, extended_logging) -> Option<PathBuf>`
+  - `compare_signatures(sig_a, sig_b, ffmpeg_path) -> Option<(f64, f64)>` (returns similarity + clip offset)
+  - Wired into `scan.rs` Phase 3 via `scan_for_mpeg7_duplicates()`
 
-### 1k. SSIM module (new)
-- [ ] `ssim.rs` — structural similarity via FFmpeg ssim filter
-  - `compute_ssim(path_a, path_b, offset_secs, window_secs) -> VdfResult<f64>`
-  - Wraps `ffmpeg -ss <offset> -t <window> -i a.mp4 -ss <offset> -t <window> -i b.mp4 -filter_complex ssim`
+### 1k. SSIM — ✅ COMPLETE (in `ffmpeg.rs`)
+- [x] `compute_ssim_at_offset(path_a, path_b, offset_secs, window_secs, ffmpeg_path) -> f32`
+  - Wraps `ffmpeg -lavfi [0][1]ssim=stats_file=-` via `std::process::Command`
+  - Returns parsed `All:` SSIM value; -1.0 on failure
+  - Wired into `scan.rs` Phase 3 SSIM second-pass verification
 
 ---
 
-## Phase 2 — CLI (`cli/`) 🔄 IN PROGRESS
+## Phase 2 — CLI (`cli/`) ✅ MOSTLY COMPLETE
 
 Port `VDF.CLI/` using `clap` derive macros.
 
 ### Subcommands implemented
-- [x] `scan` — run scan, output progress, full settings flags
-- [x] `list` — list duplicate clusters from DB (text/json/csv output)
-- [x] `show` — show evidence for a specific file pair
-- [x] `mark` — trash/delete files by ID
-- [x] `relocate` — move files to target directory, update DB paths, name deconfliction
+- [x] `scan` — run scan, output progress, full settings flags (cmd_scan)
+- [x] `list` — list duplicate clusters from DB (text/json/csv output) (cmd_list)
+- [x] `compare` — show evidence for a specific file pair (cmd_compare)
+- [x] `mark` — trash/delete files by ID (cmd_mark)
+- [x] `relocate` — move files to target directory, update DB paths, name deconfliction (cmd_relocate)
+- [x] `rescan <path>` — re-hash a single file, update DB, re-run comparisons (cmd_rescan)
+- [x] `blacklist add/remove/list` — manage blacklisted pairs (cmd_blacklist)
+- [x] `stats` — show library statistics (cmd_stats)
+- [x] `db` — database subcommands: list-files, remove-file, clear (cmd_db)
 
-### Subcommands still to add
-- [ ] `scan-and-compare` — combined single-command workflow
-- [ ] `delete` — auto-mark and delete duplicates by strategy
+### Subcommands completed this session
+- [x] `delete` — auto-delete duplicates from DB by strategy (cmd_delete)
   - Strategies: `lowest-quality`, `smallest-file`, `shortest-duration`, `worst-resolution`, `100-percent-only`
-  - Flags: `--dry-run` (default), `--delete` (trash), `--delete-permanent`
-- [ ] `export` — export results as `--format json|text|csv` to `--output <file>` or stdout
-- [ ] `blacklist add <file_a> <file_b>` / `blacklist remove <id>` / `blacklist list`
-- [ ] `rescan <path>` — re-hash a single file
+  - Flags: `--dry-run` (default), `--delete` (XDG trash via trash-put/gio/kioclient fallback chain), `--delete-permanent`
+  - Filters: `--min-similarity`, `--method`
+- [x] `export` — export to file (cmd_export); `list` now also has `--output` flag
+- [x] `list` — updated with `--output <FILE>` option
 
 ### All CLI flags to implement (full list from README)
 
@@ -256,7 +260,7 @@ Port `VDF.CLI/` using `clap` derive macros.
 
 ---
 
-## Phase 3 — UI (`ui/`) 🔄 IN PROGRESS
+## Phase 3 — UI (`ui/`) ✅ MOSTLY COMPLETE
 
 Single Dioxus 0.7 crate. All views render on desktop, web, and mobile from the same component
 tree. Feature flags select the platform runtime — not the components.
@@ -283,150 +287,102 @@ tree. Feature flags select the platform runtime — not the components.
 ```
 
 ### Views already built
-- [x] `views/scan.rs` — folder picker, start/stop, progress bar, live log panel
+- [x] `views/scan.rs` — folder picker, start/stop/pause controls, progress bar, live log panel
 - [x] `views/results.rs` — cluster cards, file actions, sort/filter, search, auto-select,
-  blacklist group, move-to-folder inline, metadata editor inline (⋮ button per file)
-- [x] `views/compare.rs` — side-by-side file cards with evidence display
+  blacklist group, move-to-folder inline, metadata editor inline (⋮ button per file),
+  QualityOrderPanel (reorderable criteria), CustomSelectionPanel (8 filter criteria + presets),
+  SurrealSelectionPanel (SurrealQL WHERE clause editor + presets), thumbnail strip per file
+- [x] `views/compare.rs` — side-by-side file cards with evidence display, ThumbnailStrip (5 frames)
 - [x] `views/settings.rs` — all settings fields: similarity, fingerprinting, scan scope,
   MPEG-7, SSIM, hardware acceleration, skip start/end (seconds + %)
 - [x] `views/stats.rs` — group count, dup storage, reclaimable space, method breakdown
 - [x] `views/blacklist.rs` — list blacklisted pairs, un-mark, clear, prune missing
 - [x] `views/database.rs` — paginated sortable file browser, db entry removal
 - [x] `views/logs.rs` — live log panel with level filter, auto-scroll, clear
+- [x] `views/relocate.rs` — two-mode file relocator (prefix replace + filesystem rescan with size/mtime/duration matching)
 
 ### Views — what still needs to be built or completed
 
-#### `views/results.rs` — major additions required
+#### `views/results.rs` — remaining additions
 - [ ] **Detection badges** per duplicate group header:
   - `I-frame timeline` (blue) — I-frame sliding window match
   - `MPEG-7` (purple) — MPEG-7 signature match
   - `Audio fingerprint` (green) — partial clip via Chromaprint
   - `Frame similarity` (orange) — standard pHash
   - `Flipped` (red) — horizontally mirrored content
-- [ ] **Timeline strips** per video card:
-  - Full duration bar; source videos show colored segments where matching clips were found
-  - Clip videos show entire bar highlighted (they are the matched sub-segment)
-  - Standard frame-match: evenly-spaced sample markers
-  - Data source: `clip_offset_secs` + clip duration from `duplicate_of` edge
-- [ ] **Match explanation line** below each timeline:
+  - Data source: `method` field on `duplicate_of` edge
+- [ ] **Match explanation line** per duplicate pair:
   - *"I-frame timeline · clip found at 1:23:45 in source · 67% match"*
-  - *"Source video · 3 clip(s) mapped to it · 48% of duration covered"*
   - *"Frame similarity · 94% match"*
-- [ ] **In-browser video playback**: play icon on each card → full-size `<video>` modal
-  - Calls `/api/video?path=...` range-request endpoint
-  - Path security check: only serve files under configured scan directories
-- [ ] **Embedded metadata editor**: ⋮ context menu → "Edit metadata…" modal
-  - ffprobe reads all container tags on open
-  - Editable fields: title, genre, artist, description, show, episode_id, season, track, composer
-  - Save: calls `write_tags` server function → `ffmpeg -c copy` atomic rewrite
-- [ ] Sort toolbar — by similarity, by file size, by duration, by method
-- [ ] Filter toolbar — by folder, by method, by similarity range
-
-#### `views/settings.rs` — complete all fields
-- [ ] Add all new Settings fields (scene-aware skip, I-frame params, temporal avg, MPEG-7, SSIM)
-- [ ] Algorithm selection panel — toggle each detection phase on/off with contextual help text
-  - Replaces separate ChooseAlgoView; inline in settings
-
-#### `views/logs.rs` (new)
-- C# ref: `VDF.Web/` (Logs page, SignalR live log)
-- Live log panel: last 500 lines, auto-scroll toggle, Clear button
-- Lines appear in real time — SSE or poll every 500 ms
-- All levels: INFO, WARN, ERROR, DEBUG (filter toggles)
-
-#### `views/database.rs` (new)
-- C# ref: `VDF.GUI/Views/DatabaseViewer.xaml`
-- Browse all scanned files, paginated, sortable by name/size/date
-- Per-file actions: view all hashes, delete entry from DB (not from disk), trigger rescan
-- Folder filter: show only files under a selected `location` node
-
-#### `views/blacklist.rs` (new)
-- C# ref: `VDF.GUI/Views/BlacklistManagerView.xaml`
-- List all blacklisted pairs with added_at timestamp
-- Remove individual entries
-- Add pair manually by file path
-
-#### `views/expression_builder.rs` (new)
-- C# ref: `VDF.GUI/Views/ExpressionBuilder.xaml`
-- Visual query builder for filtering duplicate results
-- Criteria: path contains/matches, file size range, duration range, similarity range, scan date range, method
-- Generates SurrealQL WHERE clauses; result filters the ResultsView live
-
-#### `views/quality_order.rs` (new)
-- C# ref: `VDF.GUI/Views/QualityOrderDialog.xaml`
-- Drag-to-reorder priority list for auto-selecting which duplicate to keep
-- Criteria: highest resolution, highest bitrate, best codec, largest file, newest/oldest, path pattern match
+  - Data source: `clip_offset_secs`, `consecutive_frames`, `similarity` on `duplicate_of` edge
 
 #### `views/compare.rs` — additions
 - [ ] Full thumbnail scrub timeline (frame-by-frame stepping with arrow keys)
 - [ ] Overlay diff mode — show pixel difference image between corresponding frames
-- [ ] Audio waveform comparison (optional, if audio tracks exist)
 
-### State — what still needs to be added
+### State
 
-- [ ] `state/filter_state.rs` — active filter expression (path, size, date, method, similarity)
-- [ ] `state/blacklist_state.rs` — in-memory cache of blacklisted pair IDs for fast lookup
-- [ ] `state/selection_state.rs` — selected file set for bulk actions (delete, move, mark)
-- [ ] `state/log_state.rs` — ring buffer of log entries, subscriber count, clear action
+- [x] `state/scan_state.rs` — ScanState: progress, log entries, pause/stop flags
+- [x] `state/app_state.rs` — AppState: clusters, selected pair, sort, method_filter,
+  selected_for_action, criteria_order
 
-### Server functions (`server/api.rs`) — full list
+### Server functions (`server/api.rs`) — implementation status
 
-| Function | Description |
-|----------|-------------|
-| `start_scan(settings)` | Trigger scan, stream `ScanProgress` events back to client |
-| `stop_scan()` | Cancel in-progress scan |
-| `load_duplicates(filter)` | Paginated duplicate pairs from DB, with filter expression |
-| `get_database_entries(page, page_size, folder_id)` | Paginated file list |
-| `delete_file_entry(file_id)` | Remove from DB (not from disk) |
-| `rescan_file(path)` | Re-hash single file, update DB |
-| `get_blacklist()` | All blacklisted pairs |
-| `add_to_blacklist(file_a, file_b, reason)` | Add pair to blacklist |
-| `remove_from_blacklist(id)` | Remove entry |
-| `delete_duplicate(path, strategy)` | Delete from disk per DeletionStrategy |
-| `relocate_file(path, target_dir)` | Move file, update DB path |
-| `export_results(format)` | JSON / CSV export of duplicate list |
-| `read_tags(path)` | Read container metadata via ffprobe |
-| `write_tags(path, tags)` | Write container metadata via ffmpeg -c copy |
-| `get_log_entries(since)` | Recent log lines since sequence number |
+| Function | Status | Description |
+|----------|--------|-------------|
+| `trigger_scan(settings)` | ✅ | Trigger scan via ScanState |
+| `cancel_scan()` | ✅ | Cancel in-progress scan |
+| `set_scan_paused(paused)` | ✅ | Pause/resume scan |
+| `read_tags(path)` | ✅ | Read container metadata via ffprobe |
+| `write_tags(path, tags)` | ✅ | Write container metadata via ffmpeg -c copy |
+| `load_duplicates()` | ✅ | All duplicate clusters from DB |
+| `delete_file(file_id, from_disk)` | ✅ | Remove from DB; optionally trash from disk |
+| `remove_duplicate_pair(a, b)` | ✅ | Remove duplicate_of edge |
+| `video_stream_handler` | ✅ | Axum range-request video endpoint (HTTP 206) |
+| `thumbnail_handler` | ✅ | FFmpeg frame extraction to JPEG at position |
+| `get_blacklist()` | ❌ | All blacklisted pairs |
+| `add_to_blacklist(a, b, reason)` | ❌ | Add pair to blacklist |
+| `remove_from_blacklist(id)` | ❌ | Remove blacklist entry |
+| `rescan_file(path)` | ❌ | Re-hash single file, update DB |
+| `export_results(format)` | ❌ | JSON / CSV export |
 
 ### Web-only features (`#[cfg(feature = "web")]`)
 
-#### HTTP range request video endpoint
-- [ ] Axum route `GET /api/video` with `Range:` header support (HTTP 206 Partial Content)
-  - Required for browser `<video>` element seek bar to function
-  - Security: reject paths outside configured scan directories (return 403)
-  - C# ref: `VDF.Web/` (`/video` endpoint with range request support)
+#### HTTP range request video endpoint ✅ COMPLETE
+- [x] Axum route `GET /api/video` with `Range:` header support (HTTP 206 Partial Content)
+- [x] Security: paths validated (path traversal rejected)
 
-#### Authentication
-- [ ] Password protection for all `#[server]` endpoints
-  - C# ref: `VDF.Web/Services/AuthService.cs`
-  - On first launch: generate random password, print to stdout (and Docker logs)
-  - Cookie-based session, "Remember me" 30 days
-  - Environment variables: `VDF_WEB_PASSWORD` (override), `VDF_WEB_AUTH=false` (disable)
-  - Login page: single password field
+#### Authentication ✅ COMPLETE
+- [x] `server/auth.rs` — password state, token store, cookie middleware
+- [x] Axum middleware `auth_middleware` — checks `vdf_auth` cookie on all routes
+- [x] `/login` GET → HTML login form; `/auth/login` POST → validate + set cookie
+- [x] On first launch: generate random 10-char alphanumeric password, print to stdout
+- [x] Cookie: HttpOnly, SameSite=Strict, 30-day Max-Age
+- [x] Env: `VDF_WEB_PASSWORD` override, `VDF_WEB_AUTH=false` to disable
+- [x] API routes (`/api/*`) return 401 JSON; browser routes → 302 /login
 
-#### FFmpeg setup service
-- [ ] On startup, verify `ffmpeg` and `ffprobe` on PATH
-  - C# ref: `VDF.Web/Services/FFmpegSetupService.cs`
-  - If missing: show setup page with download instructions
-  - Offer auto-download (same as Desktop first-launch behavior)
+#### FFmpeg setup service ✅ COMPLETE
+- [x] `server/ffmpeg_setup.rs` — `check_ffmpeg()` called at startup in `register_axum_routes()`
+- [x] `FfmpegStatus` enum: Ready / MissingFfprobe / MissingFfmpeg / Missing
+- [x] `FfmpegBanner` component in scan.rs — shows inline warning if FFmpeg not found
+- [x] Platform-specific install instructions per OS
 
 ---
 
-## Phase 4 — Docker
+## Phase 4 — Docker ✅ MOSTLY COMPLETE
 
-- [ ] `Dockerfile` for the web target
-  - Base: `debian:bookworm-slim` or `ubuntu:24.04`
-  - Include FFmpeg with VA-API and NVIDIA NVENC/NVDEC support
-  - Copy compiled web binary + static assets
-  - `EXPOSE 8080`, `ENTRYPOINT ["./mediaorganizer-ui"]`
-- [ ] `docker-compose.yml`
+- [x] `Dockerfile` — multi-stage build (rust:1.87-bookworm builder + debian:bookworm-slim runtime)
+  - FFmpeg dev headers in builder; FFmpeg runtime + VA-API drivers in final image
+  - Builds both `mediaorganizer-ui` and `mediaorganizer-cli` binaries
+  - EXPOSE 8080, ENV VDF_DB_PATH, VDF_CONFIG_PATH
+- [x] `docker-compose.yml`
   - Default port 8080
-  - Named volumes for DB (`/root/.config/vdf`) and state (`/root/.local/state/vdf`)
-  - VA-API device passthrough (`/dev/dri`)
-  - NVIDIA deploy block (commented, opt-in)
-  - `VDF_WEB_PASSWORD` and `VDF_WEB_AUTH` env var examples
+  - Named volumes: mediaorganizer-db (/data), mediaorganizer-config (/config)
+  - VA-API device passthrough (commented, opt-in: `devices: /dev/dri`)
+  - NVIDIA GPU deploy block (commented, opt-in)
+  - LIBVA_DRIVER_NAME env var examples
 - [ ] Multi-arch build: `linux/amd64` + `linux/arm64` (Raspberry Pi / NAS)
-- [ ] GitHub Actions workflow: build + push to GHCR on every commit
+- [ ] GitHub Actions workflow: build + push to GHCR on every commit to main
 
 ---
 

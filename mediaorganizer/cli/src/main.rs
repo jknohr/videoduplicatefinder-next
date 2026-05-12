@@ -4,6 +4,8 @@
 //!   scan          — discover + hash + compare (full pipeline)
 //!   compare       — run comparison only on previously hashed files
 //!   list          — list duplicate results from the DB
+//!   export        — export results to file (json/text/csv)
+//!   delete        — auto-delete duplicates from DB by strategy
 //!   stats         — show DB statistics
 //!   db clean      — remove entries for missing/errored files
 //!   db clear      — delete all DB entries
@@ -73,6 +75,12 @@ enum Commands {
 
     /// Re-hash a single file and re-run comparisons against all DB files
     Rescan(RescanArgs),
+
+    /// Export all duplicate results to a file (alias for list --output)
+    Export(ExportArgs),
+
+    /// Auto-delete duplicate files from the database by strategy
+    Delete(DeleteArgs),
 }
 
 // ─── OutputFormat ─────────────────────────────────────────────────────────────
@@ -234,6 +242,68 @@ struct ListArgs {
     /// Output format
     #[arg(long, default_value = "text")]
     format: OutputFormat,
+
+    /// Write output to file (default: stdout)
+    #[arg(long, value_name = "FILE")]
+    output: Option<PathBuf>,
+
+    /// Database path
+    #[arg(long)]
+    db: Option<PathBuf>,
+}
+
+// ─── Export ───────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+struct ExportArgs {
+    /// Output file path
+    #[arg(value_name = "FILE")]
+    output: PathBuf,
+
+    /// Output format
+    #[arg(long, default_value = "json")]
+    format: OutputFormat,
+
+    /// Minimum similarity filter (0.0–1.0)
+    #[arg(long, default_value = "0.0")]
+    min_similarity: f32,
+
+    /// Filter by detection method
+    #[arg(long, value_name = "METHOD")]
+    method: Option<String>,
+
+    /// Database path
+    #[arg(long)]
+    db: Option<PathBuf>,
+}
+
+// ─── Delete ───────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+struct DeleteArgs {
+    /// Selection strategy — which file in each duplicate pair to delete
+    #[arg(long, default_value = "lowest-quality")]
+    strategy: DeletionStrategy,
+
+    /// Minimum similarity of pairs to act on (0.0–1.0)
+    #[arg(long, default_value = "0.0")]
+    min_similarity: f32,
+
+    /// Only act on pairs matching this method
+    #[arg(long, value_name = "METHOD")]
+    method: Option<String>,
+
+    /// Print what would be deleted without doing anything (default: true)
+    #[arg(long, default_value = "true")]
+    dry_run: bool,
+
+    /// Move files to trash (requires trash-cli on Linux)
+    #[arg(long)]
+    delete: bool,
+
+    /// Permanently delete files from disk (irreversible!)
+    #[arg(long)]
+    delete_permanent: bool,
 
     /// Database path
     #[arg(long)]
@@ -425,6 +495,8 @@ fn main() -> Result<()> {
         Commands::Scan(args)     => cmd_scan(args),
         Commands::Compare(args)  => cmd_compare(args),
         Commands::List(args)     => cmd_list(args),
+        Commands::Export(args)   => cmd_export(args),
+        Commands::Delete(args)   => cmd_delete(args),
         Commands::Stats(args)    => cmd_stats(args),
         Commands::Db(sub)        => cmd_db(sub),
         Commands::Mark(args)     => cmd_mark(args),
@@ -539,7 +611,237 @@ fn cmd_list(args: ListArgs) -> Result<()> {
         pairs.retain(|p| format!("{:?}", p.method).to_lowercase().contains(&m));
     }
 
-    emit_output(&pairs, &by_id, &args.format, None)
+    emit_output(&pairs, &by_id, &args.format, args.output.as_deref())
+}
+
+// ─── export ───────────────────────────────────────────────────────────────────
+
+fn cmd_export(args: ExportArgs) -> Result<()> {
+    let db_path = args.db.unwrap_or_else(default_db);
+    let db = ScanDatabase::open(&db_path)
+        .with_context(|| format!("opening database at {}", db_path.display()))?;
+
+    let mut pairs = db.all_duplicates()?;
+    let files = db.all_files()?;
+    let by_id: HashMap<&str, &FileRecord> =
+        files.iter().map(|f| (f.id.as_str(), f)).collect();
+
+    if args.min_similarity > 0.0 {
+        pairs.retain(|p| p.similarity >= args.min_similarity);
+    }
+    if let Some(ref method) = args.method {
+        let m = method.to_lowercase();
+        pairs.retain(|p| format!("{:?}", p.method).to_lowercase().contains(&m));
+    }
+
+    emit_output(&pairs, &by_id, &args.format, Some(&args.output))
+}
+
+// ─── delete ───────────────────────────────────────────────────────────────────
+
+fn cmd_delete(args: DeleteArgs) -> Result<()> {
+    let dry_run = args.dry_run && !args.delete && !args.delete_permanent;
+
+    let db_path = args.db.clone().unwrap_or_else(default_db);
+    let db = ScanDatabase::open(&db_path)
+        .with_context(|| format!("opening database at {}", db_path.display()))?;
+
+    let mut pairs = db.all_duplicates()?;
+    let files = db.all_files()?;
+    let by_id: HashMap<&str, &FileRecord> =
+        files.iter().map(|f| (f.id.as_str(), f)).collect();
+
+    if args.min_similarity > 0.0 {
+        pairs.retain(|p| p.similarity >= args.min_similarity);
+    }
+    if let Some(ref method) = args.method {
+        let m = method.to_lowercase();
+        pairs.retain(|p| format!("{:?}", p.method).to_lowercase().contains(&m));
+    }
+    if matches!(args.strategy, DeletionStrategy::HundredPercentOnly) {
+        pairs.retain(|p| p.similarity >= 1.0);
+    }
+
+    // Build clusters via union-find
+    let mut parent: HashMap<String, String> = HashMap::new();
+    for p in &pairs {
+        parent.entry(p.file_a.clone()).or_insert_with(|| p.file_a.clone());
+        parent.entry(p.file_b.clone()).or_insert_with(|| p.file_b.clone());
+    }
+    let find_root = |parent: &mut HashMap<String, String>, mut x: String| -> String {
+        while parent.get(&x).map(|p| p != &x).unwrap_or(false) {
+            let p = parent[&x].clone();
+            parent.insert(x.clone(), p.clone());
+            x = p;
+        }
+        x
+    };
+    for p in &pairs {
+        let ra = find_root(&mut parent, p.file_a.clone());
+        let rb = find_root(&mut parent, p.file_b.clone());
+        if ra != rb { parent.insert(rb, ra); }
+    }
+
+    let all_ids: Vec<String> = parent.keys().cloned().collect();
+    let mut clusters: HashMap<String, Vec<String>> = HashMap::new();
+    for id in all_ids {
+        let root = find_root(&mut parent, id.clone());
+        clusters.entry(root).or_default().push(id);
+    }
+
+    let mut to_delete: Vec<String> = Vec::new();
+    for (_root, members) in &clusters {
+        if members.len() < 2 { continue; }
+        let records: Vec<&&FileRecord> = members.iter()
+            .filter_map(|id| by_id.get(id.as_str()))
+            .collect();
+        if records.is_empty() { continue; }
+
+        let keeper = match args.strategy {
+            DeletionStrategy::LowestQuality | DeletionStrategy::HundredPercentOnly => {
+                // Keep highest quality = largest resolution × bitrate proxy
+                records.iter().max_by_key(|r| {
+                    let px = r.width().unwrap_or(0) as u64 * r.height().unwrap_or(0) as u64;
+                    let br = r.video_bitrate_kbps().unwrap_or(0) as u64;
+                    px * 1000 + br
+                }).map(|r| r.id.as_str())
+            }
+            DeletionStrategy::SmallestFile => {
+                // Keep largest file
+                records.iter().max_by_key(|r| r.size_bytes).map(|r| r.id.as_str())
+            }
+            DeletionStrategy::ShortestDuration => {
+                // Keep longest duration
+                records.iter().max_by(|a, b| {
+                    a.duration_secs().partial_cmp(&b.duration_secs()).unwrap_or(std::cmp::Ordering::Equal)
+                }).map(|r| r.id.as_str())
+            }
+            DeletionStrategy::WorstResolution => {
+                // Keep highest resolution
+                records.iter().max_by_key(|r| {
+                    r.width().unwrap_or(0) as u64 * r.height().unwrap_or(0) as u64
+                }).map(|r| r.id.as_str())
+            }
+        };
+
+        for id in members {
+            if Some(id.as_str()) != keeper {
+                to_delete.push(id.clone());
+            }
+        }
+    }
+
+    if to_delete.is_empty() {
+        eprintln!("No files selected for deletion.");
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("DRY RUN — would delete {} file(s):", to_delete.len());
+        for id in &to_delete {
+            if let Some(r) = by_id.get(id.as_str()) {
+                println!("  {}", r.path);
+            }
+        }
+        return Ok(());
+    }
+
+    let mut deleted = 0usize;
+    let mut errors = 0usize;
+    for id in &to_delete {
+        let path = match by_id.get(id.as_str()) {
+            Some(r) => r.path.as_std_path().to_path_buf(),
+            None => { eprintln!("no path for id {id}"); errors += 1; continue; }
+        };
+
+        if args.delete_permanent {
+            match std::fs::remove_file(&path) {
+                Ok(()) => { println!("deleted: {}", path.display()); deleted += 1; }
+                Err(e) => { eprintln!("error deleting {}: {e}", path.display()); errors += 1; }
+            }
+        } else {
+            // Trash: move to ~/.local/share/Trash/files/ on Linux,
+            // use system trash via `trash-put` if available, else move manually.
+            let trashed = try_trash(&path);
+            if trashed {
+                println!("trashed: {}", path.display());
+                deleted += 1;
+            } else {
+                eprintln!("trash failed for {}: no trash-put found; use --delete-permanent", path.display());
+                errors += 1;
+            }
+        }
+    }
+
+    eprintln!("{deleted} file(s) deleted, {errors} error(s).");
+    if errors > 0 { anyhow::bail!("{errors} deletion error(s)"); }
+    Ok(())
+}
+
+fn try_trash(path: &std::path::Path) -> bool {
+    // Try trash-put (trash-cli) first
+    if let Ok(status) = std::process::Command::new("trash-put")
+        .arg(path)
+        .status()
+    {
+        if status.success() { return true; }
+    }
+    // Try gio trash (GNOME)
+    if let Ok(status) = std::process::Command::new("gio")
+        .args(["trash", &path.to_string_lossy()])
+        .status()
+    {
+        if status.success() { return true; }
+    }
+    // Try kioclient trash (KDE)
+    if let Ok(status) = std::process::Command::new("kioclient")
+        .args(["move", &path.to_string_lossy(), "trash:/"])
+        .status()
+    {
+        if status.success() { return true; }
+    }
+    // Manual XDG trash fallback
+    xdg_trash(path)
+}
+
+fn xdg_trash(path: &std::path::Path) -> bool {
+    let trash_dir = dirs::data_local_dir()
+        .map(|d| d.join("Trash"))
+        .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share/Trash"));
+    let files_dir = trash_dir.join("files");
+    let info_dir  = trash_dir.join("info");
+    let _ = std::fs::create_dir_all(&files_dir);
+    let _ = std::fs::create_dir_all(&info_dir);
+
+    let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n.to_string(),
+        None => return false,
+    };
+    let abs = match path.canonicalize() {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => path.to_string_lossy().into_owned(),
+    };
+
+    // Deconflict
+    let mut dest = files_dir.join(&name);
+    let mut n = 1u32;
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(&name);
+    let ext  = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    while dest.exists() {
+        let candidate = if ext.is_empty() { format!("{stem}.{n}") } else { format!("{stem}.{n}.{ext}") };
+        dest = files_dir.join(&candidate);
+        n += 1;
+    }
+    let trash_name = dest.file_name().and_then(|n| n.to_str()).unwrap_or(&name).to_string();
+
+    // Write .trashinfo
+    let now = chrono::Local::now().naive_local().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let info_content = format!("[Trash Info]\nPath={abs}\nDeletionDate={now}\n");
+    let info_path = info_dir.join(format!("{trash_name}.trashinfo"));
+    if std::fs::write(&info_path, &info_content).is_err() { return false; }
+
+    // Move the file
+    std::fs::rename(path, &dest).is_ok()
 }
 
 // ─── stats ────────────────────────────────────────────────────────────────────

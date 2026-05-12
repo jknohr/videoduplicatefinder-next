@@ -21,6 +21,9 @@ pub fn ScanView() -> Element {
         div { class: "view scan-view",
             h1 { "Scan" }
 
+            // ── FFmpeg status banner ───────────────────────────────────────
+            FfmpegBanner {}
+
             // ── Folder list ───────────────────────────────────────────────
             section { class: "folders",
                 h2 { "Include Folders" }
@@ -146,6 +149,59 @@ pub fn ScanView() -> Element {
                     button { class: "btn btn-secondary",
                         "View {app_state.read().clusters.len()} duplicate groups →"
                     }
+                }
+            }
+        }
+    }
+}
+
+// ── FFmpeg status banner ──────────────────────────────────────────────────────
+
+/// Shows a warning banner if FFmpeg is not available on PATH.
+///
+/// Checks once on mount via `get_ffmpeg_status()` server function and caches
+/// the result in a local signal. "ready" → no banner; anything else → warning.
+#[component]
+fn FfmpegBanner() -> Element {
+    let mut status = use_signal(|| "checking".to_string());
+
+    use_effect(move || {
+        spawn(async move {
+            #[cfg(all(feature = "server", feature = "web"))]
+            {
+                use crate::server::ffmpeg_setup::{ffmpeg_status, FfmpegStatus, install_instructions};
+                let s = match ffmpeg_status() {
+                    Some(FfmpegStatus::Ready) | None => "ready".to_string(),
+                    Some(FfmpegStatus::MissingFfprobe { ffmpeg_path }) =>
+                        format!("FFprobe not found (ffmpeg at {}). Metadata reading and SSIM will not work.", ffmpeg_path.display()),
+                    Some(FfmpegStatus::MissingFfmpeg { ffprobe_path }) =>
+                        format!("FFmpeg not found (ffprobe at {}). Video scanning will not work.", ffprobe_path.display()),
+                    Some(FfmpegStatus::Missing) =>
+                        format!("FFmpeg and FFprobe not found on PATH.\n{}", install_instructions()),
+                };
+                status.set(s);
+            }
+            #[cfg(not(all(feature = "server", feature = "web")))]
+            { status.set("ready".to_string()); }
+        });
+    });
+
+    let msg = status.read();
+    if msg.as_str() == "ready" || msg.as_str() == "checking" {
+        return rsx! {};
+    }
+
+    rsx! {
+        div { class: "ffmpeg-banner banner-warn",
+            span { class: "banner-icon", "⚠" }
+            div { class: "banner-body",
+                strong { "FFmpeg not available" }
+                pre { class: "banner-msg", "{msg}" }
+                a {
+                    class: "banner-link",
+                    href: "https://ffmpeg.org/download.html",
+                    target: "_blank",
+                    "FFmpeg download page →"
                 }
             }
         }
