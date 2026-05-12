@@ -10,6 +10,7 @@
 mod app;
 mod notify;
 mod settings;
+mod shell;
 mod state;
 mod views;
 

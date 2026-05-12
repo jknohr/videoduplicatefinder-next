@@ -205,6 +205,27 @@ fn FileCard(info: FileInfo, label: &'static str) -> Element {
                 dt { "Audio" } dd { if info.has_audio { "Yes" } else { "No" } }
                 dt { "Size" } dd { "{format_bytes(info.size_bytes)}" }
             }
+
+            div { class: "file-card-actions",
+                button {
+                    class: "btn btn-xs btn-ghost",
+                    title: "Open file with default application",
+                    onclick: {
+                        let path = info.path.clone();
+                        move |_| crate::shell::open_path(&path)
+                    },
+                    "Open"
+                }
+                button {
+                    class: "btn btn-xs btn-ghost",
+                    title: "Reveal in file manager",
+                    onclick: {
+                        let path = info.path.clone();
+                        move |_| crate::shell::reveal_in_folder(&path)
+                    },
+                    "Reveal"
+                }
+            }
         }
     }
 }
