@@ -266,6 +266,44 @@ fn AutoSelectBar(mut app_state: Signal<AppState>) -> Element {
                     "Trash selected"
                 }
                 MoveToFolderInline { app_state }
+                // Dry-run export: download JSON report of what would be deleted
+                button {
+                    class: "btn btn-xs btn-ghost",
+                    title: "Export a JSON cleanup report for the selected files",
+                    onclick: move |_| {
+                        let ids = app_state.read().selected_for_action.clone();
+                        spawn(async move {
+                            #[cfg(all(feature = "server", feature = "web"))]
+                            {
+                                use crate::server::api::export_dry_run_report;
+                                if let Ok(report) = export_dry_run_report(ids).await {
+                                    if let Ok(json) = serde_json::to_string_pretty(&report) {
+                                        // Trigger a browser download via the data: URL pattern
+                                        // (evaluated client-side in WASM; no-op on desktop)
+                                        #[cfg(target_arch = "wasm32")]
+                                        {
+                                            use web_sys::window;
+                                            if let Some(win) = window() {
+                                                let b64 = base64_encode(json.as_bytes());
+                                                let url = format!("data:application/json;base64,{b64}");
+                                                let _ = win.open_with_url_and_target(&url, "_blank");
+                                            }
+                                        }
+                                        #[cfg(not(target_arch = "wasm32"))]
+                                        {
+                                            // Desktop: write to temp file and open
+                                            let tmp = std::env::temp_dir().join("vdf_dry_run.json");
+                                            if std::fs::write(&tmp, &json).is_ok() {
+                                                crate::shell::open_path(tmp.to_str().unwrap_or(""));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    },
+                    "Dry-run report"
+                }
                 button {
                     class: "btn btn-xs btn-ghost",
                     onclick: move |_| app_state.write().selected_for_action.clear(),
@@ -276,24 +314,38 @@ fn AutoSelectBar(mut app_state: Signal<AppState>) -> Element {
     }
 }
 
-/// Inline move-to-folder widget shown when files are selected.
+/// Inline bulk file-operation widget (Move / Copy / Symlink) shown when files are selected.
+/// Ports FileUtils.CopyFile + CreateSymbolLinksForCheckedItemsCommand from C# VDF.
 #[component]
 fn MoveToFolderInline(mut app_state: Signal<AppState>) -> Element {
-    let mut dest = use_signal(String::new);
-    let mut show = use_signal(|| false);
+    let mut dest   = use_signal(String::new);
+    let mut show   = use_signal(|| false);
+    // 0 = Move, 1 = Copy, 2 = Symlink
+    let mut action = use_signal(|| 0u8);
+    let mut status: Signal<Option<String>> = use_signal(|| None);
 
     if !*show.read() {
         return rsx! {
             button {
                 class: "btn btn-xs btn-outline",
                 onclick: move |_| show.set(true),
-                "Move to folder…"
+                "Move/Copy to folder…"
             }
         };
     }
 
     rsx! {
         div { class: "move-inline",
+            // Action tab selector
+            div { class: "action-tabs",
+                for (idx, label) in [(0u8, "Move"), (1u8, "Copy"), (2u8, "Symlink")] {
+                    button {
+                        class: if *action.read() == idx { "btn btn-xs btn-primary" } else { "btn btn-xs btn-ghost" },
+                        onclick: move |_| action.set(idx),
+                        "{label}"
+                    }
+                }
+            }
             input {
                 r#type: "text",
                 class: "move-dest-input",
@@ -305,33 +357,82 @@ fn MoveToFolderInline(mut app_state: Signal<AppState>) -> Element {
                 class: "btn btn-xs btn-primary",
                 disabled: dest.read().trim().is_empty(),
                 onclick: move |_| {
-                    let ids = app_state.read().selected_for_action.clone();
+                    let ids         = app_state.read().selected_for_action.clone();
                     let destination = dest.read().trim().to_string();
-                    let mut state = app_state;
+                    let op          = *action.read();
+                    let mut state   = app_state;
                     spawn(async move {
-                        let mut moved_ids = Vec::new();
-                        for id in &ids {
-                            #[cfg(feature = "server")]
-                            match move_file_action(id.clone(), destination.clone()).await {
-                                Ok(()) => moved_ids.push(id.clone()),
-                                Err(_) => {}
+                        let errors: u32;
+                        let mut moved_ids: Vec<String> = Vec::new();
+
+                        match op {
+                            0 => {
+                                // Move — uses individual move_file_action to update DB paths
+                                errors = {
+                                    let mut e = 0u32;
+                                    for id in &ids {
+                                        #[cfg(feature = "server")]
+                                        match move_file_action(id.clone(), destination.clone()).await {
+                                            Ok(()) => moved_ids.push(id.clone()),
+                                            Err(_) => e += 1,
+                                        }
+                                        #[cfg(not(feature = "server"))]
+                                        { let _ = (id, &destination); }
+                                    }
+                                    e
+                                };
+                            }
+                            1 => {
+                                // Copy — files stay in DB, just copied on disk
+                                #[cfg(all(feature = "server", feature = "web"))]
+                                {
+                                    use crate::server::api::bulk_copy_files;
+                                    errors = bulk_copy_files(ids.clone(), destination.clone())
+                                        .await.unwrap_or(ids.len() as u32);
+                                }
+                                #[cfg(not(all(feature = "server", feature = "web")))]
+                                { errors = 0; }
+                            }
+                            _ => {
+                                // Symlink
+                                #[cfg(all(feature = "server", feature = "web"))]
+                                {
+                                    use crate::server::api::bulk_create_symlinks;
+                                    errors = bulk_create_symlinks(ids.clone(), destination.clone())
+                                        .await.unwrap_or(ids.len() as u32);
+                                }
+                                #[cfg(not(all(feature = "server", feature = "web")))]
+                                { errors = 0; }
                             }
                         }
+
                         let mut s = state.write();
                         for id in &moved_ids {
                             s.remove_file(id);
                         }
-                        s.selected_for_action.clear();
+                        if op == 0 { s.selected_for_action.clear(); }
+                        drop(s);
+                        if errors > 0 {
+                            status.set(Some(format!("{errors} file(s) failed")));
+                        }
                     });
-                    dest.set(String::new());
-                    show.set(false);
+                    if op == 0 { dest.set(String::new()); show.set(false); }
                 },
-                "Move"
+                {
+                    match *action.read() {
+                        1 => "Copy",
+                        2 => "Symlink",
+                        _ => "Move",
+                    }
+                }
             }
             button {
                 class: "btn btn-xs btn-ghost",
-                onclick: move |_| { show.set(false); dest.set(String::new()); },
+                onclick: move |_| { show.set(false); dest.set(String::new()); status.set(None); },
                 "Cancel"
+            }
+            if let Some(ref msg) = *status.read() {
+                span { class: "action-status text-muted", "{msg}" }
             }
         }
     }

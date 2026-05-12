@@ -573,6 +573,253 @@ pub async fn cleanup_database() -> Result<usize, ServerFnError> {
     { Ok(0) }
 }
 
+// ---------------------------------------------------------------------------
+// Bulk file operations — port of FileUtils.CopyFile from C# VDF.Core
+// ---------------------------------------------------------------------------
+
+/// Copy a list of files (by DB id) to `dest_folder`.
+/// Deconflicts filenames by appending _N suffixes.
+/// Returns the number of errors (0 = all succeeded).
+#[cfg(feature = "web")]
+#[server(endpoint = "/api/bulk_copy")]
+pub async fn bulk_copy_files(
+    file_ids: Vec<String>,
+    dest_folder: String,
+) -> Result<u32, ServerFnError> {
+    #[cfg(feature = "server")]
+    {
+        use app_core::db::{Database, ScanDatabase};
+        let db_path = dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("vdf").join("db");
+        tokio::task::spawn_blocking(move || {
+            let db = ScanDatabase::open(&db_path).map_err(|e| ServerFnError::new(e.to_string()))?;
+            std::fs::create_dir_all(&dest_folder)
+                .map_err(|e| ServerFnError::new(e.to_string()))?;
+            let mut errors = 0u32;
+            for id in &file_ids {
+                let Ok(Some(rec)) = db.get_file(id) else { errors += 1; continue; };
+                let src = std::path::Path::new(rec.path.as_str());
+                if !src.exists() { errors += 1; continue; }
+                let dest = deconflict_path(&dest_folder, src);
+                if std::fs::copy(src, &dest).is_err() { errors += 1; }
+            }
+            Ok(errors)
+        }).await.map_err(|e| ServerFnError::new(e.to_string()))?
+    }
+    #[cfg(not(feature = "server"))]
+    { let _ = (file_ids, dest_folder); Ok(0) }
+}
+
+/// Move (rename) a list of files to `dest_folder` and update DB paths.
+/// Returns the number of errors.
+#[cfg(feature = "web")]
+#[server(endpoint = "/api/bulk_move")]
+pub async fn bulk_move_files(
+    file_ids: Vec<String>,
+    dest_folder: String,
+) -> Result<u32, ServerFnError> {
+    #[cfg(feature = "server")]
+    {
+        use app_core::db::{Database, ScanDatabase};
+        let db_path = dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("vdf").join("db");
+        tokio::task::spawn_blocking(move || {
+            let mut db = ScanDatabase::open(&db_path).map_err(|e| ServerFnError::new(e.to_string()))?;
+            std::fs::create_dir_all(&dest_folder)
+                .map_err(|e| ServerFnError::new(e.to_string()))?;
+            let mut errors = 0u32;
+            for id in &file_ids {
+                let Ok(Some(rec)) = db.get_file(id) else { errors += 1; continue; };
+                let src = std::path::Path::new(rec.path.as_str());
+                if !src.exists() { errors += 1; continue; }
+                let dest = deconflict_path(&dest_folder, src);
+                if let Err(_) = std::fs::rename(src, &dest) {
+                    // rename across filesystems fails; fall back to copy+delete
+                    if std::fs::copy(src, &dest).is_ok() {
+                        let _ = std::fs::remove_file(src);
+                    } else {
+                        errors += 1;
+                        continue;
+                    }
+                }
+                // Update DB path
+                if let Ok(new_path) = camino::Utf8PathBuf::from_path_buf(dest) {
+                    let mut updated = rec;
+                    updated.name = new_path.file_name().unwrap_or("").to_string();
+                    updated.path = new_path;
+                    let _ = db.upsert_file(updated);
+                }
+            }
+            Ok(errors)
+        }).await.map_err(|e| ServerFnError::new(e.to_string()))?
+    }
+    #[cfg(not(feature = "server"))]
+    { let _ = (file_ids, dest_folder); Ok(0) }
+}
+
+/// Create symbolic links in `dest_folder` pointing to the original files.
+/// Ports `CreateSymbolLinksForCheckedItemsCommand` from C# MainWindowVM.
+/// Returns the number of errors.
+#[cfg(feature = "web")]
+#[server(endpoint = "/api/bulk_symlink")]
+pub async fn bulk_create_symlinks(
+    file_ids: Vec<String>,
+    dest_folder: String,
+) -> Result<u32, ServerFnError> {
+    #[cfg(feature = "server")]
+    {
+        use app_core::db::{Database, ScanDatabase};
+        let db_path = dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("vdf").join("db");
+        tokio::task::spawn_blocking(move || {
+            let db = ScanDatabase::open(&db_path).map_err(|e| ServerFnError::new(e.to_string()))?;
+            std::fs::create_dir_all(&dest_folder)
+                .map_err(|e| ServerFnError::new(e.to_string()))?;
+            let mut errors = 0u32;
+            for id in &file_ids {
+                let Ok(Some(rec)) = db.get_file(id) else { errors += 1; continue; };
+                let src = std::path::Path::new(rec.path.as_str());
+                if !src.exists() { errors += 1; continue; }
+                let link = deconflict_path(&dest_folder, src);
+                #[cfg(unix)]
+                let res = std::os::unix::fs::symlink(src, &link);
+                #[cfg(windows)]
+                let res = std::os::windows::fs::symlink_file(src, &link);
+                #[cfg(not(any(unix, windows)))]
+                let res: std::io::Result<()> = Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "symlinks not supported on this platform"));
+                if res.is_err() { errors += 1; }
+            }
+            Ok(errors)
+        }).await.map_err(|e| ServerFnError::new(e.to_string()))?
+    }
+    #[cfg(not(feature = "server"))]
+    { let _ = (file_ids, dest_folder); Ok(0) }
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup dry-run report — port of BuildCleanupDryRunReport from C# MainWindowVM
+// ---------------------------------------------------------------------------
+
+/// DTO for a single item in a dry-run cleanup report.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DryRunItem {
+    pub path: String,
+    pub size_bytes: u64,
+    pub resolution: String,
+}
+
+/// DTO for one duplicate group in a dry-run cleanup report.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DryRunGroup {
+    pub remove: Vec<DryRunItem>,
+    pub keep:   Vec<DryRunItem>,
+    pub estimated_savings_bytes: u64,
+}
+
+/// DTO for the full dry-run cleanup report.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DryRunReport {
+    pub created_at: String,
+    pub total_savings_bytes: u64,
+    pub groups: Vec<DryRunGroup>,
+}
+
+/// Build a dry-run report showing which files would be deleted if `to_remove_ids`
+/// were deleted, and which files in each group would be kept.
+///
+/// Ports `ExportCheckedItemsCleanupDryRunReportCommand` from C# MainWindowVM.
+#[cfg(feature = "web")]
+#[server(endpoint = "/api/dry_run_report")]
+pub async fn export_dry_run_report(
+    to_remove_ids: Vec<String>,
+) -> Result<DryRunReport, ServerFnError> {
+    #[cfg(feature = "server")]
+    {
+        use app_core::db::{Database, ScanDatabase};
+        let db_path = dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("vdf").join("db");
+        tokio::task::spawn_blocking(move || {
+            let db = ScanDatabase::open(&db_path).map_err(|e| ServerFnError::new(e.to_string()))?;
+            let all_pairs = db.all_duplicates().map_err(|e| ServerFnError::new(e.to_string()))?;
+            let remove_set: std::collections::HashSet<&str> = to_remove_ids.iter().map(|s| s.as_str()).collect();
+
+            // Group files by which duplicate cluster they belong to
+            let mut cluster_map: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
+            for pair in &all_pairs {
+                let key = {
+                    let mut ids = vec![pair.file_a.clone(), pair.file_b.clone()];
+                    ids.sort();
+                    ids[0].clone()
+                };
+                cluster_map.entry(key.clone()).or_default().insert(pair.file_a.clone());
+                cluster_map.entry(key).or_default().insert(pair.file_b.clone());
+            }
+
+            let mut groups: Vec<DryRunGroup> = Vec::new();
+            let mut seen_remove: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            for id in &to_remove_ids {
+                if seen_remove.contains(id) { continue; }
+
+                // Find which cluster this id belongs to
+                let cluster_ids: Vec<String> = cluster_map.values()
+                    .find(|set| set.contains(id.as_str()))
+                    .map(|set| set.iter().cloned().collect())
+                    .unwrap_or_else(|| vec![id.clone()]);
+
+                let mut remove_items = Vec::new();
+                let mut keep_items  = Vec::new();
+
+                for cid in &cluster_ids {
+                    if let Ok(Some(rec)) = db.get_file(cid) {
+                        let resolution = if rec.width().unwrap_or(0) > 0 {
+                            format!("{}×{}", rec.width().unwrap_or(0), rec.height().unwrap_or(0))
+                        } else {
+                            String::new()
+                        };
+                        let item = DryRunItem {
+                            path: rec.path.to_string(),
+                            size_bytes: rec.size_bytes,
+                            resolution,
+                        };
+                        if remove_set.contains(cid.as_str()) {
+                            seen_remove.insert(cid.clone());
+                            remove_items.push(item);
+                        } else {
+                            keep_items.push(item);
+                        }
+                    }
+                }
+
+                if remove_items.is_empty() { continue; }
+                let savings: u64 = remove_items.iter().map(|i| i.size_bytes).sum();
+                groups.push(DryRunGroup { remove: remove_items, keep: keep_items, estimated_savings_bytes: savings });
+            }
+
+            let total_savings: u64 = groups.iter().map(|g| g.estimated_savings_bytes).sum();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            Ok(DryRunReport {
+                created_at: format!("{now}"),
+                total_savings_bytes: total_savings,
+                groups,
+            })
+        }).await.map_err(|e| ServerFnError::new(e.to_string()))?
+    }
+    #[cfg(not(feature = "server"))]
+    {
+        let _ = to_remove_ids;
+        Ok(DryRunReport { created_at: String::new(), total_savings_bytes: 0, groups: vec![] })
+    }
+}
+
 /// Return a MIME content-type string for the given file path.
 #[cfg(feature = "web")]
 fn mime_for_ext(path: &std::path::Path) -> &'static str {
@@ -593,5 +840,26 @@ fn mime_for_ext(path: &std::path::Path) -> &'static str {
         Some("ogv")               => "video/ogg",
         Some("3gp")               => "video/3gpp",
         _                         => "application/octet-stream",
+    }
+}
+
+/// Build a destination path, appending `_N` before the extension if a file
+/// with the same name already exists at `dest_folder`.
+/// Mirrors the deconflict loop in `FileUtils.CopyFile` from C# VDF.Core.
+#[cfg(feature = "server")]
+fn deconflict_path(dest_folder: &str, src: &std::path::Path) -> std::path::PathBuf {
+    let file_name = src.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let mut dest = std::path::PathBuf::from(dest_folder).join(file_name);
+    if !dest.exists() {
+        return dest;
+    }
+    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or(file_name);
+    let ext  = src.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let mut n = 1u32;
+    loop {
+        let name = if ext.is_empty() { format!("{stem}_{n}") } else { format!("{stem}_{n}.{ext}") };
+        dest = std::path::PathBuf::from(dest_folder).join(&name);
+        if !dest.exists() { return dest; }
+        n += 1;
     }
 }
