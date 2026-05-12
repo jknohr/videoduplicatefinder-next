@@ -460,12 +460,16 @@ Phase 3: compare_all() — O(n²) pairwise
 | `ui/src/views/compare.rs` | Complete | CompareView, FileCard, ThumbnailStrip (5 frames), evidence panel, DurationComparison |
 | `ui/src/views/settings.rs` | Complete | SettingsView with all 13 hardware accel options |
 | `ui/src/views/blacklist.rs` | Complete | BlacklistView, pair table, remove action |
-| `ui/src/views/database.rs` | Complete | DatabaseView, paginated/sortable file list, delete |
+| `ui/src/views/database.rs` | Complete | DatabaseView, paginated/sortable file list, delete, Rescan, Cleanup buttons |
 | `ui/src/views/relocate.rs` | Complete | RelocateView, prefix mode, rescan mode, preview table, apply |
 | `ui/src/views/stats.rs` | Complete | StatsView, cluster/file/size statistics |
 | `ui/src/views/logs.rs` | Complete | LogsView, live log panel |
-| `ui/src/server/api.rs` | Complete | trigger_scan, cancel_scan, pause_scan, delete_file, move_file, blacklist_group, thumbnail_handler, video_stream_handler |
-| `ui/src/server/mod.rs` | Complete | Axum router registration |
+| `ui/src/notify.rs` | Complete | notify_desktop() — Linux notify-send, macOS osascript, Windows PowerShell BalloonTip |
+| `ui/src/shell.rs` | Complete | open_path(), reveal_in_folder() — cross-platform file manager integration |
+| `ui/src/server/api.rs` | Complete | trigger_scan, cancel_scan, pause_scan, delete_file, move_file, blacklist_group, thumbnail_handler, video_stream_handler, get_blacklist, add/remove_blacklist, rescan_file, cleanup_database, get_ffmpeg_status |
+| `ui/src/server/auth.rs` | Complete | Web auth middleware, login page, cookie-based session |
+| `ui/src/server/ffmpeg_setup.rs` | Complete | FFmpeg binary detection + install instructions |
+| `ui/src/server/mod.rs` | Complete | Axum router registration with auth middleware |
 
 ---
 
