@@ -4,6 +4,7 @@
 //! The graph traversal (union-find over edges) is done in AppState::load_clusters.
 
 use dioxus::prelude::*;
+use urlencoding;
 use crate::app::Route;
 use crate::state::AppState;
 use crate::state::app_state::{DuplicateCluster, ResultSort};
@@ -296,8 +297,8 @@ fn cluster_card(cluster: &DuplicateCluster, mut app_state: Signal<AppState>) -> 
     let fa = cluster.files.first().map(|f| f.id.clone()).unwrap_or_default();
     let fb = cluster.files.get(1).map(|f| f.id.clone()).unwrap_or_default();
 
-    // File rows: pre-build display tuples (id, name, path, dur, w, h, size)
-    let file_rows: Vec<(String, String, String, f64, u32, u32, u64)> = cluster.files.iter().map(|f| {
+    // File rows: pre-build display tuples (id, name, path, dur, w, h, size, is_image)
+    let file_rows: Vec<(String, String, String, f64, u32, u32, u64, bool)> = cluster.files.iter().map(|f| {
         (
             f.id.clone(),
             f.name.clone(),
@@ -306,6 +307,7 @@ fn cluster_card(cluster: &DuplicateCluster, mut app_state: Signal<AppState>) -> 
             f.width().unwrap_or(0),
             f.height().unwrap_or(0),
             f.size_bytes,
+            f.is_image(),
         )
     }).collect();
 
@@ -324,8 +326,35 @@ fn cluster_card(cluster: &DuplicateCluster, mut app_state: Signal<AppState>) -> 
             }
 
             div { class: "cluster-files",
-                for (fid, name, path, dur, w, h, size) in file_rows {
+                for (fid, name, path, dur, w, h, size, is_img) in file_rows {
                     div { class: "file-row",
+                        // Thumbnail: shown for videos and images
+                        {
+                            let encoded = urlencoding::encode(&path).into_owned();
+                            // Position at 25% of duration for a representative frame
+                            let pos = if dur > 0.0 { dur * 0.25 } else { 0.0 };
+                            if is_img {
+                                rsx! {
+                                    img {
+                                        class: "file-thumb",
+                                        src: "/api/thumbnail?path={encoded}&pos=0&w=200",
+                                        alt: "{name}",
+                                        loading: "lazy",
+                                    }
+                                }
+                            } else if dur > 0.0 {
+                                rsx! {
+                                    img {
+                                        class: "file-thumb",
+                                        src: "/api/thumbnail?path={encoded}&pos={pos:.2}&w=200",
+                                        alt: "{name}",
+                                        loading: "lazy",
+                                    }
+                                }
+                            } else {
+                                rsx! { div { class: "file-thumb file-thumb-empty" } }
+                            }
+                        }
                         div { class: "file-info",
                             div { class: "file-name", "{name}" }
                             div { class: "file-meta",

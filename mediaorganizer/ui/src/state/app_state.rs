@@ -19,6 +19,7 @@ pub mod stubs {
         pub fn duration_secs(&self) -> f64 { 0.0 }
         pub fn width(&self) -> Option<u32> { None }
         pub fn height(&self) -> Option<u32> { None }
+        pub fn is_image(&self) -> bool { false }
     }
 }
 #[cfg(not(feature = "server"))]

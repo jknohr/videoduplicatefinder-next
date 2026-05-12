@@ -9,6 +9,7 @@ use crate::settings::UiSettings;
 use crate::state::{AppState, ScanState};
 use crate::state::scan_state::LogLevel;
 
+
 #[component]
 pub fn ScanView() -> Element {
     let mut scan_state = use_context::<Signal<ScanState>>();
@@ -62,13 +63,28 @@ pub fn ScanView() -> Element {
             // ── Scan controls ─────────────────────────────────────────────
             section { class: "scan-controls",
                 if is_scanning {
+                    // Stop button — sets the cancel flag in the shared AtomicBool
                     button {
                         class: "btn btn-danger",
                         onclick: move |_| {
-                            // TODO: send cancellation signal to scan engine
-                            scan_state.write().is_scanning = false;
+                            scan_state.read().request_cancel();
                         },
-                        "Stop Scan"
+                        "Stop"
+                    }
+
+                    // Pause / Resume toggle
+                    {
+                        let is_paused = scan_state.read().is_paused;
+                        rsx! {
+                            button {
+                                class: if is_paused { "btn btn-warning" } else { "btn btn-outline" },
+                                onclick: move |_| {
+                                    let paused = !scan_state.read().is_paused;
+                                    scan_state.write().set_paused(paused);
+                                },
+                                if is_paused { "Resume" } else { "Pause" }
+                            }
+                        }
                     }
                 } else {
                     button {
@@ -253,10 +269,16 @@ async fn run_scan(
         }
     };
 
+    // Wire cancel/pause flags from ScanState into the scan engine
+    let cancel = std::sync::Arc::clone(&scan_state.read().cancel_flag);
+    let pause  = std::sync::Arc::clone(&scan_state.read().pause_flag);
+
     // Run scan on a blocking thread so async runtime stays responsive
     let handle = tokio::task::spawn_blocking(move || {
         let cb = std::sync::Arc::new(move |ev| { let _ = tx.send(ev); });
         let mut engine = ScanEngine::new(settings, db).with_progress(cb);
+        engine.cancel = cancel;
+        engine.pause  = pause;
         engine.run()
     });
 
@@ -295,6 +317,9 @@ async fn run_scan(
                     LogLevel::Info,
                     format!("done — {files} files, {duplicates} duplicate groups"),
                 );
+            }
+            ScanProgress::ScanAborted => {
+                scan_state.write().push_log(LogLevel::Warn, "Scan stopped by user");
             }
             ScanProgress::Error { path, msg } => {
                 scan_state.write().push_log(LogLevel::Error, format!("error {path}: {msg}"));

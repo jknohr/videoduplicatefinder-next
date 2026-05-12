@@ -17,6 +17,37 @@ use app_core::scan::ScanProgress;
 use crate::settings::UiSettings;
 
 // ---------------------------------------------------------------------------
+// Server-side scan control — one active scan per process.
+// The cancel and pause AtomicBool flags are shared with the ScanEngine running
+// in spawn_blocking. The client calls cancel_scan() / set_scan_paused() to
+// toggle them without needing to share state across the WASM boundary.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "server")]
+mod scan_control {
+    use std::sync::{Arc, OnceLock, atomic::{AtomicBool, Ordering}};
+
+    static CANCEL: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    static PAUSE:  OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+    fn cancel_flag() -> &'static Arc<AtomicBool> {
+        CANCEL.get_or_init(|| Arc::new(AtomicBool::new(false)))
+    }
+    fn pause_flag() -> &'static Arc<AtomicBool> {
+        PAUSE.get_or_init(|| Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn cancel() { cancel_flag().store(true, Ordering::Relaxed); }
+    pub fn set_pause(paused: bool) { pause_flag().store(paused, Ordering::Relaxed); }
+    pub fn reset() {
+        cancel_flag().store(false, Ordering::Relaxed);
+        pause_flag().store(false, Ordering::Relaxed);
+    }
+    pub fn cancel_arc() -> Arc<AtomicBool> { Arc::clone(cancel_flag()) }
+    pub fn pause_arc()  -> Arc<AtomicBool> { Arc::clone(pause_flag()) }
+}
+
+// ---------------------------------------------------------------------------
 // #[server] RPC functions
 // ---------------------------------------------------------------------------
 
@@ -50,18 +81,40 @@ pub async fn trigger_scan(ui_settings: UiSettings) -> Result<(), ServerFnError> 
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ScanProgress>();
 
+    // Reset and wire global cancel/pause flags into this scan engine
+    scan_control::reset();
+    let cancel = scan_control::cancel_arc();
+    let pause  = scan_control::pause_arc();
+
     tokio::task::spawn_blocking(move || {
         let cb = std::sync::Arc::new(move |ev| { let _ = tx.send(ev); });
         let mut engine = ScanEngine::new(settings, db).with_progress(cb);
+        engine.cancel = cancel;
+        engine.pause  = pause;
         let _ = engine.run();
     });
 
     // Drain events — in fullstack mode Dioxus SSE handles the streaming
     while let Some(_event) = rx.recv().await {
         // TODO: push event to ServerEvents<ScanProgress> stream
-        // The exact API for ServerEvents streaming is in Dioxus 0.7 fullstack docs.
     }
 
+    Ok(())
+}
+
+/// Request cancellation of the active scan. Safe to call even when no scan is running.
+#[cfg(feature = "web")]
+#[server(endpoint = "/api/cancel_scan")]
+pub async fn cancel_scan() -> Result<(), ServerFnError> {
+    scan_control::cancel();
+    Ok(())
+}
+
+/// Pause or resume the active scan.
+#[cfg(feature = "web")]
+#[server(endpoint = "/api/pause_scan")]
+pub async fn set_scan_paused(paused: bool) -> Result<(), ServerFnError> {
+    scan_control::set_pause(paused);
     Ok(())
 }
 
@@ -304,6 +357,80 @@ fn parse_range(header: &str, file_size: u64) -> Option<(u64, u64)> {
         end_str.parse().ok()?
     };
     Some((start, end))
+}
+
+// ---------------------------------------------------------------------------
+// Thumbnail endpoint — GET /api/thumbnail?path=...&pos=...&w=...
+// ---------------------------------------------------------------------------
+
+/// Query parameters for GET /api/thumbnail
+#[cfg(feature = "web")]
+#[derive(serde::Deserialize)]
+pub struct ThumbnailQuery {
+    pub path: String,
+    /// Position in seconds (default 0 = let ffmpeg pick the first decodable frame)
+    #[serde(default)]
+    pub pos: f64,
+    /// Max width in pixels (default 200; 0 = full resolution)
+    #[serde(default = "default_thumb_width")]
+    pub w: u32,
+}
+
+#[cfg(feature = "web")]
+fn default_thumb_width() -> u32 { 200 }
+
+/// Extract and serve a single JPEG thumbnail from a video/image at the given position.
+///
+/// Uses `app_core::ffmpeg::extract_thumbnail_jpeg` which spawns ffmpeg as a subprocess.
+/// Results are NOT cached — the Dioxus image element caches via browser HTTP cache headers.
+#[cfg(feature = "web")]
+pub async fn thumbnail_handler(
+    axum::extract::Query(params): axum::extract::Query<ThumbnailQuery>,
+) -> axum::response::Response {
+    use axum::body::Body;
+    use axum::http::{header, StatusCode};
+    use axum::response::Response;
+
+    let path_str = params.path.clone();
+    let pos = params.pos;
+    let w = params.w;
+
+    // Validate path is absolute
+    let path = std::path::Path::new(&path_str);
+    if !path.is_absolute() {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("path must be absolute"))
+            .unwrap();
+    }
+
+    let jpeg = tokio::task::spawn_blocking(move || {
+        use camino::Utf8Path;
+        use app_core::config::HardwareAccel;
+        app_core::ffmpeg::extract_thumbnail_jpeg(
+            Utf8Path::new(&path_str),
+            pos,
+            w,
+            HardwareAccel::None,
+        )
+    })
+    .await
+    .ok()
+    .flatten();
+
+    match jpeg {
+        Some(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/jpeg")
+            .header(header::CONTENT_LENGTH, bytes.len())
+            .header(header::CACHE_CONTROL, "public, max-age=3600")
+            .body(Body::from(bytes))
+            .unwrap(),
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("thumbnail extraction failed"))
+            .unwrap(),
+    }
 }
 
 /// Return a MIME content-type string for the given file path.

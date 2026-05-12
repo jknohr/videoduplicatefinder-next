@@ -16,7 +16,9 @@ pub mod api;
 #[cfg(feature = "web")]
 pub fn register_axum_routes(router: axum::Router) -> axum::Router {
     use axum::routing::get;
-    use api::video_stream_handler;
+    use api::{thumbnail_handler, video_stream_handler};
 
-    router.route("/api/video", get(video_stream_handler))
+    router
+        .route("/api/video", get(video_stream_handler))
+        .route("/api/thumbnail", get(thumbnail_handler))
 }

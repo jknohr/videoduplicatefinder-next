@@ -25,7 +25,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 use tracing::{debug, info, warn};
@@ -38,6 +38,7 @@ pub enum ScanProgress {
     ComparisonStarted { total_pairs: usize },
     DuplicateFound { file_a: String, file_b: String, similarity: f32 },
     ScanComplete { files: usize, duplicates: usize },
+    ScanAborted,
     Error { path: Utf8PathBuf, msg: String },
 }
 
@@ -61,11 +62,23 @@ pub struct ScanEngine<D: Database> {
     pub settings: Settings,
     pub db: D,
     progress: Option<ProgressCallback>,
+    /// Set to `true` to request cancellation of an in-progress scan.
+    /// Mirrors C# CancellationTokenSource.
+    pub cancel: Arc<AtomicBool>,
+    /// Set to `true` to pause; clear to `false` to resume.
+    /// Mirrors C# PauseTokenSource.
+    pub pause: Arc<AtomicBool>,
 }
 
 impl<D: Database> ScanEngine<D> {
     pub fn new(settings: Settings, db: D) -> Self {
-        Self { settings, db, progress: None }
+        Self {
+            settings,
+            db,
+            progress: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            pause: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn with_progress(mut self, cb: ProgressCallback) -> Self {
@@ -79,23 +92,47 @@ impl<D: Database> ScanEngine<D> {
         }
     }
 
+    /// Returns `true` if the scan has been cancelled.
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Block until unpaused (checks every 50ms). Returns `true` if cancelled while paused.
+    fn check_pause(&self) -> bool {
+        while self.pause.load(Ordering::Relaxed) {
+            if self.cancel.load(Ordering::Relaxed) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        self.cancel.load(Ordering::Relaxed)
+    }
+
     /// Full scan: discover → hash → compare (four phases) → highlight best matches.
     pub fn run(&mut self) -> VdfResult<()> {
+        self.cancel.store(false, Ordering::Relaxed);
+        self.pause.store(false, Ordering::Relaxed);
+
         let paths = self.discover_files();
         info!("discovered {} files", paths.len());
 
+        if self.is_cancelled() { self.emit(ScanProgress::ScanAborted); return Ok(()); }
         self.hash_files(&paths)?;
 
+        if self.is_cancelled() { self.emit(ScanProgress::ScanAborted); return Ok(()); }
         self.scan_for_duplicates()?;
 
+        if self.is_cancelled() { self.emit(ScanProgress::ScanAborted); return Ok(()); }
         if self.settings.partial_clip_detection {
             self.scan_for_partial_duplicates()?;
         }
 
+        if self.is_cancelled() { self.emit(ScanProgress::ScanAborted); return Ok(()); }
         if self.settings.iframe_fingerprint {
             self.scan_for_timeline_duplicates()?;
         }
 
+        if self.is_cancelled() { self.emit(ScanProgress::ScanAborted); return Ok(()); }
         if self.settings.mpeg7_signature {
             self.scan_for_mpeg7_duplicates()?;
         }
@@ -433,12 +470,20 @@ impl<D: Database> ScanEngine<D> {
 
     fn hash_files(&mut self, paths: &[Utf8PathBuf]) -> VdfResult<()> {
         let settings = &self.settings;
+        let cancel = Arc::clone(&self.cancel);
+        let pause = Arc::clone(&self.pause);
 
         let results: Vec<(Utf8PathBuf, VdfResult<FileRecord>)> = paths
             .par_iter()
-            .map(|path| {
+            .filter_map(|path| {
+                // Pause support (spin-wait; won't hold rayon thread pool long if unpaused quickly)
+                while pause.load(Ordering::Relaxed) {
+                    if cancel.load(Ordering::Relaxed) { return None; }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if cancel.load(Ordering::Relaxed) { return None; }
                 let record = hash_one_file(path, settings);
-                (path.clone(), record)
+                Some((path.clone(), record))
             })
             .collect();
 

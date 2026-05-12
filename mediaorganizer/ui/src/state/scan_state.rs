@@ -1,5 +1,6 @@
 //! Reactive scan progress state shared across all components.
 
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use crate::settings::UiSettings;
 
 /// One entry in the live log panel.
@@ -24,6 +25,7 @@ pub enum LogLevel {
 pub struct ScanState {
     pub settings: UiSettings,
     pub is_scanning: bool,
+    pub is_paused: bool,
     /// 0.0 = not started, 1.0 = complete.
     pub progress: f32,
     /// Total files discovered so far.
@@ -32,6 +34,10 @@ pub struct ScanState {
     pub duplicates_found: usize,
     /// Capped ring buffer of log entries shown in the live log panel.
     pub log_entries: Vec<LogEntry>,
+    /// Shared with the ScanEngine — set to true to stop scanning.
+    pub cancel_flag: Arc<AtomicBool>,
+    /// Shared with the ScanEngine — set to true to pause, false to resume.
+    pub pause_flag: Arc<AtomicBool>,
 }
 
 impl Default for ScanState {
@@ -39,10 +45,13 @@ impl Default for ScanState {
         Self {
             settings: load_saved_settings().unwrap_or_default(),
             is_scanning: false,
+            is_paused: false,
             progress: 0.0,
             files_found: 0,
             duplicates_found: 0,
             log_entries: Vec::new(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            pause_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -70,9 +79,21 @@ impl ScanState {
 
     pub fn reset(&mut self) {
         self.is_scanning = false;
+        self.is_paused = false;
         self.progress = 0.0;
         self.files_found = 0;
         self.duplicates_found = 0;
         self.log_entries.clear();
+        self.cancel_flag.store(false, Ordering::Relaxed);
+        self.pause_flag.store(false, Ordering::Relaxed);
+    }
+
+    pub fn request_cancel(&self) {
+        self.cancel_flag.store(true, Ordering::Relaxed);
+    }
+
+    pub fn set_paused(&mut self, paused: bool) {
+        self.is_paused = paused;
+        self.pause_flag.store(paused, Ordering::Relaxed);
     }
 }
