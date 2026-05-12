@@ -181,6 +181,10 @@ struct ScanArgs {
     #[arg(long, default_value = "0.0")]
     skip_end_percent: f32,
 
+    /// Detect horizontally-mirrored (flipped) duplicates
+    #[arg(long)]
+    compare_horizontally_flipped: bool,
+
     /// Output format
     #[arg(long, default_value = "text")]
     format: OutputFormat,
@@ -535,6 +539,7 @@ fn cmd_scan(args: ScanArgs) -> Result<()> {
     settings.skip_start_percent = args.skip_start_percent;
     settings.skip_end_secs = args.skip_end;
     settings.skip_end_percent = args.skip_end_percent;
+    settings.compare_horizontally_flipped = args.compare_horizontally_flipped;
 
     let progress: Arc<dyn Fn(ScanProgress) + Send + Sync> = Arc::new(|ev| match ev {
         ScanProgress::FileDiscovered { path } => info!("found   {path}"),

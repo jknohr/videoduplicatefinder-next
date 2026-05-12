@@ -222,6 +222,99 @@ pub async fn remove_duplicate_pair(file_a: String, file_b: String) -> Result<(),
     Ok(())
 }
 
+/// Return all blacklisted file pairs from the database.
+#[cfg(feature = "web")]
+#[server(endpoint = "/api/blacklist")]
+pub async fn get_blacklist() -> Result<Vec<(String, String, u64, Option<String>)>, ServerFnError> {
+    use app_core::db::{Database, ScanDatabase};
+
+    let db_path = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("vdf").join("db");
+
+    let db = ScanDatabase::open(&db_path)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let entries = db.all_blacklisted()
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    Ok(entries.into_iter()
+        .map(|e| (e.file_a, e.file_b, e.added_at, e.reason))
+        .collect())
+}
+
+/// Add a file pair to the blacklist (mark as "not a match").
+#[cfg(feature = "web")]
+#[server(endpoint = "/api/blacklist_add")]
+pub async fn add_to_blacklist(
+    file_a: String,
+    file_b: String,
+    reason: Option<String>,
+) -> Result<(), ServerFnError> {
+    use app_core::db::{BlacklistEntry, Database, ScanDatabase};
+
+    let db_path = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("vdf").join("db");
+
+    let mut db = ScanDatabase::open(&db_path)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let entry = BlacklistEntry::new(file_a, file_b, reason);
+    db.add_blacklist(entry)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Remove a file pair from the blacklist.
+#[cfg(feature = "web")]
+#[server(endpoint = "/api/blacklist_remove")]
+pub async fn remove_from_blacklist(file_a: String, file_b: String) -> Result<(), ServerFnError> {
+    use app_core::db::{Database, ScanDatabase};
+
+    let db_path = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("vdf").join("db");
+
+    let mut db = ScanDatabase::open(&db_path)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    db.remove_blacklist(&file_a, &file_b)
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Re-hash a single file and re-run comparisons against all DB files.
+///
+/// Port of the quick-rescan path from C# ScanEngine.
+/// After completion, the caller should reload duplicates via `load_duplicates()`.
+#[cfg(feature = "web")]
+#[server(endpoint = "/api/rescan_file")]
+pub async fn rescan_file(path: String) -> Result<(), ServerFnError> {
+    use app_core::db::ScanDatabase;
+    use app_core::scan::ScanEngine;
+
+    let db_path = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("vdf").join("db");
+
+    tokio::task::spawn_blocking(move || {
+        let db = ScanDatabase::open(&db_path)
+            .map_err(|e| e.to_string())?;
+
+        let settings = app_core::config::Settings::default();
+        let mut engine = ScanEngine::new(settings, db);
+
+        engine.rescan_file(camino::Utf8Path::new(&path))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| ServerFnError::new(e.to_string()))?
+    .map_err(ServerFnError::new)
+}
+
 // ---------------------------------------------------------------------------
 // Raw Axum handlers — video streaming with HTTP 206 / Range support
 // ---------------------------------------------------------------------------

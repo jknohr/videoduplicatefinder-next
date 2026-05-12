@@ -130,9 +130,16 @@ pub fn SettingsView() -> Element {
                     }
                 }
 
-                // ── MPEG-7 / SSIM ─────────────────────────────────────────
+                // ── Advanced matching ─────────────────────────────────────
                 section { class: "settings-section",
                     h2 { "Advanced Matching" }
+
+                    CheckboxField {
+                        label: "Detect horizontally flipped duplicates",
+                        hint: "Re-compare each pair using a mirror image of the first file. Marks matches as 'Flipped' in results. Increases scan time.",
+                        checked: scan_state.read().settings.compare_horizontally_flipped,
+                        onchange: move |v| scan_state.write().settings.compare_horizontally_flipped = v,
+                    }
 
                     CheckboxField {
                         label: "MPEG-7 video signature",

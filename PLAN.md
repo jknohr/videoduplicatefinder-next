@@ -154,7 +154,7 @@ init is not needed — ffmpeg-the-third handles it through the standard hwaccel 
 - Schema additions (added via migration v1→v2): scene_change_timestamps, mpeg7_signature_path,
   temporal_avg_hash, is_flipped on duplicate_of
 
-### 1h. Scan engine ✅ COMPLETE
+### 1h. Scan engine ✅ COMPLETE (including flipped detection + rescan)
 - [x] `scan.rs` — 3-phase scan engine
 - [x] Phase 2: scene-aware skip via `get_scene_change_timestamps()`
 - [x] Phase 2: temporal average hash via `extract_temporal_average_hash()`
@@ -164,9 +164,9 @@ init is not needed — ffmpeg-the-third handles it through the standard hwaccel 
 - [x] Phase 3: SSIM second-pass for borderline matches (`ssim_verify` in scan.rs)
 - [x] Blacklist filter — `pair_is_blacklisted()` guards all four `add_duplicate()` call sites
 
-**Still to add:**
-- [ ] Phase 3: flipped-image detection (horizontal mirror + re-compare)
-- [ ] Rescan single file — re-hash one path, update DB, re-run comparisons for that file only
+**Completed:**
+- [x] Phase 3: flipped-image detection — `compare_videos_bucketed()` pre-computes `flipped_phash_hashes()` and re-compares when normal match fails; stored as `is_flipped: bool` on edge
+- [x] Rescan single file — `ScanEngine::rescan_file()` in `scan.rs`; exposed as `#[server] rescan_file(path)` in `server/api.rs`; Rescan button wired in `database.rs` view
 
 ### 1i. Metadata module ✅ COMPLETE
 - [x] `read_metadata_tags(path)` in `ffmpeg.rs` — ffprobe JSON tag reader
@@ -340,11 +340,12 @@ tree. Feature flags select the platform runtime — not the components.
 | `remove_duplicate_pair(a, b)` | ✅ | Remove duplicate_of edge |
 | `video_stream_handler` | ✅ | Axum range-request video endpoint (HTTP 206) |
 | `thumbnail_handler` | ✅ | FFmpeg frame extraction to JPEG at position |
-| `get_blacklist()` | ❌ | All blacklisted pairs |
-| `add_to_blacklist(a, b, reason)` | ❌ | Add pair to blacklist |
-| `remove_from_blacklist(id)` | ❌ | Remove blacklist entry |
-| `rescan_file(path)` | ❌ | Re-hash single file, update DB |
-| `export_results(format)` | ❌ | JSON / CSV export |
+| `get_blacklist()` | ✅ | All blacklisted pairs |
+| `add_to_blacklist(a, b, reason)` | ✅ | Add pair to blacklist |
+| `remove_from_blacklist(a, b)` | ✅ | Remove blacklist entry |
+| `rescan_file(path)` | ✅ | Re-hash single file, update DB |
+| `get_ffmpeg_status()` | ✅ | FFmpeg binary status check |
+| `export_results(format)` | ❌ | JSON / CSV export (available in CLI via `export` subcommand) |
 
 ### Web-only features (`#[cfg(feature = "web")]`)
 

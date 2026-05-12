@@ -69,6 +69,8 @@ pub struct UiSettings {
     pub ssim_window_secs: f64,
     // Hardware acceleration for FFmpeg decode
     pub hardware_accel: HardwareAccel,
+    // Detect horizontally-mirrored duplicates (flipped content)
+    pub compare_horizontally_flipped: bool,
 }
 
 impl Default for UiSettings {
@@ -104,6 +106,7 @@ impl Default for UiSettings {
             ssim_reject_threshold: 0.90,
             ssim_window_secs: 10.0,
             hardware_accel: HardwareAccel::None,
+            compare_horizontally_flipped: false,
         }
     }
 }
@@ -145,6 +148,7 @@ impl From<UiSettings> for app_core::config::Settings {
         c.ssim_verify_max_sim = s.ssim_verify_max_sim;
         c.ssim_reject_threshold = s.ssim_reject_threshold;
         c.ssim_window_secs = s.ssim_window_secs;
+        c.compare_horizontally_flipped = s.compare_horizontally_flipped;
         c.hardware_accel = match s.hardware_accel {
             HardwareAccel::None         => app_core::config::HardwareAccel::None,
             HardwareAccel::Auto         => app_core::config::HardwareAccel::Auto,

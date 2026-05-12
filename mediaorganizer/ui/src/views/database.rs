@@ -3,6 +3,9 @@
 
 use dioxus::prelude::*;
 
+#[cfg(all(feature = "server", feature = "web"))]
+use crate::server::api::rescan_file;
+
 const PAGE_SIZE: usize = 50;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,6 +174,16 @@ pub fn DatabaseView() -> Element {
                                 });
                             }
                         },
+                        on_rescan: {
+                            let path = row.path.clone();
+                            move |_| {
+                                let path2 = path.clone();
+                                #[cfg(all(feature = "server", feature = "web"))]
+                                spawn(async move {
+                                    let _ = rescan_file(path2).await;
+                                });
+                            }
+                        },
                     }
                 }
             }
@@ -211,7 +224,7 @@ fn SortButton(label: &'static str, active: bool, onclick: EventHandler<()>) -> E
 }
 
 #[component]
-fn DbRowCard(row: DbRow, on_delete: EventHandler<()>) -> Element {
+fn DbRowCard(row: DbRow, on_delete: EventHandler<()>, on_rescan: EventHandler<()>) -> Element {
     let scanned_dt = format_unix(row.scanned_at);
     let type_label = if row.is_image { "Image" } else { "Video" };
 
@@ -227,6 +240,12 @@ fn DbRowCard(row: DbRow, on_delete: EventHandler<()>) -> Element {
                 span { class: if row.is_image { "badge badge-image" } else { "badge badge-video" }, "{type_label}" }
             }
             div { class: "db-col db-col-actions",
+                button {
+                    class: "btn btn-xs btn-outline",
+                    title: "Re-fingerprint this file (updates hashes in DB without full scan)",
+                    onclick: move |_| on_rescan.call(()),
+                    "Rescan"
+                }
                 button {
                     class: "btn btn-xs btn-danger",
                     title: "Remove from database (does not delete file from disk)",
