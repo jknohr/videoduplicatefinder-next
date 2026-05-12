@@ -443,13 +443,29 @@ Phase 3: compare_all() — O(n²) pairwise
 | `core/src/config.rs` | Complete | All Settings fields from C# |
 | `core/src/phash.rs` | Complete | DCT pHash, Hamming similarity |
 | `core/src/comparison.rs` | Complete | Sliding-window I-frame matching |
-| `core/src/ffmpeg.rs` | Complete | probe_media, gray frames, iframe timestamps |
+| `core/src/ffmpeg.rs` | Complete | probe_media, gray frames, iframe timestamps, thumbnail JPEG |
 | `core/src/audio.rs` | Complete | Full Chromaprint pipeline |
-| `core/src/db.rs` | Complete | SurrealDB 3.0 graph schema + CRUD + RELATE |
-| `core/src/scan.rs` | Complete | 3-phase scan engine |
+| `core/src/db.rs` | Complete | SurrealDB 3.0 graph schema + CRUD + RELATE + query_file_ids_where |
+| `core/src/scan.rs` | Complete | 3-phase scan engine, cancel/pause AtomicBool, DiscoveryComplete/ScanAborted events |
+| `core/src/ranker.rs` | Complete | pick_keeper, default_criteria, compute_best_flags, BestFlags |
 | `core/src/lib.rs` | Complete | Re-exports |
-| `cli/src/main.rs` | Complete | scan / list / show commands |
-| `ui/` | Not started | Dioxus 0.7 — one crate, desktop+web+mobile features |
+| `cli/src/main.rs` | Complete | scan / list / show / blacklist / relocate commands |
+| `ui/src/main.rs` | Complete | Platform entry points for desktop / web / mobile |
+| `ui/src/app.rs` | Complete | Route enum, App root, Sidebar with all nav links |
+| `ui/src/state/scan_state.rs` | Complete | ScanState, LogEntry, cancel/pause flags, reset() |
+| `ui/src/state/app_state.rs` | Complete | AppState, DuplicateCluster, criteria_order, ResultSort |
+| `ui/src/settings.rs` | Complete | UiSettings, HardwareAccel (13 variants), From<UiSettings> |
+| `ui/src/views/scan.rs` | Complete | ScanView, AddFolderButton, ProgressBar, Stop/Pause controls |
+| `ui/src/views/results.rs` | Complete | ResultsView, AutoSelectBar, QualityOrderPanel, CustomSelectionPanel, SurrealSelectionPanel, MoveToFolderInline, MetadataEditorInline, cluster cards with thumbnails |
+| `ui/src/views/compare.rs` | Complete | CompareView, FileCard, ThumbnailStrip (5 frames), evidence panel, DurationComparison |
+| `ui/src/views/settings.rs` | Complete | SettingsView with all 13 hardware accel options |
+| `ui/src/views/blacklist.rs` | Complete | BlacklistView, pair table, remove action |
+| `ui/src/views/database.rs` | Complete | DatabaseView, paginated/sortable file list, delete |
+| `ui/src/views/relocate.rs` | Complete | RelocateView, prefix mode, rescan mode, preview table, apply |
+| `ui/src/views/stats.rs` | Complete | StatsView, cluster/file/size statistics |
+| `ui/src/views/logs.rs` | Complete | LogsView, live log panel |
+| `ui/src/server/api.rs` | Complete | trigger_scan, cancel_scan, pause_scan, delete_file, move_file, blacklist_group, thumbnail_handler, video_stream_handler |
+| `ui/src/server/mod.rs` | Complete | Axum router registration |
 
 ---
 

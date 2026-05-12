@@ -115,15 +115,26 @@ pub struct Settings {
     pub hardware_accel: HardwareAccel,
 }
 
+/// Hardware acceleration mode for FFmpeg video decode.
+///
+/// Faithful port of `FFHardwareAccelerationMode` from C#.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum HardwareAccel {
     #[default]
     None,
+    Auto,
+    Vdpau,
+    Dxva2,
     Vaapi,
+    Qsv,
     Cuda,
     VideoToolbox,
     D3d11va,
+    Drm,
+    OpenCl,
+    MediaCodec,
+    Vulkan,
 }
 
 impl Default for Settings {
@@ -146,7 +157,7 @@ impl Default for Settings {
             skip_end_secs: 0.0,
             skip_end_percent: 0.0,
             max_sampling_duration_secs: 0.0,
-            thumbnail_count: 1,
+            thumbnail_count: 5,
             use_phashing: true,
             compare_horizontally_flipped: false,
             ignore_black_pixels: false,

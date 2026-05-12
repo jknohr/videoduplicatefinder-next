@@ -4,7 +4,9 @@ use dioxus::prelude::*;
 
 use crate::state::{AppState, ScanState};
 use crate::views::{
-    compare::CompareView, results::ResultsView, scan::ScanView, settings::SettingsView,
+    blacklist::BlacklistView, compare::CompareView, database::DatabaseView,
+    logs::LogsView, relocate::RelocateView, results::ResultsView, scan::ScanView,
+    settings::SettingsView, stats::StatsView,
 };
 
 /// Top-level routes.
@@ -14,8 +16,18 @@ pub enum Route {
     ScanView {},
     #[route("/results")]
     ResultsView {},
+    #[route("/stats")]
+    StatsView {},
+    #[route("/blacklist")]
+    BlacklistView {},
     #[route("/compare/:file_a/:file_b")]
     CompareView { file_a: String, file_b: String },
+    #[route("/database")]
+    DatabaseView {},
+    #[route("/relocate")]
+    RelocateView {},
+    #[route("/logs")]
+    LogsView {},
     #[route("/settings")]
     SettingsView {},
 }
@@ -39,6 +51,11 @@ pub fn Sidebar() -> Element {
         nav { class: "sidebar",
             NavLink { to: Route::ScanView {}, "Scan" }
             NavLink { to: Route::ResultsView {}, "Results" }
+            NavLink { to: Route::StatsView {}, "Stats" }
+            NavLink { to: Route::BlacklistView {}, "Blacklist" }
+            NavLink { to: Route::DatabaseView {}, "Database" }
+            NavLink { to: Route::RelocateView {}, "Relocate" }
+            NavLink { to: Route::LogsView {}, "Logs" }
             NavLink { to: Route::SettingsView {}, "Settings" }
         }
     }

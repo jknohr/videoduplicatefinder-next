@@ -1,6 +1,29 @@
 //! Global application state: loaded duplicate pairs and UI selection.
 
-use core::db::{DuplicatePair, FileRecord};
+#[cfg(feature = "server")]
+use app_core::db::{DuplicatePair, FileRecord};
+#[cfg(not(feature = "server"))]
+pub mod stubs {
+    #[derive(Debug, Clone, Default)] pub struct DuplicatePair {
+        pub file_a: String, pub file_b: String, pub similarity: f32,
+        pub clip_offset_secs: Option<f64>,
+        pub method_str: String,
+    }
+    #[derive(Debug, Clone, Default)] pub struct FileRecord {
+        pub id: String,
+        pub path: camino::Utf8PathBuf,
+        pub name: String,
+        pub size_bytes: u64,
+    }
+    impl FileRecord {
+        pub fn duration_secs(&self) -> f64 { 0.0 }
+        pub fn width(&self) -> Option<u32> { None }
+        pub fn height(&self) -> Option<u32> { None }
+        pub fn is_image(&self) -> bool { false }
+    }
+}
+#[cfg(not(feature = "server"))]
+use stubs::{DuplicatePair, FileRecord};
 
 /// A duplicate cluster: a group of files all connected by duplicate_of edges.
 ///
@@ -16,10 +39,18 @@ pub struct DuplicateCluster {
     pub max_similarity: f32,
 }
 
+/// Names of the quality criteria in user-chosen ranking order.
+///
+/// Mirrors `SettingsFile.QualityCriteriaOrder` from the C# codebase.
+/// The first entry has highest priority; unrecognised names are ignored.
+pub const ALL_CRITERIA: &[&str] = &[
+    "Duration", "Resolution", "FPS", "Bitrate", "Audio Bitrate", "Size",
+];
+
 /// Global application state provided at the App root.
 ///
 /// Provided via `use_context_provider(|| Signal::new(AppState::default()))`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AppState {
     /// All duplicate clusters loaded from SurrealDB after a scan completes.
     pub clusters: Vec<DuplicateCluster>,
@@ -29,6 +60,23 @@ pub struct AppState {
     pub sort: ResultSort,
     /// Filter: only show clusters matching this method.
     pub method_filter: Option<String>,
+    /// File IDs selected by auto-select for bulk trash/delete.
+    pub selected_for_action: Vec<String>,
+    /// User's chosen quality criterion priority order (name strings).
+    pub criteria_order: Vec<String>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            clusters: Vec::new(),
+            selected_pair: None,
+            sort: ResultSort::default(),
+            method_filter: None,
+            selected_for_action: Vec::new(),
+            criteria_order: ALL_CRITERIA.iter().map(|s| s.to_string()).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -98,6 +146,32 @@ impl AppState {
         // Default sort: highest similarity first
         self.clusters.sort_by(|a, b| {
             b.max_similarity.partial_cmp(&a.max_similarity).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    /// Remove a single file from whichever cluster contains it.
+    /// If the cluster drops below 2 files it is removed entirely.
+    pub fn remove_file(&mut self, file_id: &str) {
+        self.clusters.retain_mut(|cluster| {
+            cluster.files.retain(|f| f.id != file_id);
+            cluster.edges.retain(|e| e.file_a != file_id && e.file_b != file_id);
+            if cluster.files.len() >= 2 {
+                cluster.max_similarity = cluster
+                    .edges
+                    .iter()
+                    .map(|e| e.similarity)
+                    .fold(0f32, f32::max);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Remove the cluster that contains the given set of file IDs.
+    pub fn remove_cluster_containing(&mut self, file_ids: &[String]) {
+        self.clusters.retain(|cluster| {
+            !cluster.files.iter().any(|f| file_ids.contains(&f.id))
         });
     }
 }

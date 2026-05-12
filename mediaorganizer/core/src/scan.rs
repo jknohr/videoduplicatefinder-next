@@ -1,49 +1,86 @@
 //! Scan engine: file discovery → hash extraction → comparison → duplicate detection.
+//!
+//! Faithful port of VDF.Core/ScanEngine.cs.
+//! Three comparison phases run sequentially after hashing:
+//!   1. Visual pHash (or grayscale) — ScanForDuplicates
+//!   2. Partial clip audio fingerprint — ScanForPartialDuplicates
+//!   3. I-frame timeline — ScanForTimelineDuplicates
 
 use crate::{
     audio,
     comparison::arrays_match,
-    config::Settings,
+    config::{FolderMatchMode, Settings},
     db::{Database, DuplicatePair, FileRecord, MatchMethod},
     error::VdfResult,
     ffmpeg,
-    phash::{compute_phash, similarity as phash_similarity},
+    hardlink,
+    mpeg7,
+    phash::{compute_phash, is_duplicate as phash_is_duplicate, similarity as phash_similarity},
+    ranker,
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
-use std::sync::Arc;
-use tracing::{info, warn};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+};
+use tracing::{debug, info, warn};
 
 /// Progress event emitted during scanning.
 #[derive(Debug, Clone)]
 pub enum ScanProgress {
     FileDiscovered { path: Utf8PathBuf },
+    /// Emitted once after discovery is complete so the UI can show N/total progress.
+    DiscoveryComplete { total: usize },
     FileHashed { path: Utf8PathBuf, phash: u64 },
     ComparisonStarted { total_pairs: usize },
     DuplicateFound { file_a: String, file_b: String, similarity: f32 },
     ScanComplete { files: usize, duplicates: usize },
+    ScanAborted,
     Error { path: Utf8PathBuf, msg: String },
 }
 
 pub type ProgressCallback = Arc<dyn Fn(ScanProgress) + Send + Sync>;
 
-/// Supported video/image extensions.
+/// Supported video extensions (matches VDF.Core/FFTools/FileUtils.cs).
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg",
-    "ts", "m2ts", "mts", "vob", "3gp", "ogv", "rm", "rmvb",
+    "ts", "m2ts", "mts", "vob", "3gp", "ogv", "rm", "rmvb", "divx", "xvid",
+    "asf", "f4v", "hevc", "264", "265",
 ];
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "bmp", "gif", "webp", "tiff", "tif"];
+
+/// Threshold for activating duration-bucket optimization (matching C# bucketActivationThreshold).
+const BUCKET_ACTIVATION_THRESHOLD: usize = 5000;
+
+/// Bucket granularity in seconds (matching C# bucketSizeSeconds = 1).
+const BUCKET_SIZE_SECS: i64 = 1;
 
 pub struct ScanEngine<D: Database> {
     pub settings: Settings,
     pub db: D,
     progress: Option<ProgressCallback>,
+    /// Set to `true` to request cancellation of an in-progress scan.
+    /// Mirrors C# CancellationTokenSource.
+    pub cancel: Arc<AtomicBool>,
+    /// Set to `true` to pause; clear to `false` to resume.
+    /// Mirrors C# PauseTokenSource.
+    pub pause: Arc<AtomicBool>,
 }
 
 impl<D: Database> ScanEngine<D> {
     pub fn new(settings: Settings, db: D) -> Self {
-        Self { settings, db, progress: None }
+        Self {
+            settings,
+            db,
+            progress: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            pause: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn with_progress(mut self, cb: ProgressCallback) -> Self {
@@ -57,17 +94,281 @@ impl<D: Database> ScanEngine<D> {
         }
     }
 
-    /// Discover files, hash them, store in DB, then compare.
+    /// Returns `true` if the scan has been cancelled.
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Block until unpaused (checks every 50ms). Returns `true` if cancelled while paused.
+    fn check_pause(&self) -> bool {
+        while self.pause.load(Ordering::Relaxed) {
+            if self.cancel.load(Ordering::Relaxed) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Full scan: discover → hash → compare (four phases) → highlight best matches.
     pub fn run(&mut self) -> VdfResult<()> {
+        self.cancel.store(false, Ordering::Relaxed);
+        self.pause.store(false, Ordering::Relaxed);
+
         let paths = self.discover_files();
         info!("discovered {} files", paths.len());
+        self.emit(ScanProgress::DiscoveryComplete { total: paths.len() });
 
+        if self.is_cancelled() { self.emit(ScanProgress::ScanAborted); return Ok(()); }
         self.hash_files(&paths)?;
-        self.compare_all()?;
+
+        if self.is_cancelled() { self.emit(ScanProgress::ScanAborted); return Ok(()); }
+        self.scan_for_duplicates()?;
+
+        if self.is_cancelled() { self.emit(ScanProgress::ScanAborted); return Ok(()); }
+        if self.settings.partial_clip_detection {
+            self.scan_for_partial_duplicates()?;
+        }
+
+        if self.is_cancelled() { self.emit(ScanProgress::ScanAborted); return Ok(()); }
+        if self.settings.iframe_fingerprint {
+            self.scan_for_timeline_duplicates()?;
+        }
+
+        if self.is_cancelled() { self.emit(ScanProgress::ScanAborted); return Ok(()); }
+        if self.settings.mpeg7_signature {
+            self.scan_for_mpeg7_duplicates()?;
+        }
+
+        info!("Highlighting best matches per duplicate group");
+        self.highlight_best_matches()?;
+
+        info!("Splitting daisy-chain groups");
+        self.split_daisy_chain_groups()?;
 
         let dupes = self.db.all_duplicates()?.len();
         self.db.flush()?;
         self.emit(ScanProgress::ScanComplete { files: paths.len(), duplicates: dupes });
+        Ok(())
+    }
+
+    /// Run only the comparison phases on files that have already been hashed.
+    ///
+    /// This is the "compare-only" mode: skip re-scanning/hashing files and
+    /// proceed directly to duplicate detection and best-match annotation
+    /// against the existing DB fingerprints.
+    pub fn run_compare_only(&mut self) -> VdfResult<()> {
+        info!("compare-only: skipping hash phase, running comparison phases on existing DB");
+
+        self.scan_for_duplicates()?;
+
+        if self.settings.partial_clip_detection {
+            self.scan_for_partial_duplicates()?;
+        }
+
+        if self.settings.iframe_fingerprint {
+            self.scan_for_timeline_duplicates()?;
+        }
+
+        if self.settings.mpeg7_signature {
+            self.scan_for_mpeg7_duplicates()?;
+        }
+
+        info!("Highlighting best matches per duplicate group");
+        self.highlight_best_matches()?;
+
+        info!("Splitting daisy-chain groups");
+        self.split_daisy_chain_groups()?;
+
+        let dupes = self.db.all_duplicates()?.len();
+        self.db.flush()?;
+        let total_files = self.db.count_files()? as usize;
+        self.emit(ScanProgress::ScanComplete { files: total_files, duplicates: dupes });
+        Ok(())
+    }
+
+    /// Re-hash a single file, update its DB record, remove its old duplicate
+    /// edges, and re-run all comparison phases against every other file already
+    /// in the database.
+    ///
+    /// This is equivalent to removing the file from the DB, re-running
+    /// `hash_files([path])`, and then running all comparison phases restricted
+    /// to pairs that involve this file — but without touching any other file's
+    /// fingerprints.
+    ///
+    /// Mirrors the "quick rescan" path in C# VDF.Core.ScanEngine (GatherInfos +
+    /// ScanForDuplicates with a single-file filter).
+    pub fn rescan_file(&mut self, path: &Utf8Path) -> VdfResult<()> {
+        info!("rescan_file: re-hashing {path}");
+
+        // 1. Hash the file and upsert into DB
+        let record = match hash_one_file(path, &self.settings) {
+            Ok(r) => r,
+            Err(e) => {
+                self.emit(ScanProgress::Error { path: path.to_owned(), msg: e.to_string() });
+                return Err(e);
+            }
+        };
+        let file_id = record.id.clone();
+        self.db.upsert_file(record)?;
+        self.emit(ScanProgress::FileHashed {
+            path: path.to_owned(),
+            phash: self.db.get_file(&file_id)?.and_then(|r| r.first_phash()).unwrap_or(0),
+        });
+
+        // 2. Remove all existing duplicate edges for this file
+        self.db.remove_duplicates_of(&file_id)?;
+
+        // 3. Load the updated record + all other files to compare against
+        let target = match self.db.get_file(&file_id)? {
+            Some(r) => r,
+            None => return Ok(()), // shouldn't happen — just inserted it
+        };
+        let all_files = self.db.all_files()?;
+
+        // 4. Compare target against every other file (same logic as compare_all,
+        //    restricted to pairs involving `target`).
+        let settings = &self.settings;
+        let mut new_pairs: Vec<DuplicatePair> = Vec::new();
+
+        for other in &all_files {
+            if other.id == target.id {
+                continue;
+            }
+            // Respect folder match mode
+            if !folder_filter_passes(&target, other, settings) {
+                continue;
+            }
+            // Duration filter
+            if !duration_filter_passes(&target, other, settings) {
+                continue;
+            }
+
+            // pHash comparison
+            if settings.use_phashing {
+                let a_hashes = target.phash_hashes();
+                let b_hashes = other.phash_hashes();
+                let (shorter, longer) = if a_hashes.len() <= b_hashes.len() {
+                    (&a_hashes, &b_hashes)
+                } else {
+                    (&b_hashes, &a_hashes)
+                };
+                if let Some(m) = crate::comparison::arrays_match(
+                    shorter,
+                    longer,
+                    settings.min_similarity,
+                    1,
+                    settings.min_similarity,
+                    0,
+                ) {
+                    let (id_a, id_b) = if a_hashes.len() <= b_hashes.len() {
+                        (target.id.clone(), other.id.clone())
+                    } else {
+                        (other.id.clone(), target.id.clone())
+                    };
+                    new_pairs.push(DuplicatePair::new(
+                        id_a,
+                        id_b,
+                        m.similarity,
+                        MatchMethod::FrameSimilarity,
+                    ));
+                    continue;
+                }
+            }
+
+            // I-frame timeline comparison
+            if settings.iframe_fingerprint {
+                let a_hashes = target.iframe_hashes();
+                let b_hashes = other.iframe_hashes();
+                if !a_hashes.is_empty() && !b_hashes.is_empty() {
+                    let (shorter, longer) = if a_hashes.len() <= b_hashes.len() {
+                        (&a_hashes, &b_hashes)
+                    } else {
+                        (&b_hashes, &a_hashes)
+                    };
+                    if let Some(m) = crate::comparison::arrays_match(
+                        shorter,
+                        longer,
+                        settings.iframe_match_percent,
+                        settings.iframe_min_consecutive,
+                        settings.iframe_hash_threshold,
+                        settings.iframe_max_gap,
+                    ) {
+                        let dur_a = target.duration_secs();
+                        let dur_b = other.duration_secs();
+                        let ts_a = target.iframe_timestamps();
+                        let ts_b = other.iframe_timestamps();
+                        let clip_offset = if a_hashes.len() <= b_hashes.len() {
+                            ts_b.get(m.offset).copied()
+                        } else {
+                            ts_a.get(m.offset).copied()
+                        };
+                        let (id_a, id_b) = if dur_a >= dur_b {
+                            (target.id.clone(), other.id.clone())
+                        } else {
+                            (other.id.clone(), target.id.clone())
+                        };
+                        let mut p = DuplicatePair::new(id_a, id_b, m.similarity, MatchMethod::IframeTimeline);
+                        p.clip_offset_secs = clip_offset;
+                        p.consecutive_frames = Some(m.consecutive_run as u32);
+                        p.best_offset_idx = Some(m.offset as u32);
+                        new_pairs.push(p);
+                        continue;
+                    }
+                }
+            }
+
+            // Audio fingerprint comparison
+            if settings.partial_clip_detection {
+                let a_fp = target.audio_fingerprint();
+                let b_fp = other.audio_fingerprint();
+                if !a_fp.is_empty() && !b_fp.is_empty() {
+                    let a_u64: Vec<u64> = a_fp.iter().map(|&x| x as u64).collect();
+                    let b_u64: Vec<u64> = b_fp.iter().map(|&x| x as u64).collect();
+                    let (shorter, longer) = if a_u64.len() <= b_u64.len() {
+                        (&a_u64, &b_u64)
+                    } else {
+                        (&b_u64, &a_u64)
+                    };
+                    let dur_ratio = shorter.len() as f32 / longer.len().max(1) as f32;
+                    if dur_ratio >= settings.partial_clip_min_ratio {
+                        if let Some(m) = crate::comparison::arrays_match(
+                            shorter,
+                            longer,
+                            settings.partial_clip_min_similarity,
+                            1,
+                            settings.partial_clip_min_similarity,
+                            2,
+                        ) {
+                            let (id_a, id_b) = if a_u64.len() <= b_u64.len() {
+                                (target.id.clone(), other.id.clone())
+                            } else {
+                                (other.id.clone(), target.id.clone())
+                            };
+                            new_pairs.push(DuplicatePair::new(
+                                id_a,
+                                id_b,
+                                m.similarity,
+                                MatchMethod::AudioFingerprint,
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Store all new pairs
+        for pair in new_pairs {
+            self.emit(ScanProgress::DuplicateFound {
+                file_a: pair.file_a.clone(),
+                file_b: pair.file_b.clone(),
+                similarity: pair.similarity,
+            });
+            self.db.add_duplicate(pair)?;
+        }
+
+        self.db.flush()?;
         Ok(())
     }
 
@@ -79,23 +380,80 @@ impl<D: Database> ScanEngine<D> {
         let mut paths = Vec::new();
         for dir in &self.settings.include_dirs {
             let walker = WalkBuilder::new(dir.as_std_path())
-                .standard_filters(true)
+                .standard_filters(false) // Don't skip hidden files — VDF includes them
+                .follow_links(false)
                 .build();
+
             for entry in walker.flatten() {
-                if entry.file_type().map(|t| !t.is_file()).unwrap_or(true) {
+                let ft = match entry.file_type() {
+                    Some(ft) => ft,
+                    None => continue,
+                };
+                if !ft.is_file() {
                     continue;
                 }
+
                 let p = entry.path();
                 let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
                 let is_video = VIDEO_EXTENSIONS.contains(&ext.as_str());
-                let is_image = self.settings.include_images && IMAGE_EXTENSIONS.contains(&ext.as_str());
+                let is_image =
+                    self.settings.include_images && IMAGE_EXTENSIONS.contains(&ext.as_str());
                 if !is_video && !is_image {
                     continue;
                 }
-                let excluded = self.settings.exclude_dirs.iter().any(|ex| {
-                    p.starts_with(ex.as_std_path())
-                });
-                if excluded { continue; }
+
+                // Blacklist / exclude_dirs check
+                let excluded =
+                    self.settings.exclude_dirs.iter().any(|ex| p.starts_with(ex.as_std_path()));
+                if excluded {
+                    continue;
+                }
+
+                // File size filter
+                if self.settings.filter_by_file_size {
+                    if let Ok(meta) = std::fs::metadata(p) {
+                        let size = meta.len();
+                        if self.settings.min_file_size_bytes > 0
+                            && size < self.settings.min_file_size_bytes
+                        {
+                            continue;
+                        }
+                        if self.settings.max_file_size_bytes > 0
+                            && size > self.settings.max_file_size_bytes
+                        {
+                            continue;
+                        }
+                    }
+                }
+
+                // Path contains filter
+                if self.settings.filter_by_path_contains && !self.settings.path_contains_texts.is_empty()
+                {
+                    let path_str = p.to_string_lossy();
+                    let matches = self
+                        .settings
+                        .path_contains_texts
+                        .iter()
+                        .any(|pat| path_str.contains(pat.as_str()));
+                    if !matches {
+                        continue;
+                    }
+                }
+
+                // Path not-contains filter
+                if self.settings.filter_by_path_not_contains
+                    && !self.settings.path_not_contains_texts.is_empty()
+                {
+                    let path_str = p.to_string_lossy();
+                    let excluded_by_pattern = self
+                        .settings
+                        .path_not_contains_texts
+                        .iter()
+                        .any(|pat| path_str.contains(pat.as_str()));
+                    if excluded_by_pattern {
+                        continue;
+                    }
+                }
 
                 match Utf8PathBuf::from_path_buf(p.to_path_buf()) {
                     Ok(utf8) => {
@@ -115,20 +473,27 @@ impl<D: Database> ScanEngine<D> {
 
     fn hash_files(&mut self, paths: &[Utf8PathBuf]) -> VdfResult<()> {
         let settings = &self.settings;
+        let cancel = Arc::clone(&self.cancel);
+        let pause = Arc::clone(&self.pause);
 
-        // Process in parallel; collect results then write to DB serially
         let results: Vec<(Utf8PathBuf, VdfResult<FileRecord>)> = paths
             .par_iter()
-            .map(|path| {
+            .filter_map(|path| {
+                // Pause support (spin-wait; won't hold rayon thread pool long if unpaused quickly)
+                while pause.load(Ordering::Relaxed) {
+                    if cancel.load(Ordering::Relaxed) { return None; }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if cancel.load(Ordering::Relaxed) { return None; }
                 let record = hash_one_file(path, settings);
-                (path.clone(), record)
+                Some((path.clone(), record))
             })
             .collect();
 
         for (path, result) in results {
             match result {
                 Ok(record) => {
-                    let first_hash = record.phashes.values().next().copied();
+                    let first_hash = record.first_phash();
                     self.db.upsert_file(record)?;
                     if let Some(h) = first_hash {
                         self.emit(ScanProgress::FileHashed { path, phash: h });
@@ -143,81 +508,709 @@ impl<D: Database> ScanEngine<D> {
     }
 
     // ------------------------------------------------------------------
-    // Phase 3: pairwise comparison
+    // Phase 3a: visual pHash duplicate scan (ScanForDuplicates)
     // ------------------------------------------------------------------
 
-    fn compare_all(&mut self) -> VdfResult<()> {
+    fn scan_for_duplicates(&mut self) -> VdfResult<()> {
         let all = self.db.all_files()?;
-        let n = all.len();
-        let total_pairs = n * (n.saturating_sub(1)) / 2;
+
+        let (mut images, mut videos): (Vec<_>, Vec<_>) =
+            all.into_iter().partition(|f| f.is_image());
+
+        // Filter out files with no hash data
+        images.retain(|f| !f.phash_hashes().is_empty());
+        videos.retain(|f| !f.phash_hashes().is_empty());
+
+        let total = images.len() + videos.len();
+        let total_pairs = total * total.saturating_sub(1) / 2;
         self.emit(ScanProgress::ComparisonStarted { total_pairs });
 
         self.db.clear_duplicates()?;
 
         let settings = &self.settings;
-        let mut pairs: Vec<DuplicatePair> = Vec::new();
+        let pairs: Arc<Mutex<Vec<DuplicatePair>>> = Arc::new(Mutex::new(Vec::new()));
 
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let a = &all[i];
-                let b = &all[j];
+        // Group representatives for preventing daisy-chain merges.
+        // Maps group_id → index in the unified scan list.
+        let group_reps: Arc<Mutex<HashMap<u64, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+        // Map path → group_id for existing duplicate entries.
+        let path_to_group: Arc<Mutex<HashMap<String, u64>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let next_group_id = AtomicU64::new(1);
 
-                // Duration pre-filter: use percentage-based tolerance matching C#
-                if let (Some(ia), Some(ib)) = (&a.media_info, &b.media_info) {
-                    let longer_dur = ia.duration_secs.max(ib.duration_secs);
-                    let diff = (ia.duration_secs - ib.duration_secs).abs();
-                    let tolerance = settings.duration_tolerance_secs(longer_dur);
-                    if tolerance > 0.0 && diff > tolerance {
-                        continue;
+        // Merge helper closure (mirrors C# MergeDuplicate)
+        let try_merge = |rec_a: &FileRecord,
+                         rec_b: &FileRecord,
+                         sim: f32,
+                         method: MatchMethod,
+                         offset: Option<f64>,
+                         is_flipped: bool,
+                         all_recs: &[FileRecord],
+                         pairs_lock: &Arc<Mutex<Vec<DuplicatePair>>>,
+                         p2g: &Arc<Mutex<HashMap<String, u64>>>,
+                         greps: &Arc<Mutex<HashMap<u64, usize>>>,
+                         gid_counter: &AtomicU64,
+                         settings: &Settings| {
+            let mut p2g_map = p2g.lock().unwrap();
+            let mut greps_map = greps.lock().unwrap();
+            let path_a = rec_a.path.to_string();
+            let path_b = rec_b.path.to_string();
+
+            let found_a = p2g_map.get(&path_a).copied();
+            let found_b = p2g_map.get(&path_b).copied();
+
+            match (found_a, found_b) {
+                (Some(ga), Some(gb)) => {
+                    if ga != gb {
+                        // Merging two groups: verify representatives are similar
+                        let rep_a_idx = greps_map.get(&ga).copied();
+                        let rep_b_idx = greps_map.get(&gb).copied();
+                        if let (Some(ia), Some(ib)) = (rep_a_idx, rep_b_idx) {
+                            if ia < all_recs.len() && ib < all_recs.len() {
+                                let ra = &all_recs[ia];
+                                let rb = &all_recs[ib];
+                                if !phash_check_duplicate(ra, rb, settings) {
+                                    return; // Representatives not similar — block merge
+                                }
+                            }
+                        }
+                        // Reassign all gb members to ga
+                        for gid in p2g_map.values_mut() {
+                            if *gid == gb {
+                                *gid = ga;
+                            }
+                        }
+                        greps_map.remove(&gb);
                     }
                 }
+                (Some(ga), None) => {
+                    // Verify against existing group representative
+                    if let Some(&rep_idx) = greps_map.get(&ga) {
+                        if rep_idx < all_recs.len()
+                            && !phash_check_duplicate(&all_recs[rep_idx], rec_b, settings)
+                        {
+                            return;
+                        }
+                    }
+                    p2g_map.insert(path_b.clone(), ga);
+                }
+                (None, Some(gb)) => {
+                    // Verify against existing group representative
+                    if let Some(&rep_idx) = greps_map.get(&gb) {
+                        if rep_idx < all_recs.len()
+                            && !phash_check_duplicate(&all_recs[rep_idx], rec_a, settings)
+                        {
+                            return;
+                        }
+                    }
+                    p2g_map.insert(path_a.clone(), gb);
+                }
+                (None, None) => {
+                    let gid = gid_counter.fetch_add(1, Ordering::Relaxed);
+                    p2g_map.insert(path_a.clone(), gid);
+                    p2g_map.insert(path_b.clone(), gid);
+                    // Representative is always rec_a (first of the pair, lower scan index)
+                    let rep_idx = all_recs.iter().position(|r| r.path == rec_a.path).unwrap_or(0);
+                    greps_map.insert(gid, rep_idx);
+                }
+            }
 
-                // --- Standard pHash comparison ---
-                if let Some(pair) = compare_phash(a, b, settings.min_similarity) {
-                    self.emit(ScanProgress::DuplicateFound {
-                        file_a: a.path.to_string(),
-                        file_b: b.path.to_string(),
-                        similarity: pair.similarity,
-                    });
-                    pairs.push(pair);
-                    continue; // already matched; skip heavier methods
+            let mut new_pair = DuplicatePair::new(rec_a.id.clone(), rec_b.id.clone(), sim, method);
+            new_pair.clip_offset_secs = offset;
+            new_pair.is_flipped = is_flipped;
+            pairs_lock.lock().unwrap().push(new_pair);
+        };
+
+        // Compare images (always linear, no buckets)
+        compare_images(
+            &images,
+            settings,
+            &pairs,
+            &path_to_group,
+            &group_reps,
+            &next_group_id,
+            &try_merge,
+        );
+
+        // Compare videos (bucketed for large datasets)
+        if videos.len() < BUCKET_ACTIVATION_THRESHOLD {
+            compare_videos_linear(
+                &videos,
+                settings,
+                &pairs,
+                &path_to_group,
+                &group_reps,
+                &next_group_id,
+                &try_merge,
+            );
+        } else {
+            compare_videos_bucketed(
+                &videos,
+                settings,
+                &pairs,
+                &path_to_group,
+                &group_reps,
+                &next_group_id,
+                &try_merge,
+            );
+        }
+
+        let found_pairs = pairs.lock().unwrap().clone();
+        for pair in found_pairs {
+            if self.db.pair_is_blacklisted(&pair.file_a, &pair.file_b)
+                .unwrap_or(false)
+            {
+                debug!("skipping blacklisted pair {} ↔ {}", pair.file_a, pair.file_b);
+                continue;
+            }
+            self.emit(ScanProgress::DuplicateFound {
+                file_a: pair.file_a.clone(),
+                file_b: pair.file_b.clone(),
+                similarity: pair.similarity,
+            });
+            self.db.add_duplicate(pair)?;
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3b: partial clip audio fingerprint scan
+    // ------------------------------------------------------------------
+
+    fn scan_for_partial_duplicates(&mut self) -> VdfResult<()> {
+        let all = self.db.all_files()?;
+
+        // Eligible: has non-empty, non-silent audio fingerprint
+        let mut candidates: Vec<FileRecord> = all
+            .into_iter()
+            .filter(|f| {
+                if f.is_image() {
+                    return false;
+                }
+                let fp = f.audio_fingerprint();
+                !fp.is_empty() && !is_silent_fingerprint(&fp)
+            })
+            .collect();
+
+        if candidates.len() < 2 {
+            return Ok(());
+        }
+
+        // Sort longest first (matching C# OrderByDescending duration)
+        candidates.sort_by(|a, b| {
+            b.duration_secs()
+                .partial_cmp(&a.duration_secs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let sim_threshold = self.settings.partial_clip_min_similarity;
+
+        let mut new_pairs = Vec::new();
+
+        for i in 0..candidates.len().saturating_sub(1) {
+            let source = &candidates[i];
+            let source_sec = source.duration_secs();
+            if source_sec < 1.0 {
+                continue;
+            }
+            let source_fp = source.audio_fingerprint();
+
+            for j in (i + 1)..candidates.len() {
+                let clip = &candidates[j];
+                let clip_sec = clip.duration_secs();
+                if clip_sec < 1.0 {
+                    continue;
+                }
+                let clip_fp = clip.audio_fingerprint();
+
+                // Pre-filter: clip must be shorter than source (sorted desc, so j > i is shorter)
+                if clip_fp.len() >= source_fp.len() {
+                    continue;
                 }
 
-                // --- I-frame timeline comparison ---
-                if settings.iframe_fingerprint
-                    && !a.iframe_phashes.is_empty()
-                    && !b.iframe_phashes.is_empty()
-                {
-                    if let Some(pair) = compare_iframe_timeline(a, b, settings) {
-                        self.emit(ScanProgress::DuplicateFound {
-                            file_a: a.path.to_string(),
-                            file_b: b.path.to_string(),
-                            similarity: pair.similarity,
-                        });
-                        pairs.push(pair);
-                        continue;
-                    }
+                // Pre-filter: clip < 95% of source length (visual dup handles the rest)
+                if clip_sec / source_sec >= 0.95 {
+                    continue;
                 }
 
-                // --- Audio fingerprint comparison ---
-                if settings.partial_clip_detection
-                    && !a.audio_fingerprint.is_empty()
-                    && !b.audio_fingerprint.is_empty()
-                {
-                    if let Some(pair) = compare_audio(a, b, settings) {
-                        self.emit(ScanProgress::DuplicateFound {
-                            file_a: a.path.to_string(),
-                            file_b: b.path.to_string(),
-                            similarity: pair.similarity,
-                        });
-                        pairs.push(pair);
-                    }
+                let (sim, offset_secs) =
+                    audio::fingerprint_sliding_window(&clip_fp, &source_fp, sim_threshold);
+
+                if sim >= sim_threshold {
+                    let mut pair = DuplicatePair::new(
+                        source.id.clone(),
+                        clip.id.clone(),
+                        sim,
+                        MatchMethod::AudioFingerprint,
+                    );
+                    pair.clip_offset_secs = Some(offset_secs as f64);
+                    new_pairs.push(pair);
                 }
             }
         }
 
-        for pair in pairs {
+        for pair in new_pairs {
+            if self.db.pair_is_blacklisted(&pair.file_a, &pair.file_b)
+                .unwrap_or(false)
+            {
+                debug!("skipping blacklisted audio pair {} ↔ {}", pair.file_a, pair.file_b);
+                continue;
+            }
+            self.emit(ScanProgress::DuplicateFound {
+                file_a: pair.file_a.clone(),
+                file_b: pair.file_b.clone(),
+                similarity: pair.similarity,
+            });
             self.db.add_duplicate(pair)?;
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3c: I-frame timeline scan
+    // ------------------------------------------------------------------
+
+    fn scan_for_timeline_duplicates(&mut self) -> VdfResult<()> {
+        let all = self.db.all_files()?;
+        let candidates: Vec<FileRecord> = all
+            .into_iter()
+            .filter(|f| !f.is_image() && f.iframe_hashes().len() >= 2)
+            .collect();
+
+        if candidates.len() < 2 {
+            return Ok(());
+        }
+
+        info!("I-frame timeline scan: {} videos with fingerprints", candidates.len());
+
+        let settings = &self.settings;
+        let mut new_pairs = Vec::new();
+
+        for i in 0..candidates.len().saturating_sub(1) {
+            let a = &candidates[i];
+            for j in (i + 1)..candidates.len() {
+                let b = &candidates[j];
+
+                // Temporal avg hash pre-filter: if both files have hashes and
+                // Hamming distance is > 25 bits (out of 64), skip expensive I-frame scan.
+                if settings.temporal_avg_hash {
+                    if let (Some(ha), Some(hb)) = (a.temporal_avg_hash(), b.temporal_avg_hash()) {
+                        let distance = (ha ^ hb).count_ones();
+                        if distance > 25 {
+                            continue;
+                        }
+                    }
+                }
+
+                let a_hashes = a.iframe_hashes();
+                let b_hashes = b.iframe_hashes();
+                let (shorter, longer, short_rec, long_rec) =
+                    if a_hashes.len() <= b_hashes.len() {
+                        (a_hashes, b_hashes, a, b)
+                    } else {
+                        (b_hashes, a_hashes, b, a)
+                    };
+
+                let result = arrays_match(
+                    &shorter,
+                    &longer,
+                    settings.iframe_match_percent,
+                    settings.iframe_min_consecutive,
+                    settings.iframe_hash_threshold,
+                    settings.iframe_max_gap,
+                );
+
+                if let Some(r) = result {
+                    let long_ts = long_rec.iframe_timestamps();
+                    let offset_secs = if !long_ts.is_empty() {
+                        let idx = r.offset.min(long_ts.len() - 1);
+                        long_ts[idx]
+                    } else {
+                        r.offset as f64 * settings.iframe_sample_interval_secs
+                    };
+
+                    info!(
+                        "[Timeline] {} in {}: sim={:.1}%, offset={:.1}s",
+                        short_rec.path.file_name().unwrap_or("?"),
+                        long_rec.path.file_name().unwrap_or("?"),
+                        r.similarity * 100.0,
+                        offset_secs,
+                    );
+
+                    let mut pair = DuplicatePair::new(
+                        long_rec.id.clone(),
+                        short_rec.id.clone(),
+                        r.similarity,
+                        MatchMethod::IframeTimeline,
+                    );
+                    pair.clip_offset_secs = Some(offset_secs);
+                    pair.consecutive_frames = Some(r.consecutive_run as u32);
+                    new_pairs.push(pair);
+                }
+            }
+        }
+
+        for pair in new_pairs {
+            if self.db.pair_is_blacklisted(&pair.file_a, &pair.file_b)
+                .unwrap_or(false)
+            {
+                debug!("skipping blacklisted timeline pair {} ↔ {}", pair.file_a, pair.file_b);
+                continue;
+            }
+            self.emit(ScanProgress::DuplicateFound {
+                file_a: pair.file_a.clone(),
+                file_b: pair.file_b.clone(),
+                similarity: pair.similarity,
+            });
+            self.db.add_duplicate(pair)?;
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3d: MPEG-7 signature comparison
+    // ------------------------------------------------------------------
+
+    fn scan_for_mpeg7_duplicates(&mut self) -> VdfResult<()> {
+        let ffmpeg_path = match which_ffmpeg() {
+            Some(p) => p,
+            None => {
+                warn!("ffmpeg not found in PATH — skipping MPEG-7 phase");
+                return Ok(());
+            }
+        };
+
+        let all = self.db.all_files()?;
+        // Only files that already have an mpeg7_sig_path stored, or that we can
+        // extract a signature for right now.
+        let candidates: Vec<(FileRecord, std::path::PathBuf)> = all
+            .into_iter()
+            .filter(|f| !f.is_image())
+            .filter_map(|f| {
+                // Check for stored sig path in fingerprints, then fall back to extraction.
+                let sig = f.mpeg7_sig_path()
+                    .map(std::path::PathBuf::from)
+                    .filter(|p| p.exists() && p.metadata().map(|m| m.len() > 0).unwrap_or(false))
+                    .or_else(|| {
+                        mpeg7::extract_signature(f.path.as_std_path(), &ffmpeg_path, false)
+                    })?;
+                Some((f, sig))
+            })
+            .collect();
+
+        if candidates.len() < 2 {
+            return Ok(());
+        }
+
+        info!("MPEG-7 signature scan: {} videos with signatures", candidates.len());
+
+        let mut new_pairs = Vec::new();
+
+        for i in 0..candidates.len().saturating_sub(1) {
+            let (a, sig_a) = &candidates[i];
+            let dur_a = a.duration_secs();
+
+            for j in (i + 1)..candidates.len() {
+                let (b, sig_b) = &candidates[j];
+
+                // Hard-link exclusion
+                if self.settings.exclude_hard_links
+                    && hardlink::are_same_file(a.path.as_std_path(), b.path.as_std_path())
+                {
+                    continue;
+                }
+
+                // Duration pre-filter (avoid O(n²) FFmpeg comparisons)
+                let dur_b = b.duration_secs();
+                if dur_a > 0.0 && dur_b > 0.0 {
+                    let shorter = dur_a.min(dur_b);
+                    let longer = dur_a.max(dur_b);
+                    let tol = self.settings.percent_duration_difference / 100.0;
+                    if tol > 0.0 && (longer - shorter) / longer > tol * 2.0 {
+                        continue;
+                    }
+                }
+
+                let result = mpeg7::compare_signatures(sig_a, sig_b, &ffmpeg_path, false);
+                if !result.is_match {
+                    continue;
+                }
+
+                info!(
+                    "[MPEG-7] {} ↔ {}: offset={:.1}s",
+                    a.path.file_name().unwrap_or("?"),
+                    b.path.file_name().unwrap_or("?"),
+                    result.offset_secs,
+                );
+
+                let (long_rec, short_rec) = if dur_a >= dur_b { (a, b) } else { (b, a) };
+                let mut pair = DuplicatePair::new(
+                    long_rec.id.clone(),
+                    short_rec.id.clone(),
+                    1.0, // MPEG-7 match is binary — confidence is always 1.0
+                    MatchMethod::Mpeg7Signature,
+                );
+                pair.clip_offset_secs = Some(result.offset_secs);
+                new_pairs.push(pair);
+            }
+        }
+
+        for pair in new_pairs {
+            if self.db.pair_is_blacklisted(&pair.file_a, &pair.file_b)
+                .unwrap_or(false)
+            {
+                debug!("skipping blacklisted MPEG-7 pair {} ↔ {}", pair.file_a, pair.file_b);
+                continue;
+            }
+            self.emit(ScanProgress::DuplicateFound {
+                file_a: pair.file_a.clone(),
+                file_b: pair.file_b.clone(),
+                similarity: pair.similarity,
+            });
+            self.db.add_duplicate(pair)?;
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 4: highlight best matches per group
+    // ------------------------------------------------------------------
+
+    /// For each duplicate cluster, compute quality flags and store them back
+    /// to the DB via upsert_file.  Mirrors C# ScanEngine.HighlightBestMatches().
+    fn highlight_best_matches(&mut self) -> VdfResult<()> {
+        let all_files = self.db.all_files()?;
+        let all_pairs = self.db.all_duplicates()?;
+
+        // Build path → FileRecord map for fast lookup.
+        let file_map: HashMap<String, FileRecord> =
+            all_files.into_iter().map(|f| (f.id.clone(), f)).collect();
+
+        // Union-Find to group files by cluster.
+        let mut parent: HashMap<String, String> = HashMap::new();
+        for id in file_map.keys() {
+            parent.insert(id.clone(), id.clone());
+        }
+        let find = |parent: &mut HashMap<String, String>, mut x: String| -> String {
+            while parent.get(&x).map(|p| p != &x).unwrap_or(false) {
+                let p = parent[&x].clone();
+                let gp = parent.get(&p).cloned().unwrap_or(p.clone());
+                parent.insert(x.clone(), gp.clone());
+                x = gp;
+            }
+            x
+        };
+
+        for pair in &all_pairs {
+            let ra = find(&mut parent, pair.file_a.clone());
+            let rb = find(&mut parent, pair.file_b.clone());
+            if ra != rb {
+                parent.insert(rb, ra);
+            }
+        }
+
+        // Collect clusters: root → [file_ids].
+        let mut clusters: HashMap<String, Vec<String>> = HashMap::new();
+        for id in file_map.keys() {
+            let root = find(&mut parent, id.clone());
+            clusters.entry(root).or_default().push(id.clone());
+        }
+
+        let _criteria = ranker::default_criteria();
+
+        for (_root, member_ids) in &clusters {
+            if member_ids.len() < 2 {
+                continue; // no quality annotation needed for singletons
+            }
+            let members: Vec<FileRecord> = member_ids
+                .iter()
+                .filter_map(|id| file_map.get(id).cloned())
+                .collect();
+
+            let flags_vec = ranker::compute_best_flags(&members);
+
+            for (record, flags) in members.iter().zip(flags_vec.iter()) {
+                // Persist flags to analysis sub-document via DB upsert.
+                let mut updated = record.clone();
+                let analysis = updated.analysis.get_or_insert_with(Default::default);
+                analysis.best_flags = Some(flags.clone());
+                self.db.upsert_file(updated)?;
+            }
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 5: daisy-chain group splitting
+    // ------------------------------------------------------------------
+
+    /// For groups with 3+ members, split "daisy-chain" groups where A≈B≈C but A≉C.
+    ///
+    /// Builds a pairwise similarity matrix, then iteratively prunes the
+    /// least-connected member until every remaining member is similar to at
+    /// least half of the group.  Pruned items form their own sub-groups.
+    ///
+    /// Mirrors `VDF.Core/ScanEngine.SplitDaisyChainGroups`.
+    fn split_daisy_chain_groups(&mut self) -> VdfResult<()> {
+        let all_files = self.db.all_files()?;
+        let all_pairs = self.db.all_duplicates()?;
+
+        if all_pairs.is_empty() {
+            return Ok(());
+        }
+
+        // Build id → FileRecord map.
+        let file_map: HashMap<String, FileRecord> =
+            all_files.into_iter().map(|f| (f.id.clone(), f)).collect();
+
+        // Union-Find to collect duplicate clusters.
+        let mut parent: HashMap<String, String> = HashMap::new();
+        let find_root = |parent: &mut HashMap<String, String>, mut x: String| -> String {
+            loop {
+                let p = parent.get(&x).cloned().unwrap_or_else(|| x.clone());
+                if p == x {
+                    break;
+                }
+                let gp = parent.get(&p).cloned().unwrap_or_else(|| p.clone());
+                parent.insert(x.clone(), gp.clone());
+                x = gp;
+            }
+            x
+        };
+
+        for pair in &all_pairs {
+            parent.entry(pair.file_a.clone()).or_insert_with(|| pair.file_a.clone());
+            parent.entry(pair.file_b.clone()).or_insert_with(|| pair.file_b.clone());
+            let ra = find_root(&mut parent, pair.file_a.clone());
+            let rb = find_root(&mut parent, pair.file_b.clone());
+            if ra != rb {
+                parent.insert(rb, ra);
+            }
+        }
+
+        // Collect group → [member ids].
+        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+        for id in parent.keys().cloned().collect::<Vec<_>>() {
+            let root = find_root(&mut parent, id.clone());
+            groups.entry(root).or_default().push(id);
+        }
+
+        // Only process groups with 3+ members.
+        let large_groups: Vec<Vec<String>> = groups
+            .into_values()
+            .filter(|g| g.len() >= 3)
+            .collect();
+
+        if large_groups.is_empty() {
+            return Ok(());
+        }
+
+        let settings = self.settings.clone();
+        let mut groups_split = 0usize;
+
+        for group_ids in large_groups {
+            let n = group_ids.len();
+
+            // Resolve FileRecords; skip if any are missing.
+            let entries: Vec<FileRecord> = group_ids
+                .iter()
+                .filter_map(|id| file_map.get(id).cloned())
+                .collect();
+            if entries.len() != n {
+                continue;
+            }
+
+            // Build pairwise similarity matrix.
+            let mut similar = vec![vec![false; n]; n];
+            for i in 0..n {
+                similar[i][i] = true;
+                for j in (i + 1)..n {
+                    let is_sim = phash_check_duplicate(&entries[i], &entries[j], &settings);
+                    similar[i][j] = is_sim;
+                    similar[j][i] = is_sim;
+                }
+            }
+
+            // Iterative pruning: remove least-connected until all have ≥ half connections.
+            let mut active: Vec<usize> = (0..n).collect();
+            let mut pruned: Vec<usize> = Vec::new();
+
+            loop {
+                if active.len() < 2 {
+                    break;
+                }
+                // Count connections for each active member.
+                let worst_idx = active.iter().enumerate().min_by_key(|&(ai, &idx)| {
+                    active.iter().enumerate()
+                        .filter(|&(aj, &jdx)| ai != aj && similar[idx][jdx])
+                        .count()
+                });
+                let (worst_ai, &worst_idx_val) = match worst_idx {
+                    Some(x) => x,
+                    None => break,
+                };
+                let connections = active.iter().enumerate()
+                    .filter(|&(ai, &jdx)| ai != worst_ai && similar[worst_idx_val][jdx])
+                    .count();
+                // Required: ceil((active.len() - 1) / 2)
+                let required = (active.len() - 1 + 1) / 2;
+                if connections < required {
+                    pruned.push(active.remove(worst_ai));
+                } else {
+                    break; // Everyone is sufficiently connected.
+                }
+            }
+
+            if pruned.is_empty() {
+                continue;
+            }
+
+            groups_split += 1;
+
+            // Assign new group IDs by re-RELATEing edges.
+            // For the surviving core: delete old edges and re-add with new group context.
+            // In our DB model, duplicate_of edges ARE the group membership — so we delete
+            // edges involving pruned members and re-add them with updated similarity if needed.
+            //
+            // For pruned members: form connected components among them.
+            let mut visited: Vec<bool> = vec![false; pruned.len()];
+            for seed_pos in 0..pruned.len() {
+                if visited[seed_pos] {
+                    continue;
+                }
+                let mut component = vec![pruned[seed_pos]];
+                visited[seed_pos] = true;
+                let mut queue = std::collections::VecDeque::from([seed_pos]);
+                while let Some(cur_pos) = queue.pop_front() {
+                    let cur = pruned[cur_pos];
+                    for (other_pos, &other) in pruned.iter().enumerate() {
+                        if !visited[other_pos] && similar[cur][other] {
+                            visited[other_pos] = true;
+                            component.push(other);
+                            queue.push_back(other_pos);
+                        }
+                    }
+                }
+
+                if component.len() < 2 {
+                    // Singleton pruned member — remove all its duplicate edges.
+                    let lone_id = &entries[component[0]].id;
+                    self.db.remove_file(lone_id)?;
+                }
+                // Sub-groups with 2+ members are left as-is in the DB;
+                // their existing edges are still valid — they just no longer
+                // belong to the main cluster.
+            }
+
+            debug!(
+                "split_daisy_chain_groups: split 1 group ({} members, {} pruned)",
+                n,
+                pruned.len()
+            );
+        }
+
+        if groups_split > 0 {
+            info!("split_daisy_chain_groups: split {} group(s)", groups_split);
         }
         Ok(())
     }
@@ -231,24 +1224,112 @@ fn hash_one_file(path: &Utf8Path, settings: &Settings) -> VdfResult<FileRecord> 
     let size = std::fs::metadata(path)?.len();
     let mut record = FileRecord::new(path.to_owned(), size);
 
+    let is_image = record.is_image();
+
+    if is_image {
+        // Load image, resize to 32×32, extract grayscale bytes
+        if let Ok(gray) = load_image_as_gray32(path) {
+            // TooDark check: mirrors GrayBytesUtils.VerifyGrayScaleValues.
+            // 80% or more pixels < 0x20 → mark as too dark, skip hashing.
+            if is_too_dark(&gray) {
+                warn!("image too dark, skipping pHash: {path}");
+                let analysis = record.analysis.get_or_insert_with(Default::default);
+                analysis.is_too_dark = true;
+                return Ok(record);
+            }
+            let h = compute_phash(&gray);
+            let mut map = std::collections::HashMap::new();
+            map.insert(0u64, h);
+            record.set_phash_from_map(&map);
+        } else {
+            return Err(crate::error::VdfError::FfmpegGeneral {
+                code: -1,
+                msg: format!("failed to load image: {path}"),
+            });
+        }
+        return Ok(record);
+    }
+
     // Probe media info
     let info = ffmpeg::probe_media(path)?;
     let duration = info.duration_secs;
-    record.media_info = Some(info);
+    record.set_media_info(info);
 
-    // Standard pHash samples
-    let timestamps = settings.sample_timestamps(duration, 5); // 5 sample positions
+    // Scene-aware skip: detect intro end via FFmpeg scdet filter,
+    // then offset effective_skip_start by the first detected scene change.
+    let effective_start = if settings.scene_aware_skip {
+        let scenes = ffmpeg::get_scene_change_timestamps(
+            path,
+            settings.scene_detection_threshold,
+            settings.scene_skip_count + 4, // fetch a few extra; we take only Nth
+            settings.hardware_accel,
+        );
+        // Take the Nth scene cut (skip_count = how many intros to skip)
+        let offset = scenes
+            .get(settings.scene_skip_count.saturating_sub(1))
+            .copied()
+            .unwrap_or(0.0);
+        // Use the larger of computed scene offset and the normal skip
+        offset.max(settings.effective_skip_start(duration))
+    } else {
+        settings.effective_skip_start(duration)
+    };
+
+    // Standard pHash samples using the configured thumbnail count
+    let timestamps = settings.sample_timestamps(duration, settings.thumbnail_count);
     let frames = ffmpeg::extract_gray_frames(
         path,
         &timestamps,
-        settings.effective_skip_start(duration),
+        effective_start,
         settings.effective_skip_end(duration),
+        settings.hardware_accel,
     )?;
-    for (ts_ms, gray) in frames {
-        record.phashes.insert(ts_ms, compute_phash(&gray));
+
+    // Build phash map; also compute flipped hashes when enabled
+    let mut phash_map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut flipped_map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for (ts, gray) in &frames {
+        phash_map.insert(*ts, compute_phash(gray));
+        if settings.compare_horizontally_flipped {
+            let flipped = ffmpeg::flip_gray_horizontal(gray);
+            flipped_map.insert(*ts, compute_phash(&flipped));
+        }
     }
 
-    // I-frame timeline
+    if settings.compare_horizontally_flipped {
+        record.set_phash_from_map_with_flipped(&phash_map, Some(&flipped_map));
+    } else {
+        record.set_phash_from_map(&phash_map);
+    }
+
+    // Temporal average hash (fast pre-filter for I-frame timeline comparison)
+    if settings.temporal_avg_hash {
+        match ffmpeg::extract_temporal_average_hash(
+            path,
+            settings.temporal_avg_start_secs,
+            settings.temporal_avg_window_secs,
+            duration,
+            settings.hardware_accel,
+        ) {
+            Some(gray) => {
+                let hash = crate::phash::compute_phash(&gray);
+                record.set_temporal_avg_hash(hash);
+            }
+            None => warn!("temporal avg hash returned nothing for {path}"),
+        }
+    }
+
+    // MPEG-7 signature extraction
+    if settings.mpeg7_signature {
+        if let Some(ffmpeg_path) = ffmpeg::which_ffmpeg() {
+            let sig_path = mpeg7::extract_signature(path.as_std_path(), &ffmpeg_path, false);
+            if let Some(sig) = sig_path {
+                record.set_mpeg7_sig_path(sig.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    // I-frame timeline fingerprint
     if settings.iframe_fingerprint {
         let ts_list = ffmpeg::extract_iframe_timestamps(
             path,
@@ -262,15 +1343,26 @@ fn hash_one_file(path: &Utf8Path, settings: &Settings) -> VdfResult<FileRecord> 
             &ts_list,
             settings.effective_skip_start(duration),
             settings.effective_skip_end(duration),
+            settings.hardware_accel,
         )?;
-        record.iframe_timestamps = ts_list;
-        record.iframe_phashes = gray_frames.values().map(|g| compute_phash(g)).collect();
+        let iframe_hashes: Vec<u64> = gray_frames.values().map(|g| compute_phash(g)).collect();
+        record.set_iframe_fingerprint(ts_list, iframe_hashes);
     }
 
     // Audio fingerprint
     if settings.partial_clip_detection {
-        if let Ok(Some(fp)) = audio::compute_fingerprint(path) {
-            record.audio_fingerprint = fp;
+        match audio::compute_fingerprint(path) {
+            Ok(Some(fp)) => {
+                if is_silent_fingerprint(&fp) {
+                    // Silent tracks produce all-zero fingerprints that match any other
+                    // silent track at 100% — store empty to skip in comparison.
+                    warn!("silent audio fingerprint detected, skipping: {path}");
+                } else {
+                    record.set_audio_fingerprint(fp);
+                }
+            }
+            Ok(None) => {} // no audio stream
+            Err(e) => warn!("audio fingerprint failed for {path}: {e}"),
         }
     }
 
@@ -278,95 +1370,400 @@ fn hash_one_file(path: &Utf8Path, settings: &Settings) -> VdfResult<FileRecord> 
 }
 
 // ---------------------------------------------------------------------------
-// Comparison helpers
+// FFmpeg binary discovery (delegates to ffmpeg module)
 // ---------------------------------------------------------------------------
 
-fn compare_phash(a: &FileRecord, b: &FileRecord, min_sim: f32) -> Option<DuplicatePair> {
-    if a.phashes.is_empty() || b.phashes.is_empty() {
-        return None;
+use crate::ffmpeg::which_ffmpeg;
+
+/// Load any image file as a 32×32 grayscale array using the `image` crate.
+fn load_image_as_gray32(path: &Utf8Path) -> VdfResult<Box<[u8; 1024]>> {
+    use fast_image_resize::images::Image;
+    use fast_image_resize::{PixelType, ResizeAlg, ResizeOptions, Resizer};
+
+    let img = image::open(path.as_std_path())
+        .map_err(|e| crate::error::VdfError::FfmpegGeneral { code: -1, msg: e.to_string() })?;
+    let rgb = img.to_rgb8();
+    let (w, h) = (rgb.width(), rgb.height());
+    let rgb_flat = rgb.into_raw();
+
+    let src = Image::from_vec_u8(w, h, rgb_flat, PixelType::U8x3)
+        .map_err(|e| crate::error::VdfError::FfmpegGeneral { code: -1, msg: e.to_string() })?;
+    let mut dst = Image::new(32, 32, PixelType::U8x3);
+    let mut resizer = Resizer::new();
+    resizer
+        .resize(&src, &mut dst, &ResizeOptions::new().resize_alg(ResizeAlg::Nearest))
+        .map_err(|e| crate::error::VdfError::FfmpegGeneral { code: -1, msg: e.to_string() })?;
+
+    let buf = dst.buffer();
+    let mut gray = Box::new([0u8; 1024]);
+    for i in 0..1024usize {
+        let r = buf[i * 3] as u32;
+        let g = buf[i * 3 + 1] as u32;
+        let b = buf[i * 3 + 2] as u32;
+        gray[i] = ((r * 299 + g * 587 + b * 114) / 1000) as u8;
     }
-    // Compare all same-index positions and average
-    let mut total = 0f32;
-    let mut count = 0usize;
-    for (&ts, &ha) in &a.phashes {
-        if let Some(&hb) = b.phashes.get(&ts) {
-            total += phash_similarity(ha, hb);
-            count += 1;
+    Ok(gray)
+}
+
+// ---------------------------------------------------------------------------
+// Silent fingerprint detection (port of ScanEngine.IsSilentFingerprint)
+// ---------------------------------------------------------------------------
+
+/// Returns true when every block in the fingerprint is zero.
+/// Silent tracks produce uniform-zero fingerprints that match any other silent
+/// track at 100%, causing false-positive partial-clip groups.
+pub fn is_silent_fingerprint(fp: &[u32]) -> bool {
+    if fp.is_empty() {
+        return false;
+    }
+    fp.iter().all(|&b| b == 0)
+}
+
+// ---------------------------------------------------------------------------
+// TooDark detection (port of GrayBytesUtils.VerifyGrayScaleValues)
+// ---------------------------------------------------------------------------
+
+/// Pixel brightness threshold below which a pixel is considered "dark".
+/// Matches C# `BlackPixelLimit = 0x20`.
+const BLACK_PIXEL_LIMIT: u8 = 0x20;
+
+/// Percentage of dark pixels that classifies a frame as "too dark" (image rejected).
+/// Matches C# `darkPercent = 80` default.
+const TOO_DARK_PERCENT: f64 = 80.0;
+
+/// Returns `true` when 80% or more of the 32×32 grayscale pixels are below 0x20.
+/// Mirrors `GrayBytesUtils.VerifyGrayScaleValues` (returns false when too dark).
+pub fn is_too_dark(gray: &[u8; 1024]) -> bool {
+    let dark_pixels = gray.iter().filter(|&&b| b <= BLACK_PIXEL_LIMIT).count();
+    100.0 / gray.len() as f64 * dark_pixels as f64 >= TOO_DARK_PERCENT
+}
+
+// ---------------------------------------------------------------------------
+// Folder match mode helper (port of ScanEngine.SameFolderAtDepth)
+// ---------------------------------------------------------------------------
+
+/// Returns true when the last `depth` path segments of both folder paths are equal.
+fn same_folder_at_depth(a: &str, b: &str, depth: usize) -> bool {
+    fn segments(s: &str) -> Vec<&str> {
+        s.split(std::path::MAIN_SEPARATOR).filter(|seg| !seg.is_empty()).collect()
+    }
+    let sa = segments(a);
+    let sb = segments(b);
+    for i in 0..depth {
+        let ai = sa.len().checked_sub(i + 1);
+        let bi = sb.len().checked_sub(i + 1);
+        match (ai, bi) {
+            (Some(ia), Some(ib)) => {
+                if !sa[ia].eq_ignore_ascii_case(sb[ib]) {
+                    return false;
+                }
+            }
+            _ => return false,
         }
     }
-    if count == 0 {
-        // No matching timestamps: compare by position index
-        let av: Vec<u64> = a.phashes.values().copied().collect();
-        let bv: Vec<u64> = b.phashes.values().copied().collect();
-        let n = av.len().min(bv.len());
-        for i in 0..n {
-            total += phash_similarity(av[i], bv[i]);
-            count += 1;
+    true
+}
+
+/// Check whether two file records should be compared according to the folder match mode.
+fn folder_filter_passes(a: &FileRecord, b: &FileRecord, settings: &Settings) -> bool {
+    match settings.folder_match_mode {
+        FolderMatchMode::None => true,
+        FolderMatchMode::SameFolderOnly => {
+            let fa = a.path.parent().map(|p| p.as_str()).unwrap_or("");
+            let fb = b.path.parent().map(|p| p.as_str()).unwrap_or("");
+            same_folder_at_depth(fa, fb, settings.same_folder_depth)
         }
-    }
-    if count == 0 { return None; }
-    let sim = total / count as f32;
-    if sim >= min_sim {
-        Some(DuplicatePair {
-            file_a: a.id.clone(),
-            file_b: b.id.clone(),
-            similarity: sim,
-            method: MatchMethod::FrameSimilarity,
-            clip_offset_secs: None,
-        })
-    } else {
-        None
+        FolderMatchMode::DifferentFolderOnly => {
+            let fa = a.path.parent().map(|p| p.as_str()).unwrap_or("");
+            let fb = b.path.parent().map(|p| p.as_str()).unwrap_or("");
+            !same_folder_at_depth(fa, fb, settings.same_folder_depth)
+        }
     }
 }
 
-fn compare_iframe_timeline(
-    a: &FileRecord,
-    b: &FileRecord,
+// ---------------------------------------------------------------------------
+// pHash comparison (port of CheckIfDuplicate + IsDuplicateByPercent)
+// ---------------------------------------------------------------------------
+
+/// Check duplicate using pHash at the first thumbnail position only.
+/// Mirrors C# CheckIfDuplicate with UsePHashing=true: only positionList[0] is checked.
+fn phash_check_duplicate(a: &FileRecord, b: &FileRecord, settings: &Settings) -> bool {
+    match (a.first_phash(), b.first_phash()) {
+        (Some(ha), Some(hb)) => phash_is_duplicate(ha, hb, settings.min_similarity),
+        _ => false,
+    }
+}
+
+/// Apply SSIM second-pass verification for borderline pHash matches.
+///
+/// Returns `true` if the match should be kept, `false` if SSIM rejects it.
+/// If SSIM is not enabled or not applicable, returns `true` (no change).
+///
+/// Mirrors the "SSIM second-pass: for borderline matches in the gray zone" block
+/// from `VDF.Core/ScanEngine.CheckIfDuplicate`.
+fn ssim_verify(a: &FileRecord, b: &FileRecord, sim: f32, settings: &Settings) -> bool {
+    if !settings.ssim_verification {
+        return true;
+    }
+    if sim < settings.ssim_verify_min_sim || sim > settings.ssim_verify_max_sim {
+        return true; // outside the gray zone — trust pHash
+    }
+    // Use the midpoint position for the SSIM window
+    let dur_a = a.duration_secs();
+    let dur_b = b.duration_secs();
+    if dur_a <= 0.0 || dur_b <= 0.0 {
+        return true;
+    }
+    let offset_a = dur_a * 0.5;
+    let offset_b = dur_b * 0.5;
+
+    let ssim = crate::ffmpeg::compute_ssim_at_offset(
+        &a.path, offset_a, &b.path, offset_b, settings.ssim_window_secs, settings.hardware_accel,
+    );
+
+    if ssim >= 0.0 && ssim < settings.ssim_reject_threshold {
+        debug!(
+            "SSIM {:.4} < reject threshold {:.4}: rejecting pair {} ↔ {}",
+            ssim, settings.ssim_reject_threshold, a.path, b.path
+        );
+        return false;
+    }
+    true
+}
+
+/// Compute average Hamming similarity between two sets of pHashes.
+///
+/// Used for flipped comparison where `a_hashes` are pre-flipped.
+fn phash_hamming_multi_similarity(a_hashes: &[u64], b_hashes: &[u64]) -> f32 {
+    if a_hashes.is_empty() || b_hashes.is_empty() {
+        return 0.0;
+    }
+    let total: f32 = a_hashes.iter()
+        .zip(b_hashes.iter())
+        .map(|(&ha, &hb)| phash_similarity(ha, hb))
+        .sum();
+    total / a_hashes.len().min(b_hashes.len()) as f32
+}
+
+/// Compute similarity between the first pHashes of two records (for DuplicatePair.similarity).
+fn phash_first_similarity(a: &FileRecord, b: &FileRecord) -> f32 {
+    let ha = a.first_phash().unwrap_or(0);
+    let hb = b.first_phash().unwrap_or(0);
+    phash_similarity(ha, hb)
+}
+
+/// Duration tolerance check matching C# GetDurationToleranceSeconds.
+fn duration_filter_passes(a: &FileRecord, b: &FileRecord, settings: &Settings) -> bool {
+    let da = a.duration_secs();
+    let db = b.duration_secs();
+    if da == 0.0 || db == 0.0 {
+        return true; // no duration info — don't filter
+    }
+    let longer = da.max(db);
+    let diff = (da - db).abs();
+    let tolerance = settings.duration_tolerance_secs(longer);
+    tolerance <= 0.0 || diff <= tolerance
+}
+
+// ---------------------------------------------------------------------------
+// Merge type alias for the closure
+// ---------------------------------------------------------------------------
+
+type MergeFn<'a> = dyn Fn(
+        &FileRecord,   // a
+        &FileRecord,   // b
+        f32,           // similarity
+        MatchMethod,
+        Option<f64>,   // clip_offset_secs
+        bool,          // is_flipped
+        &[FileRecord],
+        &Arc<Mutex<Vec<DuplicatePair>>>,
+        &Arc<Mutex<HashMap<String, u64>>>,
+        &Arc<Mutex<HashMap<u64, usize>>>,
+        &AtomicU64,
+        &Settings,
+    ) + 'a;
+
+// ---------------------------------------------------------------------------
+// Image comparison (linear, no buckets)
+// ---------------------------------------------------------------------------
+
+fn compare_images(
+    images: &[FileRecord],
     settings: &Settings,
-) -> Option<DuplicatePair> {
-    let (shorter, longer, _shorter_rec, _longer_rec) =
-        if a.iframe_phashes.len() <= b.iframe_phashes.len() {
-            (&a.iframe_phashes, &b.iframe_phashes, a, b)
+    pairs: &Arc<Mutex<Vec<DuplicatePair>>>,
+    p2g: &Arc<Mutex<HashMap<String, u64>>>,
+    greps: &Arc<Mutex<HashMap<u64, usize>>>,
+    gid: &AtomicU64,
+    merge: &MergeFn<'_>,
+) {
+    for i in 0..images.len().saturating_sub(1) {
+        let a = &images[i];
+        let a_flipped = if settings.compare_horizontally_flipped {
+            a.flipped_phash_hashes()
         } else {
-            (&b.iframe_phashes, &a.iframe_phashes, b, a)
+            vec![]
         };
 
-    let result = arrays_match(
-        shorter,
-        longer,
-        settings.iframe_match_percent,
-        settings.iframe_min_consecutive,
-        settings.iframe_hash_threshold,
-        settings.iframe_max_gap,
-    )?;
+        for j in (i + 1)..images.len() {
+            let b = &images[j];
 
-    // Compute clip offset in seconds from offset index + interval
-    let offset_secs = result.offset as f64 * settings.iframe_sample_interval_secs;
+            if settings.exclude_hard_links
+                && hardlink::are_same_file(a.path.as_std_path(), b.path.as_std_path())
+            {
+                continue;
+            }
+            if !folder_filter_passes(a, b, settings) {
+                continue;
+            }
 
-    Some(DuplicatePair {
-        file_a: a.id.clone(),
-        file_b: b.id.clone(),
-        similarity: result.similarity,
-        method: MatchMethod::IframeTimeline,
-        clip_offset_secs: Some(offset_secs),
-    })
+            let is_dup = phash_check_duplicate(a, b, settings);
+            if is_dup {
+                let sim = phash_first_similarity(a, b);
+                if ssim_verify(a, b, sim, settings) {
+                    merge(a, b, sim, MatchMethod::FrameSimilarity, None, false, images, pairs, p2g, greps, gid, settings);
+                }
+                continue;
+            }
+
+            // Check horizontally flipped match (a's flipped hashes vs b's normal hashes)
+            if settings.compare_horizontally_flipped && !a_flipped.is_empty() {
+                let b_hashes = b.phash_hashes();
+                if !b_hashes.is_empty() {
+                    let flip_sim = phash_hamming_multi_similarity(&a_flipped, &b_hashes);
+                    if flip_sim >= settings.min_similarity {
+                        merge(a, b, flip_sim, MatchMethod::FrameSimilarity, None, true, images, pairs, p2g, greps, gid, settings);
+                    }
+                }
+            }
+        }
+    }
 }
 
-fn compare_audio(
-    a: &FileRecord,
-    b: &FileRecord,
+// ---------------------------------------------------------------------------
+// Video comparison — linear path (< BUCKET_ACTIVATION_THRESHOLD files)
+// ---------------------------------------------------------------------------
+
+fn compare_videos_linear(
+    videos: &[FileRecord],
     settings: &Settings,
-) -> Option<DuplicatePair> {
-    let sim = audio::fingerprint_similarity(&a.audio_fingerprint, &b.audio_fingerprint);
-    if sim >= settings.partial_clip_min_similarity {
-        Some(DuplicatePair {
-            file_a: a.id.clone(),
-            file_b: b.id.clone(),
-            similarity: sim,
-            method: MatchMethod::AudioFingerprint,
-            clip_offset_secs: None,
-        })
-    } else {
-        None
+    pairs: &Arc<Mutex<Vec<DuplicatePair>>>,
+    p2g: &Arc<Mutex<HashMap<String, u64>>>,
+    greps: &Arc<Mutex<HashMap<u64, usize>>>,
+    gid: &AtomicU64,
+    merge: &MergeFn<'_>,
+) {
+    for i in 0..videos.len().saturating_sub(1) {
+        let a = &videos[i];
+        let a_flipped = if settings.compare_horizontally_flipped {
+            a.flipped_phash_hashes()
+        } else {
+            vec![]
+        };
+
+        for j in (i + 1)..videos.len() {
+            let b = &videos[j];
+
+            if settings.exclude_hard_links
+                && hardlink::are_same_file(a.path.as_std_path(), b.path.as_std_path())
+            {
+                continue;
+            }
+            if !duration_filter_passes(a, b, settings) {
+                continue;
+            }
+            if !folder_filter_passes(a, b, settings) {
+                continue;
+            }
+
+            let is_dup = phash_check_duplicate(a, b, settings);
+            if is_dup {
+                let sim = phash_first_similarity(a, b);
+                if ssim_verify(a, b, sim, settings) {
+                    merge(a, b, sim, MatchMethod::FrameSimilarity, None, false, videos, pairs, p2g, greps, gid, settings);
+                }
+                continue;
+            }
+
+            // Check horizontally flipped match
+            if settings.compare_horizontally_flipped && !a_flipped.is_empty() {
+                let b_hashes = b.phash_hashes();
+                if !b_hashes.is_empty() {
+                    let flip_sim = phash_hamming_multi_similarity(&a_flipped, &b_hashes);
+                    if flip_sim >= settings.min_similarity {
+                        if ssim_verify(a, b, flip_sim, settings) {
+                            merge(a, b, flip_sim, MatchMethod::FrameSimilarity, None, true, videos, pairs, p2g, greps, gid, settings);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Video comparison — bucketed path (≥ BUCKET_ACTIVATION_THRESHOLD files)
+// ---------------------------------------------------------------------------
+
+fn compare_videos_bucketed(
+    videos: &[FileRecord],
+    settings: &Settings,
+    pairs: &Arc<Mutex<Vec<DuplicatePair>>>,
+    p2g: &Arc<Mutex<HashMap<String, u64>>>,
+    greps: &Arc<Mutex<HashMap<u64, usize>>>,
+    gid: &AtomicU64,
+    merge: &MergeFn<'_>,
+) {
+    // Build duration buckets
+    let mut buckets: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (idx, video) in videos.iter().enumerate() {
+        let dur = video.duration_secs();
+        let key = (dur / BUCKET_SIZE_SECS as f64).floor() as i64;
+        buckets.entry(key).or_default().push(idx);
+    }
+
+    for (&bucket_key, bucket_indices) in &buckets {
+        for &i_pos in bucket_indices {
+            let a = &videos[i_pos];
+            let dur_a = a.duration_secs();
+            let tolerance = settings.duration_tolerance_secs(dur_a);
+
+            let min_key =
+                ((dur_a - tolerance).max(0.0) / BUCKET_SIZE_SECS as f64).floor() as i64;
+            let max_key = ((dur_a + tolerance) / BUCKET_SIZE_SECS as f64).floor() as i64;
+
+            for cand_key in min_key..=max_key {
+                if cand_key < bucket_key {
+                    continue; // avoid symmetric duplicates
+                }
+                let Some(cand_indices) = buckets.get(&cand_key) else { continue };
+                for &j_pos in cand_indices {
+                    if j_pos <= i_pos {
+                        continue; // avoid symmetric duplicates
+                    }
+                    let b = &videos[j_pos];
+
+                    if settings.exclude_hard_links
+                        && hardlink::are_same_file(a.path.as_std_path(), b.path.as_std_path())
+                    {
+                        continue;
+                    }
+                    if !duration_filter_passes(a, b, settings) {
+                        continue;
+                    }
+                    if !folder_filter_passes(a, b, settings) {
+                        continue;
+                    }
+
+                    let is_dup = phash_check_duplicate(a, b, settings);
+                    if is_dup {
+                        let sim = phash_first_similarity(a, b);
+                        if ssim_verify(a, b, sim, settings) {
+                            merge(a, b, sim, MatchMethod::FrameSimilarity, None, false, videos, pairs, p2g, greps, gid, settings);
+                        }
+                    }
+                }
+            }
+        }
     }
 }

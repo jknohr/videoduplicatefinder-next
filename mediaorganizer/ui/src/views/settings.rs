@@ -1,8 +1,7 @@
-//! Settings view — all core::config::Settings fields exposed as form controls.
+//! Settings view — all UiSettings fields exposed as form controls.
 
 use dioxus::prelude::*;
-use core::config::{FolderMatchMode, Settings};
-
+use crate::settings::{FolderMatchMode, HardwareAccel, UiSettings};
 use crate::state::ScanState;
 
 #[component]
@@ -30,7 +29,7 @@ pub fn SettingsView() -> Element {
                         label: "Duration tolerance (%)",
                         min: 0.0, max: 100.0, step: 1.0,
                         value: scan_state.read().settings.percent_duration_difference as f32,
-                        display: format!("{:.0}%", scan_state.read().settings.percent_duration_difference),
+                        display: format!("{:.0}%", scan_state.read().settings.percent_duration_difference as f32),
                         onchange: move |v| scan_state.write().settings.percent_duration_difference = v as f64,
                     }
 
@@ -131,9 +130,104 @@ pub fn SettingsView() -> Element {
                     }
                 }
 
+                // ── MPEG-7 / SSIM ─────────────────────────────────────────
+                section { class: "settings-section",
+                    h2 { "Advanced Matching" }
+
+                    CheckboxField {
+                        label: "MPEG-7 video signature",
+                        hint: "Low-level content signature — very accurate, requires FFmpeg mpeg7 build.",
+                        checked: scan_state.read().settings.mpeg7_signature,
+                        onchange: move |v| scan_state.write().settings.mpeg7_signature = v,
+                    }
+
+                    CheckboxField {
+                        label: "SSIM second-pass verification",
+                        hint: "Run structural similarity check on borderline pHash matches to reduce false positives.",
+                        checked: scan_state.read().settings.ssim_verification,
+                        onchange: move |v| scan_state.write().settings.ssim_verification = v,
+                    }
+
+                    if scan_state.read().settings.ssim_verification {
+                        SliderField {
+                            label: "SSIM re-check lower bound (sim ≥ this → verify)",
+                            min: 0.5, max: 1.0, step: 0.01,
+                            value: scan_state.read().settings.ssim_verify_min_sim,
+                            display: format!("{:.0}%", scan_state.read().settings.ssim_verify_min_sim * 100.0),
+                            onchange: move |v| scan_state.write().settings.ssim_verify_min_sim = v,
+                        }
+                        SliderField {
+                            label: "SSIM re-check upper bound (sim ≤ this → verify)",
+                            min: 0.5, max: 1.0, step: 0.01,
+                            value: scan_state.read().settings.ssim_verify_max_sim,
+                            display: format!("{:.0}%", scan_state.read().settings.ssim_verify_max_sim * 100.0),
+                            onchange: move |v| scan_state.write().settings.ssim_verify_max_sim = v,
+                        }
+                        SliderField {
+                            label: "SSIM reject threshold (below this → discard match)",
+                            min: 0.0, max: 1.0, step: 0.01,
+                            value: scan_state.read().settings.ssim_reject_threshold,
+                            display: format!("{:.0}%", scan_state.read().settings.ssim_reject_threshold * 100.0),
+                            onchange: move |v| scan_state.write().settings.ssim_reject_threshold = v,
+                        }
+                        NumberField {
+                            label: "SSIM sample window (seconds)",
+                            value: scan_state.read().settings.ssim_window_secs as f32,
+                            min: 1.0,
+                            onchange: move |v| scan_state.write().settings.ssim_window_secs = v as f64,
+                        }
+                    }
+                }
+
+                // ── Hardware acceleration ─────────────────────────────────
+                section { class: "settings-section",
+                    h2 { "Hardware Acceleration" }
+                    p { class: "field-hint text-muted",
+                        "Offloads video decoding to GPU. Requires appropriate FFmpeg build and drivers."
+                    }
+                    label { class: "field-label", "Decoder" }
+                    select {
+                        class: "select",
+                        onchange: move |e| {
+                            scan_state.write().settings.hardware_accel = match e.value().as_str() {
+                                "auto"         => HardwareAccel::Auto,
+                                "vaapi"        => HardwareAccel::Vaapi,
+                                "cuda"         => HardwareAccel::Cuda,
+                                "videotoolbox" => HardwareAccel::VideoToolbox,
+                                "d3d11va"      => HardwareAccel::D3d11va,
+                                "dxva2"        => HardwareAccel::Dxva2,
+                                "qsv"          => HardwareAccel::Qsv,
+                                "vdpau"        => HardwareAccel::Vdpau,
+                                "drm"          => HardwareAccel::Drm,
+                                "opencl"       => HardwareAccel::OpenCl,
+                                "mediacodec"   => HardwareAccel::MediaCodec,
+                                "vulkan"       => HardwareAccel::Vulkan,
+                                _              => HardwareAccel::None,
+                            };
+                        },
+                        option { value: "none",         selected: scan_state.read().settings.hardware_accel == HardwareAccel::None,         "None (CPU)" }
+                        option { value: "auto",         selected: scan_state.read().settings.hardware_accel == HardwareAccel::Auto,         "Auto (FFmpeg selects best)" }
+                        option { value: "vaapi",        selected: scan_state.read().settings.hardware_accel == HardwareAccel::Vaapi,        "VA-API (Linux Intel/AMD)" }
+                        option { value: "cuda",         selected: scan_state.read().settings.hardware_accel == HardwareAccel::Cuda,         "NVDEC / CUDA (NVIDIA)" }
+                        option { value: "videotoolbox", selected: scan_state.read().settings.hardware_accel == HardwareAccel::VideoToolbox, "VideoToolbox (macOS)" }
+                        option { value: "d3d11va",      selected: scan_state.read().settings.hardware_accel == HardwareAccel::D3d11va,      "D3D11VA (Windows DX11)" }
+                        option { value: "dxva2",        selected: scan_state.read().settings.hardware_accel == HardwareAccel::Dxva2,        "DXVA2 (Windows DX9)" }
+                        option { value: "qsv",          selected: scan_state.read().settings.hardware_accel == HardwareAccel::Qsv,          "Intel Quick Sync Video" }
+                        option { value: "vdpau",        selected: scan_state.read().settings.hardware_accel == HardwareAccel::Vdpau,        "VDPAU (Linux NVIDIA legacy)" }
+                        option { value: "drm",          selected: scan_state.read().settings.hardware_accel == HardwareAccel::Drm,          "DRM/KMS (Linux embedded)" }
+                        option { value: "opencl",       selected: scan_state.read().settings.hardware_accel == HardwareAccel::OpenCl,       "OpenCL (cross-platform GPU)" }
+                        option { value: "mediacodec",   selected: scan_state.read().settings.hardware_accel == HardwareAccel::MediaCodec,   "MediaCodec (Android)" }
+                        option { value: "vulkan",       selected: scan_state.read().settings.hardware_accel == HardwareAccel::Vulkan,       "Vulkan (experimental)" }
+                    }
+                }
+
                 // ── Skip start / end ──────────────────────────────────────
                 section { class: "settings-section",
                     h2 { "Skip Start / End" }
+                    p { class: "field-hint text-muted",
+                        "Effective skip = max(seconds, duration × percent ÷ 100). \
+                         Set either to 0 to ignore that dimension."
+                    }
 
                     NumberField {
                         label: "Skip start (seconds)",
@@ -142,11 +236,27 @@ pub fn SettingsView() -> Element {
                         onchange: move |v| scan_state.write().settings.skip_start_secs = v as f64,
                     }
 
+                    SliderField {
+                        label: "Skip start (% of duration)",
+                        min: 0.0, max: 50.0, step: 0.5,
+                        value: scan_state.read().settings.skip_start_percent,
+                        display: format!("{:.1}%", scan_state.read().settings.skip_start_percent),
+                        onchange: move |v| scan_state.write().settings.skip_start_percent = v,
+                    }
+
                     NumberField {
                         label: "Skip end (seconds)",
                         value: scan_state.read().settings.skip_end_secs as f32,
                         min: 0.0,
                         onchange: move |v| scan_state.write().settings.skip_end_secs = v as f64,
+                    }
+
+                    SliderField {
+                        label: "Skip end (% of duration)",
+                        min: 0.0, max: 50.0, step: 0.5,
+                        value: scan_state.read().settings.skip_end_percent,
+                        display: format!("{:.1}%", scan_state.read().settings.skip_end_percent),
+                        onchange: move |v| scan_state.write().settings.skip_end_percent = v,
                     }
                 }
 
@@ -161,7 +271,7 @@ pub fn SettingsView() -> Element {
                     button {
                         class: "btn btn-ghost",
                         r#type: "button",
-                        onclick: move |_| scan_state.write().settings = Settings::default(),
+                        onclick: move |_| scan_state.write().settings = UiSettings::default(),
                         "Reset to defaults"
                     }
                 }
@@ -248,7 +358,7 @@ fn CheckboxField(
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 
-fn save_settings(settings: &Settings) {
+fn save_settings(settings: &UiSettings) {
     let dir = dirs::config_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("vdf");

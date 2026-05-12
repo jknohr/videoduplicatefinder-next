@@ -1486,3 +1486,30 @@ IF (SELECT db_version FROM meta:db)[0].db_version < 2 THEN {
 ```
 
 Current schema version: **2**
+
+---
+
+## UI-Layer Query Interface
+
+### `query_file_ids_where(where_clause: &str) -> VdfResult<Vec<String>>`
+
+Added to the `Database` trait and `ScanDatabase` implementation. Executes a user-supplied
+SurrealQL WHERE predicate against the `file` table:
+
+```surql
+SELECT meta::id(id) AS id FROM file WHERE <where_clause>
+```
+
+DDL keywords (`DROP`, `DELETE`, `DEFINE`, `REMOVE`, `CREATE`, `UPDATE`, `INSERT`) are blocked
+at the API boundary to prevent accidental or malicious data modification via the UI expression editor.
+
+**Used by:** `SurrealSelectionPanel` in the results view — port of C# ExpressionBuilder/DynamicExpresso.
+
+Example valid expressions:
+```
+size_bytes > 5000000
+is_image = false AND size_bytes < 1000000
+name CONTAINS "copy"
+path STARTSWITH "/home/user/Videos"
+string::length(path) > 80
+```

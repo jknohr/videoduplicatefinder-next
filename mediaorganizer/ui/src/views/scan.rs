@@ -1,22 +1,28 @@
 //! Scan view: folder management, scan controls, live progress + log.
 
 use dioxus::prelude::*;
-use core::scan::ScanProgress;
+#[cfg(feature = "server")]
+use app_core::scan::ScanProgress;
 
 use crate::app::Route;
+use crate::settings::UiSettings;
 use crate::state::{AppState, ScanState};
 use crate::state::scan_state::LogLevel;
+
 
 #[component]
 pub fn ScanView() -> Element {
     let mut scan_state = use_context::<Signal<ScanState>>();
-    let mut app_state  = use_context::<Signal<AppState>>();
+    let app_state  = use_context::<Signal<AppState>>();
 
     let is_scanning = scan_state.read().is_scanning;
 
     rsx! {
         div { class: "view scan-view",
             h1 { "Scan" }
+
+            // ── FFmpeg status banner ───────────────────────────────────────
+            FfmpegBanner {}
 
             // ── Folder list ───────────────────────────────────────────────
             section { class: "folders",
@@ -60,23 +66,41 @@ pub fn ScanView() -> Element {
             // ── Scan controls ─────────────────────────────────────────────
             section { class: "scan-controls",
                 if is_scanning {
+                    // Stop button — sets the cancel flag in the shared AtomicBool
                     button {
                         class: "btn btn-danger",
                         onclick: move |_| {
-                            // TODO: send cancellation signal to scan engine
-                            scan_state.write().is_scanning = false;
+                            scan_state.read().request_cancel();
                         },
-                        "Stop Scan"
+                        "Stop"
+                    }
+
+                    // Pause / Resume toggle
+                    {
+                        let is_paused = scan_state.read().is_paused;
+                        rsx! {
+                            button {
+                                class: if is_paused { "btn btn-warning" } else { "btn btn-outline" },
+                                onclick: move |_| {
+                                    let paused = !scan_state.read().is_paused;
+                                    scan_state.write().set_paused(paused);
+                                },
+                                if is_paused { "Resume" } else { "Pause" }
+                            }
+                        }
                     }
                 } else {
                     button {
                         class: "btn btn-primary",
                         disabled: scan_state.read().settings.include_dirs.is_empty(),
                         onclick: move |_| {
-                            let settings = scan_state.read().settings.clone();
-                            spawn(async move {
-                                run_scan(scan_state, app_state, settings).await;
-                            });
+                            #[cfg(feature = "server")]
+                            {
+                                let ui_settings = scan_state.read().settings.clone();
+                                spawn(async move {
+                                    run_scan(scan_state, app_state, ui_settings).await;
+                                });
+                            }
                         },
                         "Start Scan"
                     }
@@ -87,9 +111,17 @@ pub fn ScanView() -> Element {
             if is_scanning || scan_state.read().progress > 0.0 {
                 section { class: "scan-progress",
                     ProgressBar { value: scan_state.read().progress }
-                    p {
-                        "{scan_state.read().files_found} files · \
-                         {scan_state.read().duplicates_found} duplicates found"
+                    p { class: "progress-detail",
+                        {
+                            let s = scan_state.read();
+                            if s.total_files > 0 && s.files_hashed < s.total_files {
+                                format!("Hashing {}/{} files  ·  {} duplicates found",
+                                    s.files_hashed, s.total_files, s.duplicates_found)
+                            } else {
+                                format!("{} files  ·  {} duplicates found",
+                                    s.files_found, s.duplicates_found)
+                            }
+                        }
                     }
                 }
             }
@@ -117,6 +149,59 @@ pub fn ScanView() -> Element {
                     button { class: "btn btn-secondary",
                         "View {app_state.read().clusters.len()} duplicate groups →"
                     }
+                }
+            }
+        }
+    }
+}
+
+// ── FFmpeg status banner ──────────────────────────────────────────────────────
+
+/// Shows a warning banner if FFmpeg is not available on PATH.
+///
+/// Checks once on mount via `get_ffmpeg_status()` server function and caches
+/// the result in a local signal. "ready" → no banner; anything else → warning.
+#[component]
+fn FfmpegBanner() -> Element {
+    let mut status = use_signal(|| "checking".to_string());
+
+    use_effect(move || {
+        spawn(async move {
+            #[cfg(all(feature = "server", feature = "web"))]
+            {
+                use crate::server::ffmpeg_setup::{ffmpeg_status, FfmpegStatus, install_instructions};
+                let s = match ffmpeg_status() {
+                    Some(FfmpegStatus::Ready) | None => "ready".to_string(),
+                    Some(FfmpegStatus::MissingFfprobe { ffmpeg_path }) =>
+                        format!("FFprobe not found (ffmpeg at {}). Metadata reading and SSIM will not work.", ffmpeg_path.display()),
+                    Some(FfmpegStatus::MissingFfmpeg { ffprobe_path }) =>
+                        format!("FFmpeg not found (ffprobe at {}). Video scanning will not work.", ffprobe_path.display()),
+                    Some(FfmpegStatus::Missing) =>
+                        format!("FFmpeg and FFprobe not found on PATH.\n{}", install_instructions()),
+                };
+                status.set(s);
+            }
+            #[cfg(not(all(feature = "server", feature = "web")))]
+            { status.set("ready".to_string()); }
+        });
+    });
+
+    let msg = status.read();
+    if msg.as_str() == "ready" || msg.as_str() == "checking" {
+        return rsx! {};
+    }
+
+    rsx! {
+        div { class: "ffmpeg-banner banner-warn",
+            span { class: "banner-icon", "⚠" }
+            div { class: "banner-body",
+                strong { "FFmpeg not available" }
+                pre { class: "banner-msg", "{msg}" }
+                a {
+                    class: "banner-link",
+                    href: "https://ffmpeg.org/download.html",
+                    target: "_blank",
+                    "FFmpeg download page →"
                 }
             }
         }
@@ -216,14 +301,17 @@ fn ProgressBar(value: f32) -> Element {
 ///
 /// On the web target this becomes a #[server] call and uses SSE; the async
 /// bridge is the same from the component's perspective.
+#[cfg(feature = "server")]
 async fn run_scan(
     mut scan_state: Signal<ScanState>,
     mut app_state: Signal<AppState>,
-    settings: core::config::Settings,
+    ui_settings: UiSettings,
 ) {
     use tokio::sync::mpsc;
-    use core::db::ScanDatabase;
-    use core::scan::ScanEngine;
+    use app_core::db::{Database, ScanDatabase};
+    use app_core::scan::ScanEngine;
+
+    let settings: app_core::config::Settings = ui_settings.into();
 
     scan_state.write().reset();
     scan_state.write().is_scanning = true;
@@ -245,11 +333,16 @@ async fn run_scan(
         }
     };
 
+    // Wire cancel/pause flags from ScanState into the scan engine
+    let cancel = std::sync::Arc::clone(&scan_state.read().cancel_flag);
+    let pause  = std::sync::Arc::clone(&scan_state.read().pause_flag);
+
     // Run scan on a blocking thread so async runtime stays responsive
-    let settings_clone = settings.clone();
     let handle = tokio::task::spawn_blocking(move || {
         let cb = std::sync::Arc::new(move |ev| { let _ = tx.send(ev); });
-        let mut engine = ScanEngine::new(settings_clone, db).with_progress(cb);
+        let mut engine = ScanEngine::new(settings, db).with_progress(cb);
+        engine.cancel = cancel;
+        engine.pause  = pause;
         engine.run()
     });
 
@@ -261,11 +354,20 @@ async fn run_scan(
                 s.files_found += 1;
                 s.push_log(LogLevel::Info, format!("found   {path}"));
             }
-            ScanProgress::FileHashed { path, phash } => {
-                scan_state.write().push_log(
-                    LogLevel::Info,
-                    format!("hashed  {path}  [{phash:#018x}]"),
-                );
+            ScanProgress::DiscoveryComplete { total } => {
+                let mut s = scan_state.write();
+                s.total_files = total;
+                s.push_log(LogLevel::Info, format!("discovery done — {total} files"));
+            }
+            ScanProgress::FileHashed { path, .. } => {
+                let mut s = scan_state.write();
+                s.files_hashed += 1;
+                if s.total_files > 0 {
+                    s.progress = (s.files_hashed as f32 / s.total_files as f32) * 0.7;
+                }
+                let hashed = s.files_hashed;
+                let total  = s.total_files;
+                s.push_log(LogLevel::Info, format!("hashed  [{hashed}/{total}]  {path}"));
             }
             ScanProgress::ComparisonStarted { total_pairs } => {
                 scan_state.write().push_log(
@@ -288,6 +390,9 @@ async fn run_scan(
                     LogLevel::Info,
                     format!("done — {files} files, {duplicates} duplicate groups"),
                 );
+            }
+            ScanProgress::ScanAborted => {
+                scan_state.write().push_log(LogLevel::Warn, "Scan stopped by user");
             }
             ScanProgress::Error { path, msg } => {
                 scan_state.write().push_log(LogLevel::Error, format!("error {path}: {msg}"));

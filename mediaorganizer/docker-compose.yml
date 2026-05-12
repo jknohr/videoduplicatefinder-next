@@ -1,0 +1,94 @@
+# MediaOrganizer (Rust) — docker-compose with hardware acceleration support
+#
+# ─── Quick-start ────────────────────────────────────────────────────────────────
+#   1. Add your media paths under volumes (see examples below).
+#   2. Choose a GPU mode (see "Hardware Acceleration" section below).
+#   3. Run: docker compose up -d
+#   4. Open http://localhost:8080
+#
+# ─── Hardware Acceleration ──────────────────────────────────────────────────────
+#   VA-API (Intel / AMD on Linux):
+#     • Uncomment the "devices" and "group_add" sections below.
+#     • Set LIBVA_DRIVER_NAME to match your GPU:
+#         Intel Gen 8+:  iHD
+#         Intel Gen ≤7:  i965
+#         AMD (Mesa):    radeonsi
+#     • Verify inside the container: docker exec <id> vainfo
+#     • In the MediaOrganizer Settings UI, select "vaapi" as the HW accel mode.
+#
+#   NVIDIA (requires nvidia-container-toolkit on the host):
+#     • Install: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#     • Uncomment the "deploy" block below.
+#     • In the Settings UI, select "cuda" as the HW accel mode.
+#
+#   No GPU / software only:
+#     • Leave all hardware sections commented out.
+#     • In Settings, keep hardware acceleration set to "none" (default).
+
+services:
+  mediaorganizer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mediaorganizer:latest
+    container_name: mediaorganizer
+    ports:
+      - "8080:8080"
+    environment:
+      - RUST_LOG=info
+      - VDF_DB_PATH=/data/db
+      - VDF_CONFIG_PATH=/config
+
+      # ── VA-API (Intel / AMD) ──────────────────────────────────────────────────
+      # Uncomment when using vaapi hardware acceleration.
+      # - LIBVA_DRIVER_NAME=iHD           # iHD = Intel Gen 8+; i965 = older Intel; radeonsi = AMD
+      # - LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
+
+    # ── Device access for VA-API (Intel / AMD) ────────────────────────────────
+    # Exposes /dev/dri to the container so FFmpeg can use GPU-accelerated decode.
+    # devices:
+    #   - /dev/dri:/dev/dri
+
+    # ── Group membership for /dev/dri ─────────────────────────────────────────
+    # Needed on some hosts where /dev/dri is owned by the "video" group.
+    # group_add:
+    #   - video
+
+    # ── NVIDIA GPU ────────────────────────────────────────────────────────────
+    # Requires nvidia-container-toolkit installed on the host.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu, video, compute]
+
+    volumes:
+      # ── Persistent database and config ────────────────────────────────────────
+      - mediaorganizer-db:/data
+      - mediaorganizer-config:/config
+
+      # ── Media directories ─────────────────────────────────────────────────────
+      # Mount your video/image folders here.
+      # :ro = read-only (safe for scanning only)
+      # :rw = read-write (needed for rename, move, delete)
+      #
+      # SELinux (Fedora, RHEL, CentOS): append :Z to every bind-mount.
+      #   :Z = private relabel  |  :z = shared relabel
+      #
+      # Examples:
+      #   - /mnt/nas/movies:/media/movies:ro
+      #   - /mnt/nas/movies:/media/movies:ro,Z    # Fedora / RHEL
+      #   - /home/user/Videos:/media/videos:rw
+      #
+      # Add your paths here:
+      # - /path/to/your/videos:/media/videos:rw
+
+    restart: unless-stopped
+
+volumes:
+  mediaorganizer-db:
+    driver: local
+  mediaorganizer-config:
+    driver: local

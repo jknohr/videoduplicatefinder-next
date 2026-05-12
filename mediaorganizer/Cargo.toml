@@ -15,6 +15,7 @@ authors = ["MediaOrganizer Contributors"]
 [workspace.dependencies]
 # Async runtime & parallelism
 tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 rayon = "1.10"
 
 # Error handling
@@ -31,6 +32,7 @@ serde_json = "1"
 
 # Image processing
 fast_image_resize = { version = "5", features = ["rayon"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "gif", "webp", "tiff"] }
 
 # Audio fingerprinting
 realfft = "3"
@@ -45,6 +47,9 @@ sha2 = "0.10"
 
 # Platform dirs
 dirs = "5"
+
+# Date/time (for XDG trash info timestamps)
+chrono = { version = "0.4", features = ["clock"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -65,6 +70,7 @@ surrealdb = { version = "3", features = ["kv-rocksdb"] }
 # --features mobile  → iOS / Android
 dioxus = { version = "0.7", default-features = false }
 axum = "0.8"
+urlencoding = "2"
 
 
 [profile.release]

@@ -8,12 +8,14 @@
 //! All three targets compile the same component tree from app.rs / views/*.
 
 mod app;
+mod settings;
 mod state;
 mod views;
 
 #[cfg(feature = "web")]
 mod server;
 
+#[allow(unused_imports)]
 use app::App;
 
 #[cfg(feature = "desktop")]
@@ -29,7 +31,7 @@ fn main() {
     //   - Axum server binary (server feature ON) that serves the bundle + #[server] fns
     #[cfg(feature = "server")]
     init_logging();
-    dioxus::LaunchBuilder::fullstack().launch(App);
+    dioxus::LaunchBuilder::new().launch(App);
 }
 
 #[cfg(feature = "mobile")]
@@ -46,6 +48,7 @@ fn main() {
     std::process::exit(1);
 }
 
+#[allow(dead_code)]
 fn init_logging() {
     use tracing_subscriber::{EnvFilter, fmt};
     fmt()

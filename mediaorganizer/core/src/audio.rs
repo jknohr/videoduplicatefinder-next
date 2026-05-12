@@ -405,6 +405,53 @@ pub fn fingerprint_similarity(a: &[u32], b: &[u32]) -> f32 {
     matching as f32 / total_bits
 }
 
+/// Slide `shorter` over `longer` and return `(best_similarity, best_offset_blocks)`.
+///
+/// Faithful port of `ScanEngine.SlidingWindowCompare` from C#.
+/// Uses early exit per offset when accumulated Hamming distance already exceeds what
+/// could beat the current best similarity.
+///
+/// `min_sim` is the minimum similarity threshold; offsets that can't reach it are skipped.
+pub fn fingerprint_sliding_window(shorter: &[u32], longer: &[u32], min_sim: f32) -> (f32, usize) {
+    if shorter.is_empty() || longer.len() < shorter.len() {
+        return (0.0, 0);
+    }
+
+    let len_s = shorter.len();
+    let max_offset = longer.len() - len_s;
+    let total_bits_capacity = (len_s * 32) as u32;
+
+    let mut best_sim = 0.0f32;
+    let mut best_offset = 0usize;
+
+    for offset in 0..=max_offset {
+        let max_allowed_bits =
+            ((1.0 - best_sim.max(min_sim)) * total_bits_capacity as f32) as u32;
+
+        let mut bits = 0u32;
+        let mut early_exit = false;
+        for k in 0..len_s {
+            bits += (shorter[k] ^ longer[offset + k]).count_ones();
+            if bits > max_allowed_bits {
+                early_exit = true;
+                break;
+            }
+        }
+
+        if early_exit {
+            continue;
+        }
+
+        let sim = 1.0 - bits as f32 / total_bits_capacity as f32;
+        if sim > best_sim {
+            best_sim = sim;
+            best_offset = offset;
+        }
+    }
+
+    (best_sim, best_offset)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
