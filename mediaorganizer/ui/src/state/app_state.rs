@@ -39,10 +39,18 @@ pub struct DuplicateCluster {
     pub max_similarity: f32,
 }
 
+/// Names of the quality criteria in user-chosen ranking order.
+///
+/// Mirrors `SettingsFile.QualityCriteriaOrder` from the C# codebase.
+/// The first entry has highest priority; unrecognised names are ignored.
+pub const ALL_CRITERIA: &[&str] = &[
+    "Duration", "Resolution", "FPS", "Bitrate", "Audio Bitrate", "Size",
+];
+
 /// Global application state provided at the App root.
 ///
 /// Provided via `use_context_provider(|| Signal::new(AppState::default()))`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AppState {
     /// All duplicate clusters loaded from SurrealDB after a scan completes.
     pub clusters: Vec<DuplicateCluster>,
@@ -54,6 +62,21 @@ pub struct AppState {
     pub method_filter: Option<String>,
     /// File IDs selected by auto-select for bulk trash/delete.
     pub selected_for_action: Vec<String>,
+    /// User's chosen quality criterion priority order (name strings).
+    pub criteria_order: Vec<String>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            clusters: Vec::new(),
+            selected_pair: None,
+            sort: ResultSort::default(),
+            method_filter: None,
+            selected_for_action: Vec::new(),
+            criteria_order: ALL_CRITERIA.iter().map(|s| s.to_string()).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

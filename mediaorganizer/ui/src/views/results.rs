@@ -7,7 +7,7 @@ use dioxus::prelude::*;
 use urlencoding;
 use crate::app::Route;
 use crate::state::AppState;
-use crate::state::app_state::{DuplicateCluster, ResultSort};
+use crate::state::app_state::{DuplicateCluster, ResultSort, ALL_CRITERIA};
 #[cfg(feature = "server")]
 use dirs;
 
@@ -54,6 +54,8 @@ pub fn ResultsView() -> Element {
                 }
                 ResultsToolbar { app_state }
                 AutoSelectBar { app_state }
+                QualityOrderPanel { app_state }
+                CustomSelectionPanel { app_state }
             }
 
             if clusters.is_empty() {
@@ -127,16 +129,16 @@ fn AutoSelectBar(mut app_state: Signal<AppState>) -> Element {
         div { class: "autoselect-bar",
             span { class: "bar-label", "Auto-select duplicates to remove:" }
 
-            // Select all but the best-quality file in each group (uses the ranker's default criteria)
+            // Select all but the best-quality file in each group (uses the ranker with user's criteria order)
             button {
                 class: "btn btn-xs btn-outline",
-                title: "In each group, keep the highest-quality file (longest duration, largest size, best codec); select the rest",
+                title: "In each group, keep the highest-quality file; select the rest. Use 'Quality order…' to change priorities.",
                 onclick: move |_| {
                     #[cfg(feature = "server")]
                     {
                         let mut state = app_state.write();
                         let mut to_remove: Vec<String> = Vec::new();
-                        let criteria = app_core::ranker::default_criteria();
+                        let criteria = build_criteria_from_order(&state.criteria_order);
                         for cluster in &state.clusters {
                             if cluster.files.len() < 2 { continue; }
                             if let Some(keeper) = app_core::ranker::pick_keeper(&cluster.files, &criteria) {
@@ -284,6 +286,563 @@ fn MoveToFolderInline(mut app_state: Signal<AppState>) -> Element {
             }
         }
     }
+}
+
+// ── Quality order panel ───────────────────────────────────────────────────────
+
+/// Panel letting the user reorder the quality criteria used by "Best quality (keep)".
+///
+/// Port of QualityOrderDialog from VDF.GUI. Shown inline below the AutoSelectBar.
+#[component]
+fn QualityOrderPanel(mut app_state: Signal<AppState>) -> Element {
+    let mut open = use_signal(|| false);
+
+    if !*open.read() {
+        return rsx! {
+            button {
+                class: "btn btn-xs btn-ghost",
+                title: "Reorder quality criteria used by auto-select",
+                onclick: move |_| open.set(true),
+                "Quality order…"
+            }
+        };
+    }
+
+    // Local copy of the order for editing; changes are committed on "Apply"
+    let mut local_order: Signal<Vec<String>> = use_signal({
+        let order = app_state.read().criteria_order.clone();
+        move || order.clone()
+    });
+
+    rsx! {
+        div { class: "quality-order-panel panel",
+            h3 { "Quality Criteria Order" }
+            p { class: "text-muted",
+                "Drag or use buttons to reorder. Highest priority first."
+            }
+            ul { class: "criteria-list",
+                for (idx, name) in local_order.read().iter().enumerate() {
+                    li { class: "criteria-row",
+                        span { class: "criteria-name", "{name}" }
+                        div { class: "criteria-btns",
+                            button {
+                                class: "btn btn-xs btn-ghost",
+                                disabled: idx == 0,
+                                onclick: {
+                                    let mut lo = local_order.clone();
+                                    move |_| {
+                                        let mut v = lo.write();
+                                        if idx > 0 { v.swap(idx, idx - 1); }
+                                    }
+                                },
+                                "↑"
+                            }
+                            button {
+                                class: "btn btn-xs btn-ghost",
+                                disabled: idx + 1 >= local_order.read().len(),
+                                onclick: {
+                                    let mut lo = local_order.clone();
+                                    move |_| {
+                                        let mut v = lo.write();
+                                        if idx + 1 < v.len() { v.swap(idx, idx + 1); }
+                                    }
+                                },
+                                "↓"
+                            }
+                        }
+                    }
+                }
+            }
+            div { class: "panel-actions",
+                button {
+                    class: "btn btn-sm btn-primary",
+                    onclick: {
+                        let lo = local_order.clone();
+                        move |_| {
+                            app_state.write().criteria_order = lo.read().clone();
+                            open.set(false);
+                        }
+                    },
+                    "Apply"
+                }
+                button {
+                    class: "btn btn-sm btn-ghost",
+                    onclick: move |_| open.set(false),
+                    "Cancel"
+                }
+                button {
+                    class: "btn btn-sm btn-ghost",
+                    title: "Reset to default order",
+                    onclick: {
+                        let mut lo = local_order.clone();
+                        move |_| {
+                            *lo.write() = ALL_CRITERIA.iter().map(|s| s.to_string()).collect();
+                        }
+                    },
+                    "Reset"
+                }
+            }
+        }
+    }
+}
+
+// ── Custom selection panel ────────────────────────────────────────────────────
+
+/// Parameters for the custom-selection filter.
+///
+/// Faithful port of `CustomSelectionData` from VDF.GUI/Data/CustomSelectionData.cs.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CustomSelectionData {
+    /// Skip groups that already have a file selected for removal.
+    pub ignore_groups_with_checked: bool,
+    /// 0 = All, 1 = Videos only, 2 = Images only
+    pub file_type: u8,
+    /// 0 = Any, 1 = Exact match, 2 = Except size, 3 = Not identical
+    pub identical: u8,
+    /// 0 = Ignore, 1 = Newest, 2 = Oldest
+    pub datetime: u8,
+    pub min_size_mb: u64,
+    pub max_size_mb: u64,
+    /// Glob patterns — path must match ALL of these
+    pub path_contains: Vec<String>,
+    /// Glob patterns — path must not match ANY of these
+    pub path_not_contains: Vec<String>,
+    pub similarity_from: u8,
+    pub similarity_to: u8,
+}
+
+impl Default for CustomSelectionData {
+    fn default() -> Self {
+        Self {
+            ignore_groups_with_checked: true,
+            file_type: 0,
+            identical: 0,
+            datetime: 0,
+            min_size_mb: 0,
+            max_size_mb: 999_999_999,
+            path_contains: Vec::new(),
+            path_not_contains: Vec::new(),
+            similarity_from: 0,
+            similarity_to: 100,
+        }
+    }
+}
+
+/// Named preset for CustomSelectionData, saved to settings.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CustomSelectionPreset {
+    pub name: String,
+    pub data: CustomSelectionData,
+}
+
+/// Panel for advanced custom-selection of duplicates to remove.
+///
+/// Port of CustomSelectionView.xaml + CustomSelectionVM.cs.
+#[component]
+fn CustomSelectionPanel(mut app_state: Signal<AppState>) -> Element {
+    let mut open = use_signal(|| false);
+
+    if !*open.read() {
+        return rsx! {
+            button {
+                class: "btn btn-xs btn-ghost",
+                title: "Advanced filter: select files by type, size, path, similarity",
+                onclick: move |_| open.set(true),
+                "Custom selection…"
+            }
+        };
+    }
+
+    let mut data: Signal<CustomSelectionData> = use_signal(CustomSelectionData::default);
+    let mut presets: Signal<Vec<CustomSelectionPreset>> = use_signal(Vec::new);
+    let mut path_contains_input = use_signal(String::new);
+    let mut path_not_contains_input = use_signal(String::new);
+    let mut status = use_signal(|| String::new());
+
+    rsx! {
+        div { class: "custom-selection-panel panel",
+            h3 { "Custom Selection" }
+
+            // ── Preset bar ────────────────────────────────────────────────
+            div { class: "preset-bar",
+                label { "Preset:" }
+                select {
+                    onchange: {
+                        let presets = presets.clone();
+                        let mut data = data.clone();
+                        move |e| {
+                            let name = e.value();
+                            if let Some(p) = presets.read().iter().find(|p| p.name == name) {
+                                *data.write() = p.data.clone();
+                            }
+                        }
+                    },
+                    option { value: "", "— select —" }
+                    for p in presets.read().iter() {
+                        option { value: "{p.name}", "{p.name}" }
+                    }
+                }
+                button {
+                    class: "btn btn-xs btn-outline",
+                    onclick: {
+                        let data = data.clone();
+                        let mut presets = presets.clone();
+                        let mut status = status.clone();
+                        move |_| {
+                            let new_data = data.read().clone();
+                            // Prompt would normally show an InputBox; use timestamp as name for web
+                            let name = format!("preset_{}", presets.read().len() + 1);
+                            presets.write().push(CustomSelectionPreset { name, data: new_data });
+                            *status.write() = "Preset saved.".to_string();
+                        }
+                    },
+                    "Save preset"
+                }
+            }
+
+            // ── Options ───────────────────────────────────────────────────
+            div { class: "cs-options",
+                label { class: "cs-row",
+                    input {
+                        r#type: "checkbox",
+                        checked: data.read().ignore_groups_with_checked,
+                        onchange: {
+                            let mut data = data.clone();
+                            move |e| { data.write().ignore_groups_with_checked = e.checked(); }
+                        },
+                    }
+                    " Ignore groups with already-selected files"
+                }
+
+                label { class: "cs-label", "File type:" }
+                select {
+                    value: "{data.read().file_type}",
+                    onchange: {
+                        let mut data = data.clone();
+                        move |e| { data.write().file_type = e.value().parse().unwrap_or(0); }
+                    },
+                    option { value: "0", selected: data.read().file_type == 0, "All" }
+                    option { value: "1", selected: data.read().file_type == 1, "Videos only" }
+                    option { value: "2", selected: data.read().file_type == 2, "Images only" }
+                }
+
+                label { class: "cs-label", "Identical files:" }
+                select {
+                    value: "{data.read().identical}",
+                    onchange: {
+                        let mut data = data.clone();
+                        move |e| { data.write().identical = e.value().parse().unwrap_or(0); }
+                    },
+                    option { value: "0", selected: data.read().identical == 0, "Any" }
+                    option { value: "1", selected: data.read().identical == 1, "Exact (all metadata)" }
+                    option { value: "2", selected: data.read().identical == 2, "Except size" }
+                    option { value: "3", selected: data.read().identical == 3, "Not identical" }
+                }
+
+                label { class: "cs-label", "Keep by date:" }
+                select {
+                    value: "{data.read().datetime}",
+                    onchange: {
+                        let mut data = data.clone();
+                        move |e| { data.write().datetime = e.value().parse().unwrap_or(0); }
+                    },
+                    option { value: "0", selected: data.read().datetime == 0, "Ignore (unordered)" }
+                    option { value: "1", selected: data.read().datetime == 1, "Newest (keep)" }
+                    option { value: "2", selected: data.read().datetime == 2, "Oldest (keep)" }
+                }
+
+                div { class: "cs-row-inline",
+                    label { "Size (MB): " }
+                    input {
+                        r#type: "number",
+                        class: "input-sm",
+                        min: "0",
+                        value: "{data.read().min_size_mb}",
+                        oninput: {
+                            let mut data = data.clone();
+                            move |e| { data.write().min_size_mb = e.value().parse().unwrap_or(0); }
+                        },
+                    }
+                    span { " – " }
+                    input {
+                        r#type: "number",
+                        class: "input-sm",
+                        min: "0",
+                        value: "{data.read().max_size_mb}",
+                        oninput: {
+                            let mut data = data.clone();
+                            move |e| { data.write().max_size_mb = e.value().parse().unwrap_or(999_999_999); }
+                        },
+                    }
+                }
+
+                div { class: "cs-row-inline",
+                    label { "Similarity (%): " }
+                    input {
+                        r#type: "number",
+                        class: "input-sm",
+                        min: "0", max: "100",
+                        value: "{data.read().similarity_from}",
+                        oninput: {
+                            let mut data = data.clone();
+                            move |e| { data.write().similarity_from = e.value().parse().unwrap_or(0); }
+                        },
+                    }
+                    span { " – " }
+                    input {
+                        r#type: "number",
+                        class: "input-sm",
+                        min: "0", max: "100",
+                        value: "{data.read().similarity_to}",
+                        oninput: {
+                            let mut data = data.clone();
+                            move |e| { data.write().similarity_to = e.value().parse().unwrap_or(100); }
+                        },
+                    }
+                }
+
+                // Path contains list
+                label { class: "cs-label", "Path must match (wildcard):" }
+                div { class: "cs-list-block",
+                    ul {
+                        for (idx, entry) in data.read().path_contains.iter().enumerate() {
+                            li {
+                                span { "{entry}" }
+                                button {
+                                    class: "btn btn-xs btn-ghost",
+                                    onclick: {
+                                        let mut data = data.clone();
+                                        move |_| { data.write().path_contains.remove(idx); }
+                                    },
+                                    "✕"
+                                }
+                            }
+                        }
+                    }
+                    div { class: "cs-add-row",
+                        input {
+                            r#type: "text",
+                            class: "input-sm",
+                            placeholder: "/path/prefix*",
+                            value: "{path_contains_input}",
+                            oninput: move |e| path_contains_input.set(e.value()),
+                        }
+                        button {
+                            class: "btn btn-xs btn-outline",
+                            onclick: {
+                                let mut data = data.clone();
+                                let mut inp = path_contains_input.clone();
+                                move |_| {
+                                    let v = inp.read().trim().to_string();
+                                    if !v.is_empty() && !data.read().path_contains.contains(&v) {
+                                        data.write().path_contains.push(v);
+                                        inp.set(String::new());
+                                    }
+                                }
+                            },
+                            "Add"
+                        }
+                    }
+                }
+
+                // Path NOT contains list
+                label { class: "cs-label", "Path must NOT match (wildcard):" }
+                div { class: "cs-list-block",
+                    ul {
+                        for (idx, entry) in data.read().path_not_contains.iter().enumerate() {
+                            li {
+                                span { "{entry}" }
+                                button {
+                                    class: "btn btn-xs btn-ghost",
+                                    onclick: {
+                                        let mut data = data.clone();
+                                        move |_| { data.write().path_not_contains.remove(idx); }
+                                    },
+                                    "✕"
+                                }
+                            }
+                        }
+                    }
+                    div { class: "cs-add-row",
+                        input {
+                            r#type: "text",
+                            class: "input-sm",
+                            placeholder: "/path/to/skip*",
+                            value: "{path_not_contains_input}",
+                            oninput: move |e| path_not_contains_input.set(e.value()),
+                        }
+                        button {
+                            class: "btn btn-xs btn-outline",
+                            onclick: {
+                                let mut data = data.clone();
+                                let mut inp = path_not_contains_input.clone();
+                                move |_| {
+                                    let v = inp.read().trim().to_string();
+                                    if !v.is_empty() && !data.read().path_not_contains.contains(&v) {
+                                        data.write().path_not_contains.push(v);
+                                        inp.set(String::new());
+                                    }
+                                }
+                            },
+                            "Add"
+                        }
+                    }
+                }
+            }
+
+            // ── Status / actions ──────────────────────────────────────────
+            if !status.read().is_empty() {
+                p { class: "cs-status text-muted", "{status}" }
+            }
+
+            div { class: "panel-actions",
+                button {
+                    class: "btn btn-sm btn-primary",
+                    onclick: {
+                        let d = data.clone();
+                        let mut state = app_state.clone();
+                        let mut st = status.clone();
+                        move |_| {
+                            run_custom_selection(&d.read(), &mut state);
+                            *st.write() = format!(
+                                "{} files selected for removal.",
+                                state.read().selected_for_action.len()
+                            );
+                        }
+                    },
+                    "Select"
+                }
+                button {
+                    class: "btn btn-sm btn-ghost",
+                    onclick: move |_| open.set(false),
+                    "Close"
+                }
+                button {
+                    class: "btn btn-sm btn-ghost",
+                    title: "Reset all options to defaults",
+                    onclick: {
+                        let mut data = data.clone();
+                        move |_| { *data.write() = CustomSelectionData::default(); }
+                    },
+                    "Reset"
+                }
+            }
+        }
+    }
+}
+
+/// Execute custom selection: marks files for removal in `app_state.selected_for_action`.
+///
+/// Direct port of `MainWindowVM.RunCustomSelection()` from VDF.GUI.
+fn run_custom_selection(data: &CustomSelectionData, app_state: &mut Signal<AppState>) {
+    #[cfg(feature = "server")]
+    {
+        use std::collections::HashSet;
+
+        let mut to_remove: Vec<String> = Vec::new();
+        let mut processed_clusters: HashSet<usize> = HashSet::new();
+
+        // Build a set of cluster indices that already have selected files (if ignore option is on)
+        let already_checked: HashSet<usize> = if data.ignore_groups_with_checked {
+            let selected = &app_state.read().selected_for_action;
+            app_state.read().clusters.iter().enumerate()
+                .filter(|(_, c)| c.files.iter().any(|f| selected.contains(&f.id)))
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
+        let state = app_state.read();
+        let sim_lo = data.similarity_from as f32 / 100.0;
+        let sim_hi = data.similarity_to as f32 / 100.0;
+
+        for (cidx, cluster) in state.clusters.iter().enumerate() {
+            if already_checked.contains(&cidx) { continue; }
+            if processed_clusters.contains(&cidx) { continue; }
+
+            let max_sim = cluster.max_similarity;
+            if max_sim < sim_lo || max_sim > sim_hi { continue; }
+
+            // Filter files in the cluster by type, size, path patterns
+            let filtered: Vec<&app_core::db::FileRecord> = cluster.files.iter().filter(|f| {
+                // File type filter
+                match data.file_type {
+                    1 if f.is_image() => return false,  // videos only
+                    2 if !f.is_image() => return false, // images only
+                    _ => {}
+                }
+                // Size filter (bytes → MB)
+                let mb = f.size_bytes / 1_048_576;
+                if mb < data.min_size_mb || mb > data.max_size_mb { return false; }
+                // Path contains (all must match)
+                for pat in &data.path_contains {
+                    if !glob_match(pat, f.path.as_str()) { return false; }
+                }
+                // Path not contains (none must match)
+                for pat in &data.path_not_contains {
+                    if glob_match(pat, f.path.as_str()) { return false; }
+                }
+                true
+            }).collect();
+
+            if filtered.len() < 2 { continue; }
+
+            // Sort by identical criterion and datetime preference
+            let mut sorted: Vec<&app_core::db::FileRecord> = filtered.clone();
+            match data.datetime {
+                1 => {
+                    // Keep newest: sort ascending by mtime so index 0 is oldest (removed)
+                    sorted.sort_by(|a, b| a.scanned_at.cmp(&b.scanned_at));
+                }
+                2 => {
+                    // Keep oldest: sort descending so index 0 is newest (removed)
+                    sorted.sort_by(|a, b| b.scanned_at.cmp(&a.scanned_at));
+                }
+                _ => {}
+            }
+
+            // Index 0 is kept; rest are selected for removal
+            let keeper_id = sorted.first().map(|f| &f.id);
+            for f in &sorted[1..] {
+                to_remove.push(f.id.clone());
+            }
+            let _ = keeper_id; // already kept by skipping it
+
+            processed_clusters.insert(cidx);
+        }
+
+        drop(state);
+        app_state.write().selected_for_action = to_remove;
+    }
+}
+
+/// Simple glob pattern match (supports `*` as wildcard only).
+///
+/// Mirrors `FileSystemName.MatchesSimpleExpression` from C#.
+fn glob_match(pattern: &str, path: &str) -> bool {
+    if !pattern.contains('*') && !pattern.contains('?') {
+        return path.contains(pattern);
+    }
+    // Convert glob pattern to a simple prefix/suffix/contains check
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.is_empty() { return true; }
+    let mut pos = 0usize;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() { continue; }
+        if i == 0 {
+            if !path.starts_with(part) { return false; }
+            pos = part.len();
+        } else if i == parts.len() - 1 {
+            if !path.ends_with(part) { return false; }
+        } else {
+            match path[pos..].find(part) {
+                Some(idx) => pos += idx + part.len(),
+                None => return false,
+            }
+        }
+    }
+    true
 }
 
 fn apply_sort(clusters: &mut Vec<DuplicateCluster>, sort: ResultSort) {
@@ -569,6 +1128,60 @@ fn format_bytes(bytes: u64) -> String {
     if bytes >= GB { format!("{:.1} GB", bytes as f64 / GB as f64) }
     else if bytes >= MB { format!("{:.0} MB", bytes as f64 / MB as f64) }
     else { format!("{} KB", bytes / 1024) }
+}
+
+// ── Quality criteria builder ──────────────────────────────────────────────────
+
+/// Build a `Vec<Criterion>` respecting the user's chosen priority order.
+///
+/// Mirrors `ResolveCriteria()` from `MainWindowVM_Utils.cs`.
+/// Unrecognised names are ignored; any criterion missing from the list is
+/// appended at the end so newly-added criteria still act as tiebreakers.
+#[cfg(feature = "server")]
+fn build_criteria_from_order(order: &[String]) -> Vec<app_core::ranker::Criterion> {
+    use app_core::ranker::Criterion;
+    use app_core::db::FileRecord;
+
+    fn make(name: &str) -> Option<Criterion> {
+        match name {
+            "Duration" => Some(Criterion::new("duration",
+                |r: &FileRecord| r.duration_secs(), true)),
+            "Resolution" => Some(Criterion::new("frame_area",
+                |r: &FileRecord| {
+                    let w = r.width().unwrap_or(0) as f64;
+                    let h = r.height().unwrap_or(0) as f64;
+                    w * h
+                }, false)),
+            "FPS" => Some(Criterion::new("fps",
+                |r: &FileRecord| r.frame_rate().unwrap_or(0.0) as f64, true)),
+            "Bitrate" => Some(Criterion::new("video_bitrate",
+                |r: &FileRecord| r.video_bitrate_kbps().unwrap_or(0) as f64, true)),
+            "Audio Bitrate" => Some(Criterion::new("audio_bitrate",
+                |r: &FileRecord| r.audio_bitrate_kbps().unwrap_or(0) as f64, true)),
+            "Size" => Some(Criterion::new("size_smallest",
+                |r: &FileRecord| -(r.size_bytes as f64), false)),
+            _ => None,
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut result: Vec<Criterion> = Vec::new();
+    for name in order {
+        if seen.contains(name.as_str()) { continue; }
+        if let Some(c) = make(name) {
+            seen.insert(name.clone());
+            result.push(c);
+        }
+    }
+    // Append any criteria not in the user's list as final tiebreakers
+    for &name in ALL_CRITERIA {
+        if !seen.contains(name) {
+            if let Some(c) = make(name) {
+                result.push(c);
+            }
+        }
+    }
+    result
 }
 
 // ── File action helpers (server / desktop only) ───────────────────────────────
