@@ -188,6 +188,8 @@ fn FileCard(info: FileInfo, label: &'static str) -> Element {
                     preload: "metadata",
                     src: "{video_url}",
                 }
+                // Multi-thumbnail strip: 5 evenly-spaced frames (port of ThumbnailComparer strips)
+                ThumbnailStrip { path: info.path.clone(), duration_secs: info.duration_secs }
             }
 
             dl { class: "meta-list",
@@ -256,6 +258,37 @@ fn DurationComparison(info_a: FileInfo, info_b: FileInfo) -> Element {
                 span { class: "dur-value", "{format_duration(dur_b)}" }
             }
             p { class: "dur-diff text-muted", "Difference: {format_duration(diff)}" }
+        }
+    }
+}
+
+// ── Thumbnail strip ───────────────────────────────────────────────────────────
+
+/// Renders N evenly-spaced thumbnails extracted from a video.
+///
+/// Mirrors the thumbnail carousel in ThumbnailComparer.xaml.
+/// Uses the /api/thumbnail endpoint with different `pos` values.
+const THUMB_COUNT: usize = 5;
+
+#[component]
+fn ThumbnailStrip(path: String, duration_secs: f64) -> Element {
+    let encoded = urlencoding::encode(&path).into_owned();
+    // Positions: 10%, 27.5%, 45%, 62.5%, 80% of duration
+    let positions: Vec<f64> = (0..THUMB_COUNT)
+        .map(|i| duration_secs * (0.10 + i as f64 * 0.175))
+        .collect();
+
+    rsx! {
+        div { class: "thumb-strip",
+            for pos in positions {
+                img {
+                    class: "thumb-strip-img",
+                    src: "/api/thumbnail?path={encoded}&pos={pos:.2}&w=160",
+                    loading: "lazy",
+                    alt: "{pos:.1}s",
+                    title: "{pos:.1}s",
+                }
+            }
         }
     }
 }

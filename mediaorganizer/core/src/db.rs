@@ -1033,6 +1033,15 @@ pub trait Database: Send + Sync {
     fn files_needing_fingerprint(&self) -> VdfResult<Vec<FileRecord>>;
     fn files_with_errors(&self) -> VdfResult<Vec<FileRecord>>;
 
+    /// Execute an arbitrary SurrealQL WHERE predicate against the `file` table
+    /// and return the string IDs of all matching records.
+    ///
+    /// The caller supplies only the WHERE body; the query wrapper is:
+    /// `SELECT id FROM file WHERE <where_clause>`
+    ///
+    /// Used by the SurrealQL expression selector in the results UI.
+    fn query_file_ids_where(&self, where_clause: &str) -> VdfResult<Vec<String>>;
+
     // ── Housekeeping ──────────────────────────────────────────────────────────
     fn flush(&mut self) -> VdfResult<()>;
     fn db_version(&self) -> u32;
@@ -1875,6 +1884,34 @@ impl Database for SurrealDatabase {
         Ok(rows
             .into_iter()
             .filter_map(|v| serde_json::from_value::<FileRecord>(v).ok())
+            .collect())
+    }
+
+    fn query_file_ids_where(&self, where_clause: &str) -> VdfResult<Vec<String>> {
+        // Validate that the where clause is non-empty and doesn't contain DDL keywords
+        // to prevent abuse from the UI layer.
+        let upper = where_clause.to_uppercase();
+        for forbidden in &["DROP", "DELETE", "DEFINE", "REMOVE", "CREATE", "UPDATE", "INSERT"] {
+            if upper.contains(forbidden) {
+                return Err(VdfError::Database(format!(
+                    "Expression may not contain '{forbidden}'"
+                )));
+            }
+        }
+
+        let query = format!("SELECT meta::id(id) AS id FROM file WHERE {where_clause}");
+        let db = &self.db;
+        let rows: Vec<serde_json::Value> = self
+            .rt
+            .block_on(async {
+                let mut res = db.query(&query).await?;
+                res.take::<Vec<serde_json::Value>>(0)
+            })
+            .map_err(|e| VdfError::Database(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|v| v.get("id")?.as_str().map(|s| s.to_string()))
             .collect())
     }
 

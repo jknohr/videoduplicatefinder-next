@@ -56,6 +56,7 @@ pub fn ResultsView() -> Element {
                 AutoSelectBar { app_state }
                 QualityOrderPanel { app_state }
                 CustomSelectionPanel { app_state }
+                SurrealSelectionPanel { app_state }
             }
 
             if clusters.is_empty() {
@@ -1128,6 +1129,183 @@ fn format_bytes(bytes: u64) -> String {
     if bytes >= GB { format!("{:.1} GB", bytes as f64 / GB as f64) }
     else if bytes >= MB { format!("{:.0} MB", bytes as f64 / MB as f64) }
     else { format!("{} KB", bytes / 1024) }
+}
+
+// ── SurrealQL expression selection ───────────────────────────────────────────
+
+/// SurrealQL-based expression selector — port of ExpressionBuilder.xaml.
+///
+/// C# used DynamicExpresso (C# runtime eval) against in-memory DuplicateItem objects.
+/// The Rust equivalent runs a SurrealQL WHERE clause directly against the database,
+/// which is more powerful: full graph traversal, vector operators, functions.
+///
+/// Reference panel lists all queryable file fields.
+#[component]
+fn SurrealSelectionPanel(mut app_state: Signal<AppState>) -> Element {
+    let mut open = use_signal(|| false);
+
+    if !*open.read() {
+        return rsx! {
+            button {
+                class: "btn btn-xs btn-ghost",
+                title: "Select files using a SurrealQL WHERE expression",
+                onclick: move |_| open.set(true),
+                "SurrealQL select…"
+            }
+        };
+    }
+
+    let mut expr = use_signal(String::new);
+    let mut presets: Signal<Vec<(String, String)>> = use_signal(Vec::new);
+    let mut status = use_signal(String::new);
+    let mut preset_name = use_signal(String::new);
+
+    rsx! {
+        div { class: "surreal-panel panel",
+            h3 { "SurrealQL File Selection" }
+
+            // ── Reference ─────────────────────────────────────────────────
+            details { class: "field-ref",
+                summary { "Available fields (click to expand)" }
+                pre { class: "field-list",
+"file.path              string   — full file path
+file.name              string   — filename
+file.size_bytes        int      — file size in bytes
+file.is_image          bool     — true for images
+file.scanned_at        int      — Unix epoch seconds
+file.sha256            string?  — SHA-256 hex digest
+file.phashes           object   — pHash arrays
+file.audio_fingerprint array    — Chromaprint u32 array
+file.iframe_phashes    array    — I-frame pHash values
+
+Examples:
+  size_bytes > 5000000
+  is_image = false AND size_bytes < 1000000
+  name CONTAINS 'copy'
+  path STARTSWITH '/home/user/Videos'
+  string::length(path) > 80"
+                }
+            }
+
+            // ── Expression input ──────────────────────────────────────────
+            div { class: "cs-options",
+                label { class: "cs-label", "WHERE clause:" }
+                textarea {
+                    class: "input surreal-input",
+                    rows: "3",
+                    placeholder: "size_bytes > 5000000 AND is_image = false",
+                    value: "{expr}",
+                    oninput: move |e| expr.set(e.value()),
+                }
+
+                // Presets bar
+                div { class: "preset-bar",
+                    label { "Preset:" }
+                    select {
+                        onchange: {
+                            let presets = presets.clone();
+                            let mut ex = expr.clone();
+                            move |e| {
+                                let name = e.value();
+                                if let Some((_, exp)) = presets.read().iter().find(|(n, _)| n == &name) {
+                                    ex.set(exp.clone());
+                                }
+                            }
+                        },
+                        option { value: "", "— select —" }
+                        for (name, _) in presets.read().iter() {
+                            option { value: "{name}", "{name}" }
+                        }
+                    }
+                    input {
+                        r#type: "text",
+                        class: "input-sm",
+                        placeholder: "preset name",
+                        value: "{preset_name}",
+                        oninput: move |e| preset_name.set(e.value()),
+                    }
+                    button {
+                        class: "btn btn-xs btn-outline",
+                        onclick: {
+                            let expr = expr.clone();
+                            let mut presets = presets.clone();
+                            let mut pname = preset_name.clone();
+                            move |_| {
+                                let name = pname.read().trim().to_string();
+                                let exp = expr.read().trim().to_string();
+                                if name.is_empty() || exp.is_empty() { return; }
+                                let mut p = presets.write();
+                                if let Some(existing) = p.iter_mut().find(|(n, _)| n == &name) {
+                                    existing.1 = exp;
+                                } else {
+                                    p.push((name.clone(), exp));
+                                }
+                                pname.set(String::new());
+                            }
+                        },
+                        "Save preset"
+                    }
+                }
+            }
+
+            if !status.read().is_empty() {
+                p { class: "cs-status text-muted", "{status}" }
+            }
+
+            div { class: "panel-actions",
+                button {
+                    class: "btn btn-sm btn-primary",
+                    disabled: expr.read().trim().is_empty(),
+                    onclick: {
+                        let ex = expr.clone();
+                        let mut state = app_state.clone();
+                        let mut st = status.clone();
+                        move |_| {
+                            let where_clause = ex.read().trim().to_string();
+                            spawn(async move {
+                                #[cfg(feature = "server")]
+                                match run_surreal_select(where_clause).await {
+                                    Ok(ids) => {
+                                        let n = ids.len();
+                                        state.write().selected_for_action = ids;
+                                        *st.write() = format!("{n} files selected.");
+                                    }
+                                    Err(e) => { *st.write() = format!("Query error: {e}"); }
+                                }
+                            });
+                        }
+                    },
+                    "Select matching files"
+                }
+                button {
+                    class: "btn btn-sm btn-ghost",
+                    onclick: move |_| open.set(false),
+                    "Close"
+                }
+            }
+        }
+    }
+}
+
+/// Execute a SurrealQL WHERE clause against the file table.
+///
+/// Returns the IDs of all matching files. The UI then marks these as
+/// `selected_for_action`, exactly as the C# CheckCustomCommand did.
+#[cfg(feature = "server")]
+async fn run_surreal_select(where_clause: String) -> Result<Vec<String>, String> {
+    use app_core::db::{Database, ScanDatabase};
+    use tokio::task::spawn_blocking;
+
+    let db_path = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("vdf")
+        .join("db");
+
+    spawn_blocking(move || -> Result<Vec<String>, String> {
+        let db = ScanDatabase::open(&db_path).map_err(|e| e.to_string())?;
+        let ids = db.query_file_ids_where(&where_clause).map_err(|e| e.to_string())?;
+        Ok(ids)
+    }).await.map_err(|e| e.to_string())?
 }
 
 // ── Quality criteria builder ──────────────────────────────────────────────────
