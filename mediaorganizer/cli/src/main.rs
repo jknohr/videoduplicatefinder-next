@@ -466,6 +466,7 @@ fn cmd_scan(args: ScanArgs) -> Result<()> {
 
     let progress: Arc<dyn Fn(ScanProgress) + Send + Sync> = Arc::new(|ev| match ev {
         ScanProgress::FileDiscovered { path } => info!("found   {path}"),
+        ScanProgress::DiscoveryComplete { total } => info!("discovery done — {total} files"),
         ScanProgress::FileHashed { path, phash } => info!("hashed  {path}  [{phash:#018x}]"),
         ScanProgress::ComparisonStarted { total_pairs } => {
             info!("comparing {total_pairs} pairs…")
@@ -476,6 +477,7 @@ fn cmd_scan(args: ScanArgs) -> Result<()> {
         ScanProgress::ScanComplete { files, duplicates } => {
             info!("done — {files} files, {duplicates} duplicate groups")
         }
+        ScanProgress::ScanAborted => info!("scan aborted"),
         ScanProgress::Error { path, msg } => tracing::error!("error {path}: {msg}"),
     });
 

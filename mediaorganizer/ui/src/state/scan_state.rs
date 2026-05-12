@@ -28,7 +28,11 @@ pub struct ScanState {
     pub is_paused: bool,
     /// 0.0 = not started, 1.0 = complete.
     pub progress: f32,
-    /// Total files discovered so far.
+    /// Total files discovered (set when discovery phase completes).
+    pub total_files: usize,
+    /// Files hashed so far.
+    pub files_hashed: usize,
+    /// Total files discovered (alias kept for display).
     pub files_found: usize,
     /// Duplicate pairs found so far.
     pub duplicates_found: usize,
@@ -47,6 +51,8 @@ impl Default for ScanState {
             is_scanning: false,
             is_paused: false,
             progress: 0.0,
+            total_files: 0,
+            files_hashed: 0,
             files_found: 0,
             duplicates_found: 0,
             log_entries: Vec::new(),
@@ -81,6 +87,8 @@ impl ScanState {
         self.is_scanning = false;
         self.is_paused = false;
         self.progress = 0.0;
+        self.total_files = 0;
+        self.files_hashed = 0;
         self.files_found = 0;
         self.duplicates_found = 0;
         self.log_entries.clear();

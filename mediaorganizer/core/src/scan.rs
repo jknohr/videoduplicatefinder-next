@@ -34,6 +34,8 @@ use tracing::{debug, info, warn};
 #[derive(Debug, Clone)]
 pub enum ScanProgress {
     FileDiscovered { path: Utf8PathBuf },
+    /// Emitted once after discovery is complete so the UI can show N/total progress.
+    DiscoveryComplete { total: usize },
     FileHashed { path: Utf8PathBuf, phash: u64 },
     ComparisonStarted { total_pairs: usize },
     DuplicateFound { file_a: String, file_b: String, similarity: f32 },
@@ -115,6 +117,7 @@ impl<D: Database> ScanEngine<D> {
 
         let paths = self.discover_files();
         info!("discovered {} files", paths.len());
+        self.emit(ScanProgress::DiscoveryComplete { total: paths.len() });
 
         if self.is_cancelled() { self.emit(ScanProgress::ScanAborted); return Ok(()); }
         self.hash_files(&paths)?;

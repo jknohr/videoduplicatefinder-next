@@ -108,9 +108,17 @@ pub fn ScanView() -> Element {
             if is_scanning || scan_state.read().progress > 0.0 {
                 section { class: "scan-progress",
                     ProgressBar { value: scan_state.read().progress }
-                    p {
-                        "{scan_state.read().files_found} files · \
-                         {scan_state.read().duplicates_found} duplicates found"
+                    p { class: "progress-detail",
+                        {
+                            let s = scan_state.read();
+                            if s.total_files > 0 && s.files_hashed < s.total_files {
+                                format!("Hashing {}/{} files  ·  {} duplicates found",
+                                    s.files_hashed, s.total_files, s.duplicates_found)
+                            } else {
+                                format!("{} files  ·  {} duplicates found",
+                                    s.files_found, s.duplicates_found)
+                            }
+                        }
                     }
                 }
             }
@@ -290,11 +298,20 @@ async fn run_scan(
                 s.files_found += 1;
                 s.push_log(LogLevel::Info, format!("found   {path}"));
             }
-            ScanProgress::FileHashed { path, phash } => {
-                scan_state.write().push_log(
-                    LogLevel::Info,
-                    format!("hashed  {path}  [{phash:#018x}]"),
-                );
+            ScanProgress::DiscoveryComplete { total } => {
+                let mut s = scan_state.write();
+                s.total_files = total;
+                s.push_log(LogLevel::Info, format!("discovery done — {total} files"));
+            }
+            ScanProgress::FileHashed { path, .. } => {
+                let mut s = scan_state.write();
+                s.files_hashed += 1;
+                if s.total_files > 0 {
+                    s.progress = (s.files_hashed as f32 / s.total_files as f32) * 0.7;
+                }
+                let hashed = s.files_hashed;
+                let total  = s.total_files;
+                s.push_log(LogLevel::Info, format!("hashed  [{hashed}/{total}]  {path}"));
             }
             ScanProgress::ComparisonStarted { total_pairs } => {
                 scan_state.write().push_log(

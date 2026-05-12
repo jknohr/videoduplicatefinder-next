@@ -125,30 +125,61 @@ fn ResultsToolbar(mut app_state: Signal<AppState>) -> Element {
 fn AutoSelectBar(mut app_state: Signal<AppState>) -> Element {
     rsx! {
         div { class: "autoselect-bar",
-            span { class: "bar-label", "Auto-select:" }
+            span { class: "bar-label", "Auto-select duplicates to remove:" }
 
+            // Select all but the best-quality file in each group (uses the ranker's default criteria)
             button {
                 class: "btn btn-xs btn-outline",
-                title: "In each group, mark the smallest file for deletion (keep the largest)",
+                title: "In each group, keep the highest-quality file (longest duration, largest size, best codec); select the rest",
                 onclick: move |_| {
-                    let mut state = app_state.write();
-                    for cluster in &mut state.clusters {
-                        if cluster.files.len() < 2 { continue; }
-                        let max_size = cluster.files.iter().map(|f| f.size_bytes).max().unwrap_or(0);
-                        for f in &mut cluster.files {
-                            // mark via selected_pair field reuse; proper per-file select tracked via app_state extension
-                            let _ = f; let _ = max_size; // actual check-state TODO: extend AppState
+                    #[cfg(feature = "server")]
+                    {
+                        let mut state = app_state.write();
+                        let mut to_remove: Vec<String> = Vec::new();
+                        let criteria = app_core::ranker::default_criteria();
+                        for cluster in &state.clusters {
+                            if cluster.files.len() < 2 { continue; }
+                            if let Some(keeper) = app_core::ranker::pick_keeper(&cluster.files, &criteria) {
+                                for f in &cluster.files {
+                                    if f.id != keeper.id {
+                                        to_remove.push(f.id.clone());
+                                    }
+                                }
+                            }
                         }
+                        state.selected_for_action = to_remove;
                     }
                 },
-                "Smallest file"
+                "Best quality (keep)"
+            }
+
+            // Select all but the largest file in each group
+            button {
+                class: "btn btn-xs btn-outline",
+                title: "In each group, keep the largest file; select smaller ones",
+                onclick: move |_| {
+                    let mut state = app_state.write();
+                    let mut to_remove: Vec<String> = Vec::new();
+                    for cluster in &state.clusters {
+                        if cluster.files.len() < 2 { continue; }
+                        let keeper_id = cluster.files.iter()
+                            .max_by_key(|f| f.size_bytes)
+                            .map(|f| f.id.clone());
+                        if let Some(kid) = keeper_id {
+                            for f in &cluster.files {
+                                if f.id != kid { to_remove.push(f.id.clone()); }
+                            }
+                        }
+                    }
+                    state.selected_for_action = to_remove;
+                },
+                "Smallest files"
             }
 
             button {
                 class: "btn btn-xs btn-outline",
-                title: "In each group, trash all files with identical content hash — keep one",
+                title: "Select all but one file per group where similarity is 100%",
                 onclick: move |_| {
-                    // Select all but one file per cluster where all pHashes are identical (sim == 1.0)
                     let mut state = app_state.write();
                     let to_remove: Vec<String> = state.clusters.iter()
                         .filter(|c| c.max_similarity >= 0.9999)
