@@ -372,6 +372,10 @@ fn save_settings(settings: &UiSettings) {
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("settings.json");
     if let Ok(json) = serde_json::to_string_pretty(settings) {
-        let _ = std::fs::write(path, json);
+        // Atomic write: serialize to .tmp, then rename (POSIX rename(2) is atomic).
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 }

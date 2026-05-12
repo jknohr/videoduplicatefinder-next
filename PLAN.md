@@ -382,14 +382,14 @@ tree. Feature flags select the platform runtime — not the components.
   - VA-API device passthrough (commented, opt-in: `devices: /dev/dri`)
   - NVIDIA GPU deploy block (commented, opt-in)
   - LIBVA_DRIVER_NAME env var examples
-- [ ] Multi-arch build: `linux/amd64` + `linux/arm64` (Raspberry Pi / NAS)
-- [ ] GitHub Actions workflow: build + push to GHCR on every commit to main
+- [x] Multi-arch build: `linux/amd64` + `linux/arm64` — QEMU + Docker Buildx in `rust-ci.yml` and `docker.yml`
+- [x] GitHub Actions workflow: `rust-ci.yml` — cargo fmt/clippy/check/test on push to main/claude/** + Docker build; pushes to GHCR on main/tags
 
 ---
 
 ## Phase 5 — Integration and Quality
 
-- [ ] Integration tests: scan testdata/ (small MP4s), assert pHash output matches C# reference vectors
+- [x] Integration tests: `core/tests/phash_regression.rs` — pHash mathematical properties + regression stability; `core/tests/comparison_integration.rs` — sliding-window exact/noisy/gap/threshold coverage
 - [ ] Property tests: sliding-window invariants via `proptest`
   - If A ⊂ B (content), sliding window always finds the match
   - Gap tolerance: inserting N frames never breaks a run if gap ≤ iframe_max_gap

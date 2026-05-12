@@ -4,7 +4,7 @@
 use dioxus::prelude::*;
 
 #[cfg(all(feature = "server", feature = "web"))]
-use crate::server::api::rescan_file;
+use crate::server::api::{cleanup_database, rescan_file};
 
 const PAGE_SIZE: usize = 50;
 
@@ -37,6 +37,7 @@ pub fn DatabaseView() -> Element {
     let mut search = use_signal(String::new);
     let mut error_msg: Signal<Option<String>> = use_signal(|| None);
     let mut loading = use_signal(|| false);
+    let mut cleanup_msg: Signal<Option<String>> = use_signal(|| None);
 
     // Load on mount
     use_effect({
@@ -128,6 +129,42 @@ pub fn DatabaseView() -> Element {
                     },
                     if *loading.read() { "Loading…" } else { "Refresh" }
                 }
+
+                button {
+                    class: "btn btn-sm btn-outline",
+                    title: "Remove DB entries for files that no longer exist on disk",
+                    disabled: *loading.read(),
+                    onclick: {
+                        let mut rows = rows.clone();
+                        let mut cleanup_msg = cleanup_msg.clone();
+                        let mut loading = loading.clone();
+                        move |_| {
+                            #[cfg(all(feature = "server", feature = "web"))]
+                            spawn(async move {
+                                *loading.write() = true;
+                                match cleanup_database().await {
+                                    Ok(n) => {
+                                        *cleanup_msg.write() = Some(format!("Cleanup complete: {n} stale entries removed."));
+                                        // Reload the file list to reflect removed entries
+                                        match load_db_files().await {
+                                            Ok(loaded) => *rows.write() = loaded,
+                                            Err(_) => {}
+                                        }
+                                    }
+                                    Err(e) => {
+                                        *cleanup_msg.write() = Some(format!("Cleanup failed: {e}"));
+                                    }
+                                }
+                                *loading.write() = false;
+                            });
+                        }
+                    },
+                    "Cleanup"
+                }
+            }
+
+            if let Some(msg) = cleanup_msg.read().as_ref() {
+                div { class: "alert alert-success", "{msg}" }
             }
 
             if let Some(err) = error_msg.read().as_ref() {

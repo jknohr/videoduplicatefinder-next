@@ -551,6 +551,28 @@ pub async fn get_ffmpeg_status() -> Result<String, ServerFnError> {
     { Ok("ready".to_string()) }
 }
 
+/// Remove all file records whose path no longer exists on disk.
+/// Returns the number of entries pruned.
+/// Mirrors `DatabaseUtils.CleanupDatabase()` from C# VDF.Core.
+#[cfg(feature = "web")]
+#[server(endpoint = "/api/cleanup_database")]
+pub async fn cleanup_database() -> Result<usize, ServerFnError> {
+    #[cfg(feature = "server")]
+    {
+        use app_core::db::{Database, ScanDatabase};
+        let db_path = dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("vdf").join("db");
+        tokio::task::spawn_blocking(move || {
+            let mut db = ScanDatabase::open(&db_path).map_err(|e| ServerFnError::new(e.to_string()))?;
+            let removed = db.prune_missing_files().map_err(|e| ServerFnError::new(e.to_string()))?;
+            Ok::<usize, ServerFnError>(removed)
+        }).await.map_err(|e| ServerFnError::new(e.to_string()))?
+    }
+    #[cfg(not(feature = "server"))]
+    { Ok(0) }
+}
+
 /// Return a MIME content-type string for the given file path.
 #[cfg(feature = "web")]
 fn mime_for_ext(path: &std::path::Path) -> &'static str {

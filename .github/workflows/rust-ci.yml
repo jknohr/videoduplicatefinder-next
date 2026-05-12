@@ -1,0 +1,131 @@
+name: Rust CI
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+    paths:
+      - "mediaorganizer/**"
+      - ".github/workflows/rust-ci.yml"
+  pull_request:
+    paths:
+      - "mediaorganizer/**"
+      - ".github/workflows/rust-ci.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Check & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libavcodec-dev \
+            libavformat-dev \
+            libavfilter-dev \
+            libavdevice-dev \
+            libavutil-dev \
+            libswresample-dev \
+            libswscale-dev \
+            clang \
+            libclang-dev \
+            librocksdb-dev \
+            ffmpeg
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mediaorganizer
+
+      - name: Check formatting
+        working-directory: mediaorganizer
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (core)
+        working-directory: mediaorganizer
+        run: cargo clippy -p core -- -D warnings
+
+      - name: Clippy (cli)
+        working-directory: mediaorganizer
+        run: cargo clippy -p cli -- -D warnings
+
+      - name: Clippy (ui, server feature)
+        working-directory: mediaorganizer
+        run: cargo clippy -p ui --features server -- -D warnings
+
+      - name: cargo check (all crates)
+        working-directory: mediaorganizer
+        run: |
+          cargo check -p core
+          cargo check -p cli
+          cargo check -p ui --features server
+
+      - name: Run unit tests (core)
+        working-directory: mediaorganizer
+        run: cargo test -p core --lib -- --test-threads=1
+
+      - name: Run unit tests (cli)
+        working-directory: mediaorganizer
+        run: cargo test -p cli --lib
+
+  docker-build:
+    name: Docker Build (multi-arch)
+    runs-on: ubuntu-latest
+    needs: check
+    permissions:
+      contents: read
+      packages: write
+
+    # Only push images from main branch or version tags
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/mediaorganizer
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+
+      - name: Build (and push on main/tag)
+        uses: docker/build-push-action@v6
+        with:
+          context: mediaorganizer
+          file: mediaorganizer/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

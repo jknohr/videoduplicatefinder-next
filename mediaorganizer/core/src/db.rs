@@ -1046,6 +1046,11 @@ pub trait Database: Send + Sync {
     fn flush(&mut self) -> VdfResult<()>;
     fn db_version(&self) -> u32;
 
+    /// Remove all file records whose path no longer exists on disk.
+    /// Returns the number of entries deleted.
+    /// Mirrors `DatabaseUtils.CleanupDatabase()` from C# VDF.Core.
+    fn prune_missing_files(&mut self) -> VdfResult<usize>;
+
     // ── Bulk operations ───────────────────────────────────────────────────────
 
     /// Delete a file record and all its edges by record ID.
@@ -1959,6 +1964,21 @@ impl Database for SurrealDatabase {
 
     fn db_version(&self) -> u32 {
         DB_SCHEMA_VERSION
+    }
+
+    fn prune_missing_files(&mut self) -> VdfResult<usize> {
+        let files = self.all_files()?;
+        let mut removed = 0usize;
+        for f in &files {
+            if !std::path::Path::new(f.path.as_str()).exists() {
+                self.remove_file(&f.id)?;
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            info!("Pruned {removed} missing file records from database");
+        }
+        Ok(removed)
     }
 }
 
