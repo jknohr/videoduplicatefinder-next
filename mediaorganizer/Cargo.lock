@@ -8596,8 +8596,10 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
 ]
 
 [[package]]

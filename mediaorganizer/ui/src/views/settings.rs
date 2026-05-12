@@ -190,18 +190,34 @@ pub fn SettingsView() -> Element {
                         class: "select",
                         onchange: move |e| {
                             scan_state.write().settings.hardware_accel = match e.value().as_str() {
+                                "auto"         => HardwareAccel::Auto,
                                 "vaapi"        => HardwareAccel::Vaapi,
                                 "cuda"         => HardwareAccel::Cuda,
                                 "videotoolbox" => HardwareAccel::VideoToolbox,
                                 "d3d11va"      => HardwareAccel::D3d11va,
+                                "dxva2"        => HardwareAccel::Dxva2,
+                                "qsv"          => HardwareAccel::Qsv,
+                                "vdpau"        => HardwareAccel::Vdpau,
+                                "drm"          => HardwareAccel::Drm,
+                                "opencl"       => HardwareAccel::OpenCl,
+                                "mediacodec"   => HardwareAccel::MediaCodec,
+                                "vulkan"       => HardwareAccel::Vulkan,
                                 _              => HardwareAccel::None,
                             };
                         },
                         option { value: "none",         selected: scan_state.read().settings.hardware_accel == HardwareAccel::None,         "None (CPU)" }
+                        option { value: "auto",         selected: scan_state.read().settings.hardware_accel == HardwareAccel::Auto,         "Auto (FFmpeg selects best)" }
                         option { value: "vaapi",        selected: scan_state.read().settings.hardware_accel == HardwareAccel::Vaapi,        "VA-API (Linux Intel/AMD)" }
                         option { value: "cuda",         selected: scan_state.read().settings.hardware_accel == HardwareAccel::Cuda,         "NVDEC / CUDA (NVIDIA)" }
                         option { value: "videotoolbox", selected: scan_state.read().settings.hardware_accel == HardwareAccel::VideoToolbox, "VideoToolbox (macOS)" }
-                        option { value: "d3d11va",      selected: scan_state.read().settings.hardware_accel == HardwareAccel::D3d11va,      "D3D11VA (Windows)" }
+                        option { value: "d3d11va",      selected: scan_state.read().settings.hardware_accel == HardwareAccel::D3d11va,      "D3D11VA (Windows DX11)" }
+                        option { value: "dxva2",        selected: scan_state.read().settings.hardware_accel == HardwareAccel::Dxva2,        "DXVA2 (Windows DX9)" }
+                        option { value: "qsv",          selected: scan_state.read().settings.hardware_accel == HardwareAccel::Qsv,          "Intel Quick Sync Video" }
+                        option { value: "vdpau",        selected: scan_state.read().settings.hardware_accel == HardwareAccel::Vdpau,        "VDPAU (Linux NVIDIA legacy)" }
+                        option { value: "drm",          selected: scan_state.read().settings.hardware_accel == HardwareAccel::Drm,          "DRM/KMS (Linux embedded)" }
+                        option { value: "opencl",       selected: scan_state.read().settings.hardware_accel == HardwareAccel::OpenCl,       "OpenCL (cross-platform GPU)" }
+                        option { value: "mediacodec",   selected: scan_state.read().settings.hardware_accel == HardwareAccel::MediaCodec,   "MediaCodec (Android)" }
+                        option { value: "vulkan",       selected: scan_state.read().settings.hardware_accel == HardwareAccel::Vulkan,       "Vulkan (experimental)" }
                     }
                 }
 

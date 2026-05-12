@@ -1006,6 +1006,8 @@ pub trait Database: Send + Sync {
     fn all_duplicates(&self) -> VdfResult<Vec<DuplicatePair>>;
     fn duplicates_of(&self, file_id: &str) -> VdfResult<Vec<DuplicatePair>>;
     fn remove_duplicates_of(&mut self, file_id: &str) -> VdfResult<()>;
+    /// Remove only the duplicate_of edge between two specific files.
+    fn remove_duplicate_pair(&mut self, file_a: &str, file_b: &str) -> VdfResult<()>;
     fn clear_duplicates(&mut self) -> VdfResult<()>;
     fn pair_is_blacklisted(&self, id_a: &str, id_b: &str) -> VdfResult<bool>;
 
@@ -1525,6 +1527,26 @@ impl Database for SurrealDatabase {
                         OR out = type::record('file', $id)",
                 )
                 .bind(("id", id))
+                .await?;
+                Ok::<_, surrealdb::Error>(())
+            })
+            .map_err(|e| VdfError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_duplicate_pair(&mut self, file_a: &str, file_b: &str) -> VdfResult<()> {
+        let fa = file_a.to_string();
+        let fb = file_b.to_string();
+        let db = &self.db;
+        self.rt
+            .block_on(async move {
+                db.query(
+                    "DELETE duplicate_of \
+                     WHERE (in = type::record('file', $fa) AND out = type::record('file', $fb)) \
+                        OR (in = type::record('file', $fb) AND out = type::record('file', $fa))",
+                )
+                .bind(("fa", fa))
+                .bind(("fb", fb))
                 .await?;
                 Ok::<_, surrealdb::Error>(())
             })

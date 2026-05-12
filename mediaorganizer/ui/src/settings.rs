@@ -20,10 +20,18 @@ pub enum FolderMatchMode {
 pub enum HardwareAccel {
     #[default]
     None,
+    Auto,
+    Vdpau,
+    Dxva2,
     Vaapi,
+    Qsv,
     Cuda,
     VideoToolbox,
     D3d11va,
+    Drm,
+    OpenCl,
+    MediaCodec,
+    Vulkan,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -139,10 +147,18 @@ impl From<UiSettings> for app_core::config::Settings {
         c.ssim_window_secs = s.ssim_window_secs;
         c.hardware_accel = match s.hardware_accel {
             HardwareAccel::None         => app_core::config::HardwareAccel::None,
+            HardwareAccel::Auto         => app_core::config::HardwareAccel::Auto,
+            HardwareAccel::Vdpau        => app_core::config::HardwareAccel::Vdpau,
+            HardwareAccel::Dxva2        => app_core::config::HardwareAccel::Dxva2,
             HardwareAccel::Vaapi        => app_core::config::HardwareAccel::Vaapi,
+            HardwareAccel::Qsv          => app_core::config::HardwareAccel::Qsv,
             HardwareAccel::Cuda         => app_core::config::HardwareAccel::Cuda,
             HardwareAccel::VideoToolbox => app_core::config::HardwareAccel::VideoToolbox,
             HardwareAccel::D3d11va      => app_core::config::HardwareAccel::D3d11va,
+            HardwareAccel::Drm          => app_core::config::HardwareAccel::Drm,
+            HardwareAccel::OpenCl       => app_core::config::HardwareAccel::OpenCl,
+            HardwareAccel::MediaCodec   => app_core::config::HardwareAccel::MediaCodec,
+            HardwareAccel::Vulkan       => app_core::config::HardwareAccel::Vulkan,
         };
         c
     }

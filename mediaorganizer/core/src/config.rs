@@ -132,6 +132,7 @@ pub enum HardwareAccel {
     VideoToolbox,
     D3d11va,
     Drm,
+    OpenCl,
     MediaCodec,
     Vulkan,
 }

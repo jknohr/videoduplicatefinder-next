@@ -4,6 +4,7 @@
 //! directly from the SurrealDB graph and renders a rich evidence panel.
 
 use dioxus::prelude::*;
+use urlencoding;
 
 use crate::app::Route;
 
@@ -62,6 +63,7 @@ pub struct FileInfo {
     pub height: u32,
     pub video_codec: String,
     pub has_audio: bool,
+    pub is_image: bool,
 }
 
 /// Edge evidence data read from the duplicate_of RELATE record.
@@ -160,11 +162,33 @@ fn ComparePanel(info_a: FileInfo, info_b: FileInfo, edge: EdgeData) -> Element {
 
 #[component]
 fn FileCard(info: FileInfo, label: &'static str) -> Element {
+    // Build URL for in-browser playback via the /api/video Axum handler.
+    // For desktop the native renderer will handle local paths; for web
+    // the HTTP server streams bytes with Range support.
+    let encoded_path = urlencoding::encode(&info.path).into_owned();
+    let video_url = format!("/api/video?path={encoded_path}");
+
     rsx! {
         div { class: "file-card",
             div { class: "file-card-label", "{label}" }
             div { class: "file-name", "{info.name}" }
             div { class: "file-path text-muted", "{info.path}" }
+
+            // In-browser video/image preview
+            if info.is_image {
+                img {
+                    class: "file-preview-image",
+                    src: "{video_url}",
+                    alt: "{info.name}",
+                }
+            } else if info.duration_secs > 0.0 {
+                video {
+                    class: "file-preview-video",
+                    controls: true,
+                    preload: "metadata",
+                    src: "{video_url}",
+                }
+            }
 
             dl { class: "meta-list",
                 if info.duration_secs > 0.0 {
@@ -279,6 +303,7 @@ async fn load_pair(
                     .map(|s| s.codec_name.clone())
                     .unwrap_or_default(),
                 has_audio: r.has_audio(),
+                is_image: r.is_image(),
             };
 
             let info_a = to_info(rec_a);

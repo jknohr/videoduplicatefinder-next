@@ -31,7 +31,7 @@ server  = ["dioxus/server", "dep:tokio", "dep:app_core"]
 # Platform targets.
 # desktop and mobile include `server` so #[server] fns execute in-process.
 desktop = ["dioxus/desktop", "server"]
-web     = ["dioxus/web", "dep:axum"]
+web     = ["dioxus/web", "dep:axum", "dep:tokio-util"]
 mobile  = ["dioxus/mobile", "server"]
 
 # wasm64: same as `web` but targets wasm64-unknown-unknown (no 4 GB limit).
@@ -50,7 +50,7 @@ app_core = { path = "../core", package = "core", optional = true }
 # The base component system requires: macro (rsx!/component attr), html (element types),
 # signals (Signal<T>), hooks (use_context/use_signal/use_resource), and hot-reload.
 # Platform features (desktop/web/mobile) add their renderers on top of this base set.
-dioxus   = { version = "0.7", default-features = false, features = ["router", "fullstack", "macro", "html", "signals", "hooks"] }
+dioxus   = { version = "0.7", default-features = false, features = ["router", "fullstack", "launch", "macro", "html", "signals", "hooks"] }
 anyhow   = { workspace = true }
 tracing  = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -61,7 +61,12 @@ dirs     = { workspace = true }
 
 # tokio: optional — WASM client must not link tokio full runtime.
 # Pulled in by the `server` feature for desktop / mobile / web-server builds.
-tokio    = { workspace = true, optional = true }
+tokio      = { workspace = true, optional = true }
+# tokio-util: needed server-side for ReaderStream (video streaming with HTTP 206)
+tokio-util = { workspace = true, optional = true }
+
+# URL encoding for file paths in video streaming URLs
+urlencoding = { workspace = true }
 
 # Only linked for the `web` server target
 axum = { version = "0.8", optional = true }

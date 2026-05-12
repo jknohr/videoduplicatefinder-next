@@ -31,7 +31,7 @@ fn main() {
     //   - Axum server binary (server feature ON) that serves the bundle + #[server] fns
     #[cfg(feature = "server")]
     init_logging();
-    dioxus::LaunchBuilder::fullstack().launch(App);
+    dioxus::LaunchBuilder::new().launch(App);
 }
 
 #[cfg(feature = "mobile")]

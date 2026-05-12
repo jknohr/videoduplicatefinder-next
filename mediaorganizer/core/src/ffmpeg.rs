@@ -44,6 +44,7 @@ fn hw_device_type(accel: HardwareAccel) -> ffmpeg_sys_the_third::AVHWDeviceType 
         HardwareAccel::VideoToolbox => AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
         HardwareAccel::D3d11va => AV_HWDEVICE_TYPE_D3D11VA,
         HardwareAccel::Drm => AV_HWDEVICE_TYPE_DRM,
+        HardwareAccel::OpenCl => AV_HWDEVICE_TYPE_OPENCL,
         HardwareAccel::MediaCodec => AV_HWDEVICE_TYPE_MEDIACODEC,
         HardwareAccel::Vulkan => AV_HWDEVICE_TYPE_VULKAN,
     }
@@ -62,6 +63,7 @@ fn hw_accel_flag_str(accel: HardwareAccel) -> Option<&'static str> {
         HardwareAccel::VideoToolbox => Some("videotoolbox"),
         HardwareAccel::D3d11va => Some("d3d11va"),
         HardwareAccel::Drm => Some("drm"),
+        HardwareAccel::OpenCl => Some("opencl"),
         HardwareAccel::MediaCodec => Some("mediacodec"),
         HardwareAccel::Vulkan => Some("vulkan"),
     }
