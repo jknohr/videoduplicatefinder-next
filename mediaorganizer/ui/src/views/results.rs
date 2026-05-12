@@ -21,12 +21,27 @@ pub fn ResultsView() -> Element {
     let app_state = use_context::<Signal<AppState>>();
     let clusters = app_state.read().clusters.clone();
     let mut search = use_signal(String::new);
+    // 0 = All, 1 = Videos only, 2 = Images only
+    let mut type_filter = use_signal(|| 0u8);
+    // Similarity range filter [0.0, 1.0]
+    let mut sim_min = use_signal(|| 0.0f32);
 
-    // Client-side path filter
+    // Client-side filters: path search, file-type, similarity threshold
     let filtered: Vec<&DuplicateCluster> = clusters.iter().filter(|c| {
+        // Path search
         let q = search.read();
-        if q.is_empty() { return true; }
-        c.files.iter().any(|f| f.path.as_str().to_lowercase().contains(q.to_lowercase().as_str()))
+        if !q.is_empty() && !c.files.iter().any(|f| f.path.as_str().to_lowercase().contains(q.to_lowercase().as_str())) {
+            return false;
+        }
+        // Similarity minimum
+        let min = *sim_min.read();
+        if min > 0.0 && c.max_similarity < min { return false; }
+        // File type
+        match *type_filter.read() {
+            1 => c.files.iter().any(|f| !f.is_image()),    // Videos: keep groups with at least one video
+            2 => c.files.iter().any(|f| f.is_image()),     // Images: keep groups with at least one image
+            _ => true,
+        }
     }).collect();
 
     rsx! {
@@ -50,6 +65,39 @@ pub fn ResultsView() -> Element {
                             onclick: move |_| search.set(String::new()),
                             "✕"
                         }
+                    }
+
+                    // File type filter
+                    select {
+                        class: "select select-sm",
+                        title: "Filter by file type",
+                        onchange: move |e| {
+                            *type_filter.write() = match e.value().as_str() {
+                                "videos" => 1,
+                                "images" => 2,
+                                _ => 0,
+                            };
+                        },
+                        option { value: "all",    selected: *type_filter.read() == 0, "All types" }
+                        option { value: "videos", selected: *type_filter.read() == 1, "Videos only" }
+                        option { value: "images", selected: *type_filter.read() == 2, "Images only" }
+                    }
+
+                    // Similarity minimum slider
+                    span { class: "filter-label text-muted",
+                        "Min sim: {(*sim_min.read() * 100.0) as u32}%"
+                    }
+                    input {
+                        r#type: "range",
+                        class: "filter-slider",
+                        min: "0", max: "100", step: "1",
+                        value: "{(*sim_min.read() * 100.0) as u32}",
+                        title: "Minimum similarity threshold",
+                        oninput: move |e| {
+                            if let Ok(v) = e.value().parse::<f32>() {
+                                *sim_min.write() = v / 100.0;
+                            }
+                        },
                     }
                 }
                 ResultsToolbar { app_state }
