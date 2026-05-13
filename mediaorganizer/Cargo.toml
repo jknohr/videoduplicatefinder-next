@@ -61,6 +61,9 @@ ffmpeg-sys-the-third = "3"
 # C bindings (POSIX errno constants)
 libc = "0.2"
 
+# Property testing
+proptest = "1"
+
 # Database — SurrealDB embedded with RocksDB storage (required, not optional)
 surrealdb = { version = "3", features = ["kv-rocksdb"] }
 
