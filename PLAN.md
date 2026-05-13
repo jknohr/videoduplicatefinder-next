@@ -304,21 +304,27 @@ tree. Feature flags select the platform runtime — not the components.
 ### Views — what still needs to be built or completed
 
 #### `views/results.rs` — remaining additions
-- [ ] **Detection badges** per duplicate group header:
+- [x] **Detection badges** per duplicate group header:
   - `I-frame timeline` (blue) — I-frame sliding window match
   - `MPEG-7` (purple) — MPEG-7 signature match
   - `Audio fingerprint` (green) — partial clip via Chromaprint
   - `Frame similarity` (orange) — standard pHash
   - `Flipped` (red) — horizontally mirrored content
   - Data source: `method` field on `duplicate_of` edge
-- [ ] **Match explanation line** per duplicate pair:
+- [x] **Match explanation line** per duplicate pair:
   - *"I-frame timeline · clip found at 1:23:45 in source · 67% match"*
   - *"Frame similarity · 94% match"*
   - Data source: `clip_offset_secs`, `consecutive_frames`, `similarity` on `duplicate_of` edge
+- [x] **File type filter** (All / Videos / Images) + **similarity range filter**
+- [x] **Move/Copy/Symlink tabs** in MoveToFolderInline — calls bulk_copy_files / bulk_move_files / bulk_create_symlinks
+- [x] **Dry-run export button** — calls export_dry_run_report; writes JSON to temp file (desktop) or data: URL (web)
 
 #### `views/compare.rs` — additions
-- [ ] Full thumbnail scrub timeline (frame-by-frame stepping with arrow keys)
-- [ ] Overlay diff mode — show pixel difference image between corresponding frames
+- [x] Full thumbnail scrub timeline — frame-by-frame stepping (StepA/StepB ±1 at fps granularity)
+- [x] Overlay diff mode — pixel difference via `/api/diff_frame` (FFmpeg blend=difference + curves equalization)
+- [x] Swipe mode — CSS clip-path overlay with range slider
+- [x] Stacked mode — horizontal split with draggable divider
+- [x] QualityDiff table — Duration / Resolution / FPS / File size comparison (ports HoverDiff)
 
 ### State
 
@@ -346,6 +352,11 @@ tree. Feature flags select the platform runtime — not the components.
 | `rescan_file(path)` | ✅ | Re-hash single file, update DB |
 | `get_ffmpeg_status()` | ✅ | FFmpeg binary status check |
 | `export_results(format)` | ❌ | JSON / CSV export (available in CLI via `export` subcommand) |
+| `bulk_copy_files(ids, dest)` | ✅ | Copy selected files to destination folder |
+| `bulk_move_files(ids, dest)` | ✅ | Move selected files (rename → copy+delete fallback across filesystems) |
+| `bulk_create_symlinks(ids, dest)` | ✅ | Create symlinks to selected files in destination |
+| `export_dry_run_report(ids)` | ✅ | Generate DryRunReport showing estimated savings before deletion |
+| `diff_frame_handler` | ✅ | Axum GET /api/diff_frame — FFmpeg blend difference frame as JPEG |
 
 ### Web-only features (`#[cfg(feature = "web")]`)
 
@@ -390,9 +401,13 @@ tree. Feature flags select the platform runtime — not the components.
 ## Phase 5 — Integration and Quality
 
 - [x] Integration tests: `core/tests/phash_regression.rs` — pHash mathematical properties + regression stability; `core/tests/comparison_integration.rs` — sliding-window exact/noisy/gap/threshold coverage
-- [ ] Property tests: sliding-window invariants via `proptest`
-  - If A ⊂ B (content), sliding window always finds the match
-  - Gap tolerance: inserting N frames never breaks a run if gap ≤ iframe_max_gap
+- [x] Property tests: `core/tests/comparison_properties.rs` — 6 invariants × 256–512 cases via proptest TestRunner
+  - Exact subclip always detected at original offset (512 cases)
+  - Identical sequences match at offset 0 with sim ≥ 0.99 (256 cases)
+  - Single gap within max_gap=1 does not break detection (256 cases)
+  - Strict mode limits consecutive_run at noise frame (256 cases)
+  - Lowering hash_threshold never decreases similarity (256 cases)
+  - arrays_match monotone in hash_threshold (256 cases)
 - [ ] Scene-aware skip regression: known intro-heavy test files; assert skip offset is correct
 - [ ] Chromaprint regression: same audio fingerprint output as C# AcoustID.NET pipeline
 - [ ] SSIM regression: known borderline pairs at known offsets; assert accept/reject decisions
