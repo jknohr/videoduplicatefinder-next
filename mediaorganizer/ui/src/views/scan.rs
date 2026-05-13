@@ -390,6 +390,10 @@ async fn run_scan(
                     LogLevel::Info,
                     format!("done — {files} files, {duplicates} duplicate groups"),
                 );
+                crate::notify::notify_desktop(
+                    "Scan complete",
+                    &format!("{files} files scanned, {duplicates} duplicate groups found"),
+                );
             }
             ScanProgress::ScanAborted => {
                 scan_state.write().push_log(LogLevel::Warn, "Scan stopped by user");

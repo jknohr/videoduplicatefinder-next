@@ -130,9 +130,16 @@ pub fn SettingsView() -> Element {
                     }
                 }
 
-                // ── MPEG-7 / SSIM ─────────────────────────────────────────
+                // ── Advanced matching ─────────────────────────────────────
                 section { class: "settings-section",
                     h2 { "Advanced Matching" }
+
+                    CheckboxField {
+                        label: "Detect horizontally flipped duplicates",
+                        hint: "Re-compare each pair using a mirror image of the first file. Marks matches as 'Flipped' in results. Increases scan time.",
+                        checked: scan_state.read().settings.compare_horizontally_flipped,
+                        onchange: move |v| scan_state.write().settings.compare_horizontally_flipped = v,
+                    }
 
                     CheckboxField {
                         label: "MPEG-7 video signature",
@@ -365,6 +372,10 @@ fn save_settings(settings: &UiSettings) {
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("settings.json");
     if let Ok(json) = serde_json::to_string_pretty(settings) {
-        let _ = std::fs::write(path, json);
+        // Atomic write: serialize to .tmp, then rename (POSIX rename(2) is atomic).
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 }

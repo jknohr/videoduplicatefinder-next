@@ -1,6 +1,11 @@
-name: Docker (Web UI)
+name: Docker (Web UI) — Rust
 
-on: [push]
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+    paths:
+      - "mediaorganizer/**"
 
 jobs:
   build-and-push:
@@ -25,15 +30,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push vdf-web
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/mediaorganizer
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push mediaorganizer
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: VDF.Web/Dockerfile
+          context: mediaorganizer
+          file: mediaorganizer/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/vdf-web:latest
-            ghcr.io/${{ github.repository_owner }}/vdf-web:${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -1732,6 +1732,13 @@ fn compare_videos_bucketed(
                 ((dur_a - tolerance).max(0.0) / BUCKET_SIZE_SECS as f64).floor() as i64;
             let max_key = ((dur_a + tolerance) / BUCKET_SIZE_SECS as f64).floor() as i64;
 
+            // Pre-compute flipped hashes for `a` once per outer iteration
+            let a_flipped = if settings.compare_horizontally_flipped {
+                a.flipped_phash_hashes()
+            } else {
+                vec![]
+            };
+
             for cand_key in min_key..=max_key {
                 if cand_key < bucket_key {
                     continue; // avoid symmetric duplicates
@@ -1760,6 +1767,20 @@ fn compare_videos_bucketed(
                         let sim = phash_first_similarity(a, b);
                         if ssim_verify(a, b, sim, settings) {
                             merge(a, b, sim, MatchMethod::FrameSimilarity, None, false, videos, pairs, p2g, greps, gid, settings);
+                        }
+                        continue;
+                    }
+
+                    // Check horizontally flipped match (a's pre-flipped hashes vs b's normal hashes)
+                    if settings.compare_horizontally_flipped && !a_flipped.is_empty() {
+                        let b_hashes = b.phash_hashes();
+                        if !b_hashes.is_empty() {
+                            let flip_sim = phash_hamming_multi_similarity(&a_flipped, &b_hashes);
+                            if flip_sim >= settings.min_similarity {
+                                if ssim_verify(a, b, flip_sim, settings) {
+                                    merge(a, b, flip_sim, MatchMethod::FrameSimilarity, None, true, videos, pairs, p2g, greps, gid, settings);
+                                }
+                            }
                         }
                     }
                 }
