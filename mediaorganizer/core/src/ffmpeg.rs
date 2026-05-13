@@ -756,7 +756,70 @@ pub fn extract_thumbnail_jpeg(
     }
 }
 
-// ─── SSIM second-pass verification ───────────────────────────────────────────
+// ─── Pixel difference frame ───────────────────────────────────────────────────
+
+/// Render the absolute pixel difference between one frame from each video.
+///
+/// Uses FFmpeg `blend=all_mode=difference` on a single frame from each file.
+/// Output is a JPEG image where bright pixels indicate large differences.
+/// The result is equalized (histogram stretch) via `curves=all='0/0 1/1'` for
+/// visibility; without equalization a 96% similar pair looks nearly black.
+///
+/// Ports the pixel-diff overlay mode from `ThumbnailComparerVM` in C# VDF.
+pub fn extract_diff_jpeg(
+    path_a: &Utf8Path,
+    pos_a: f64,
+    path_b: &Utf8Path,
+    pos_b: f64,
+    max_width: u32,
+) -> Option<Vec<u8>> {
+    let ffmpeg = which_ffmpeg()?;
+
+    let scale = if max_width > 0 {
+        format!(",scale={max_width}:-1:flags=bicubic")
+    } else {
+        String::new()
+    };
+
+    // Seek both inputs to their target positions before decoding (fast).
+    // blend=all_mode=difference produces abs(A-B) per channel.
+    // Then multiply by 2 (eq=brightness=0:contrast=2) to amplify subtle diffs.
+    let filter = format!(
+        "[0:v]scale=iw:ih{scale}[a];[1:v]scale=iw:ih{scale}[b];\
+         [a][b]blend=all_mode=difference,\
+         curves=all='0/0 0.5/1 1/1'[diff]",
+        scale = scale,
+    );
+
+    let args = [
+        "-hide_banner", "-loglevel", "quiet", "-nostdin",
+        "-ss", &format!("{pos_a:.6}"),
+        "-i", path_a.as_str(),
+        "-ss", &format!("{pos_b:.6}"),
+        "-i", path_b.as_str(),
+        "-frames:v", "1",
+        "-filter_complex", &filter,
+        "-map", "[diff]",
+        "-f", "image2pipe",
+        "-vcodec", "mjpeg",
+        "-q:v", "2",
+        "pipe:1",
+    ];
+
+    let output = std::process::Command::new(&ffmpeg)
+        .args(&args)
+        .output()
+        .ok()?;
+
+    if output.stdout.is_empty() {
+        warn!("extract_diff_jpeg: empty output for {:?} vs {:?}", path_a, path_b);
+        None
+    } else {
+        Some(output.stdout)
+    }
+}
+
+
 
 /// Compute SSIM score between two video segments at given offsets using
 /// `ffmpeg -lavfi [0][1]ssim=stats_file=-`.

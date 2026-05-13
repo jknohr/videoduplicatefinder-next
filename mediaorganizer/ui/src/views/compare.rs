@@ -59,16 +59,21 @@ pub enum CompareMode {
     Single,
     Swipe,
     Stacked,
+    /// Pixel difference — bright pixels indicate per-channel differences.
+    Diff,
 }
 
 impl CompareMode {
-    const ALL: &'static [Self] = &[Self::SideBySide, Self::Single, Self::Swipe, Self::Stacked];
+    const ALL: &'static [Self] = &[
+        Self::SideBySide, Self::Single, Self::Swipe, Self::Stacked, Self::Diff,
+    ];
     fn label(self) -> &'static str {
         match self {
             Self::SideBySide => "Side by side",
             Self::Single     => "Single",
             Self::Swipe      => "Swipe",
             Self::Stacked    => "Stacked",
+            Self::Diff       => "Pixel diff",
         }
     }
 }
@@ -328,6 +333,14 @@ fn ThumbnailComparer(info_a: FileInfo, info_b: FileInfo, edge: EdgeData) -> Elem
                                 on_split: move |pct| swipe_pct.set(pct),
                             }
                         },
+                        CompareMode::Diff => rsx! {
+                            DiffView {
+                                info_a: info_a.clone(),
+                                info_b: info_b.clone(),
+                                pos_a,
+                                pos_b,
+                            }
+                        },
                     }
                 }
             }
@@ -497,6 +510,42 @@ fn CompareImage(info: FileInfo, pos: f64, label: &'static str) -> Element {
                 src: "{src}",
                 loading: "lazy",
                 alt: "{info.name} at {pos:.1}s",
+            }
+        }
+    }
+}
+
+// ── Pixel diff view ───────────────────────────────────────────────────────────
+
+/// Overlay diff mode — shows absolute pixel difference between one frame from
+/// each file. Bright pixels indicate large per-channel differences.
+/// Uses the /api/diff_frame endpoint (FFmpeg blend=all_mode=difference filter).
+/// Ports the ThumbnailComparerVM pixel-diff overlay from C# VDF.
+#[component]
+fn DiffView(info_a: FileInfo, info_b: FileInfo, pos_a: f64, pos_b: f64) -> Element {
+    let enc_a = urlencoding::encode(&info_a.path).into_owned();
+    let enc_b = urlencoding::encode(&info_b.path).into_owned();
+    let src = format!(
+        "/api/diff_frame?path_a={enc_a}&pos_a={pos_a:.3}&path_b={enc_b}&pos_b={pos_b:.3}&w=800"
+    );
+
+    rsx! {
+        div { class: "compare-diff",
+            div { class: "diff-legend",
+                span { class: "diff-legend-label", "Pixel difference (black = identical, white = maximum difference)" }
+            }
+            div { class: "compare-image-tile",
+                div { class: "tile-label", "A − B" }
+                img {
+                    class: "compare-img diff-img",
+                    src: "{src}",
+                    alt: "Pixel difference between A and B",
+                    loading: "lazy",
+                }
+            }
+            div { class: "diff-side-by-side",
+                div { class: "diff-label-a", "A: {info_a.name} @ {format_timestamp(pos_a)}" }
+                div { class: "diff-label-b", "B: {info_b.name} @ {format_timestamp(pos_b)}" }
             }
         }
     }
