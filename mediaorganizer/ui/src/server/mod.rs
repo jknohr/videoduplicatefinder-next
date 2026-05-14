@@ -19,7 +19,7 @@ pub mod ffmpeg_setup;
 pub fn register_axum_routes(router: axum::Router) -> axum::Router {
     use axum::routing::{get, post};
     use axum::middleware;
-    use api::{thumbnail_handler, video_stream_handler};
+    use api::{thumbnail_handler, video_stream_handler, diff_frame_handler};
     #[cfg(feature = "server")]
     use auth::{auth_middleware, login_page, login_submit};
 
@@ -32,7 +32,8 @@ pub fn register_axum_routes(router: axum::Router) -> axum::Router {
 
     let router = router
         .route("/api/video", get(video_stream_handler))
-        .route("/api/thumbnail", get(thumbnail_handler));
+        .route("/api/thumbnail", get(thumbnail_handler))
+        .route("/api/diff_frame", get(diff_frame_handler));
 
     #[cfg(feature = "server")]
     let router = router

@@ -526,6 +526,70 @@ pub async fn thumbnail_handler(
     }
 }
 
+// Diff-frame endpoint — GET /api/diff_frame?path_a=...&pos_a=...&path_b=...&pos_b=...&w=...
+// ---------------------------------------------------------------------------
+
+/// Query parameters for GET /api/diff_frame
+#[cfg(feature = "web")]
+#[derive(serde::Deserialize)]
+pub struct DiffFrameQuery {
+    pub path_a: String,
+    #[serde(default)]
+    pub pos_a: f64,
+    pub path_b: String,
+    #[serde(default)]
+    pub pos_b: f64,
+    #[serde(default = "default_thumb_width")]
+    pub w: u32,
+}
+
+/// Render the absolute pixel difference between one frame from each video.
+///
+/// Returns a JPEG where bright pixels indicate large per-channel differences.
+/// Ports the pixel-diff overlay mode from `ThumbnailComparerVM` in C# VDF.
+#[cfg(feature = "web")]
+pub async fn diff_frame_handler(
+    axum::extract::Query(params): axum::extract::Query<DiffFrameQuery>,
+) -> axum::response::Response {
+    use axum::body::Body;
+    use axum::http::{header, StatusCode};
+    use axum::response::Response;
+
+    // Path traversal guard
+    let path_a = std::path::PathBuf::from(&params.path_a);
+    let path_b = std::path::PathBuf::from(&params.path_b);
+    for p in [&path_a, &path_b] {
+        if p.components().any(|c| c == std::path::Component::ParentDir) {
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::empty())
+                .unwrap();
+        }
+    }
+
+    let jpeg = tokio::task::spawn_blocking(move || {
+        let a = camino::Utf8Path::from_path(&path_a)?;
+        let b = camino::Utf8Path::from_path(&path_b)?;
+        app_core::ffmpeg::extract_diff_jpeg(a, params.pos_a, b, params.pos_b, params.w)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    match jpeg {
+        Some(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/jpeg")
+            .header(header::CACHE_CONTROL, "public, max-age=3600, immutable")
+            .body(Body::from(bytes))
+            .unwrap(),
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("diff frame extraction failed"))
+            .unwrap(),
+    }
+}
+
 /// Returns a brief FFmpeg status string for the UI banner.
 ///
 /// "ready" means both ffmpeg and ffprobe are on PATH.
