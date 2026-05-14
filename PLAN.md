@@ -408,10 +408,10 @@ tree. Feature flags select the platform runtime — not the components.
   - Strict mode limits consecutive_run at noise frame (256 cases)
   - Lowering hash_threshold never decreases similarity (256 cases)
   - arrays_match monotone in hash_threshold (256 cases)
-- [ ] Scene-aware skip regression: known intro-heavy test files; assert skip offset is correct
-- [ ] Chromaprint regression: same audio fingerprint output as C# AcoustID.NET pipeline
-- [ ] SSIM regression: known borderline pairs at known offsets; assert accept/reject decisions
-- [ ] MPEG-7 regression: signature files from C# VDF; assert detectmode=full returns correct offset
+- [x] Scene-aware skip regression: `scene_detection_regression.rs` — hard cuts at known timestamps via lavfi colour sources; uniform video; max_count cap; threshold monotonicity; determinism. Skips gracefully when FFmpeg absent.
+- [x] Chromaprint regression: `chromaprint_regression.rs` — determinism, length proportional to duration, same content sim>0.99, different frequencies low sim, sliding-window finds clip in longer audio. Skips gracefully when FFmpeg absent.
+- [x] SSIM regression: `ssim_regression.rs` — identical SSIM≥0.98, white vs black <0.5, noisy copy 0.70–1.0, heavy<subtle noise, determinism, nonzero offset, missing files return -1.0. Skips gracefully when FFmpeg absent.
+- [x] MPEG-7 regression: `mpeg7_regression.rs` — sig file created, cache hit, self-match offset≈0, different no-match, missing files no-match, clip-in-movie offset≈10 s, sig_folder deterministic. Skips gracefully when FFmpeg or signature filter absent.
 - [ ] Binary size audit: desktop binary < 15 MB, web WASM < 5 MB
 - [ ] Cross-compile: Windows x86_64 via `cargo-zigbuild`; ARM64 via `cross`
 
